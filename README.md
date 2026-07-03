@@ -1,4 +1,4 @@
-# APREMBO: Adaptive Partition REMBO-UCB Optimizer
+# APREMBO: Adaptive Partition REMBO Optimizer
 
 APREMBO is a REMBO-style Bayesian optimization optimizer for high-dimensional black-box functions. It searches in a low-dimensional embedded space, projects embedded candidates back into the original bounded domain, fits local Gaussian-process models on tree cells, and can stop early using posterior probability rules.
 
