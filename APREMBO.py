@@ -38,6 +38,7 @@ come from the surrounding ``APREMBO`` package.
 # Lengthscale optimization helpers
 # =============================================================================
 
+import importlib
 import math
 import random
 import warnings
@@ -243,6 +244,9 @@ def _try_cma_es_search(model, mll, train_x, train_y, bounds, start_lengthscale, 
     lengthscale space. This keeps the code runnable without a local cma.py file
     or a pip-installed cma package.
     """
+    if int(maxiter) <= 0 or importlib.util.find_spec("cma") is None:
+        return None
+
     lower, upper = float(bounds[0]), float(bounds[1])
     log_lower = math.log(lower)
     log_upper = math.log(upper)
@@ -254,7 +258,7 @@ def _try_cma_es_search(model, mll, train_x, train_y, bounds, start_lengthscale, 
         return -_mll_value_for_lengthscale(model, mll, train_x, train_y, lengthscale)
 
     try:
-        import cma
+        cma = importlib.import_module("cma")
 
         es = cma.CMAEvolutionStrategy(
             [start_log],
@@ -355,16 +359,18 @@ def select_lengthscale_direct_cma(
 
     direct_lengthscale, direct_value = direct_result
 
-    cma_result = _try_cma_es_search(
-        model=model,
-        mll=mll,
-        train_x=train_x,
-        train_y=train_y,
-        bounds=bounds,
-        start_lengthscale=direct_lengthscale,
-        maxiter=cma_maxiter,
-        seed=seed,
-    )
+    cma_result = None
+    if int(cma_maxiter) > 0:
+        cma_result = _try_cma_es_search(
+            model=model,
+            mll=mll,
+            train_x=train_x,
+            train_y=train_y,
+            bounds=bounds,
+            start_lengthscale=direct_lengthscale,
+            maxiter=cma_maxiter,
+            seed=seed,
+        )
 
     if cma_result is not None and cma_result[1] > direct_value:
         return cma_result
@@ -511,6 +517,7 @@ class GaussianProcess(SingleTaskGP):
         n_keep_dims=0,
         use_direct_cma_lengthscale=False,
         freeze_direct_cma_lengthscale=True,
+        use_cma_lengthscale_refinement=True,
         outcome_transform=None,
         input_transform=None,
     ):
@@ -535,6 +542,7 @@ class GaussianProcess(SingleTaskGP):
         self.lengthscale_bounds = lengthscale_bounds
         self.use_direct_cma_lengthscale = bool(use_direct_cma_lengthscale)
         self.freeze_direct_cma_lengthscale = bool(freeze_direct_cma_lengthscale)
+        self.use_cma_lengthscale_refinement = bool(use_cma_lengthscale_refinement)
 
         if train_yvar is None:
             train_Yvar = torch.full_like(train_Y, self.R ** 2, dtype=torch.double)
@@ -610,6 +618,7 @@ class GaussianProcess(SingleTaskGP):
                 self.train_inputs[0].double(),
                 self.train_targets.view(-1, 1).double(),
                 self.lengthscale_bounds,
+                cma_maxiter=40 if self.use_cma_lengthscale_refinement else 0,
             )
             set_scalar_lengthscale(self, selected_lengthscale)
 
@@ -661,6 +670,7 @@ def build_gp_model(
     n_keep_dims=0,
     use_direct_cma_lengthscale=False,
     freeze_direct_cma_lengthscale=True,
+    use_cma_lengthscale_refinement=True,
     fit=True,
 ):
     """Build and optionally fit a GP model."""
@@ -677,6 +687,7 @@ def build_gp_model(
         n_keep_dims=n_keep_dims,
         use_direct_cma_lengthscale=use_direct_cma_lengthscale,
         freeze_direct_cma_lengthscale=freeze_direct_cma_lengthscale,
+        use_cma_lengthscale_refinement=use_cma_lengthscale_refinement,
     )
 
     if fit:
@@ -1028,6 +1039,7 @@ class APREMBO:
         lipschitz_mode="predict",
         use_direct_cma_lengthscale=False,
         freeze_direct_cma_lengthscale=True,
+        use_cma_lengthscale_refinement=True,
         lengthscale_reoptimize_interval=20,
         t_sigma=0.002,
         exploitation_patience=5,
@@ -1036,6 +1048,10 @@ class APREMBO:
         effective_dim=None,
         active_indices=None,
         threshold_trace_risk_tolerances=None,
+        acquisition_optimizer="botorch",
+        acquisition_direct_maxfun=500,
+        acquisition_direct_maxiter=200,
+        acquisition_local_maxfun=800,
         verbose=False,
     ):
         self.real_original_boundaries = np.asarray(original_boundaries, dtype=float)
@@ -1058,6 +1074,10 @@ class APREMBO:
         if self.n_init < 0:
             raise ValueError("n_init must be non-negative.")
         self.acquisition_function = acquisition_function
+        self.acquisition_optimizer = str(acquisition_optimizer).strip().lower().replace("_", "-")
+        self.acquisition_direct_maxfun = max(1, int(acquisition_direct_maxfun))
+        self.acquisition_direct_maxiter = max(1, int(acquisition_direct_maxiter))
+        self.acquisition_local_maxfun = max(1, int(acquisition_local_maxfun))
         self.v1 = v1
         self.v2 = v2
         self.rho = rho
@@ -1081,6 +1101,7 @@ class APREMBO:
             raise ValueError("lipschitz_mode='user' requires a numeric L value.")
         self.use_direct_cma_lengthscale = bool(use_direct_cma_lengthscale)
         self.freeze_direct_cma_lengthscale = bool(freeze_direct_cma_lengthscale)
+        self.use_cma_lengthscale_refinement = bool(use_cma_lengthscale_refinement)
         self.domain_debug = os.environ.get("REMBO_DOMAIN_DEBUG", "").lower() in ("1", "true", "yes", "on")
         self.domain_debug_print_limit = int(os.environ.get("REMBO_DOMAIN_DEBUG_PRINT_LIMIT", "5"))
         self.domain_debug_print_count = 0
@@ -1413,6 +1434,7 @@ class APREMBO:
                 n_keep_dims=0,
                 use_direct_cma_lengthscale=optimize_lengthscale_now,
                 freeze_direct_cma_lengthscale=self.freeze_direct_cma_lengthscale,
+                use_cma_lengthscale_refinement=self.use_cma_lengthscale_refinement,
                 fit=True,
             )
 
@@ -1663,6 +1685,10 @@ class APREMBO:
             objective_function=acquisition,
             boundaries=np.asarray(node.bounds_emb, dtype=float),
             batch_size=batch_size,
+            method=self.acquisition_optimizer,
+            direct_maxfun=self.acquisition_direct_maxfun,
+            direct_maxiter=self.acquisition_direct_maxiter,
+            local_maxfun=self.acquisition_local_maxfun,
         )
         x = self.embedded_to_original(z.detach().cpu().numpy())
         return x, z

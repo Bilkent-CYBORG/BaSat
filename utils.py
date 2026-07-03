@@ -547,8 +547,56 @@ def global_optimization(
     batch_size=1,
     num_restarts=20,
     raw_samples=1024,
+    method="botorch",
+    direct_maxfun=500,
+    direct_maxiter=200,
+    local_maxfun=800,
 ):
     """Optimize a BoTorch acquisition function over box boundaries."""
+    method = str(method).strip().lower().replace("_", "-")
+    if method in {"direct", "direct-local", "direct+local"} and int(batch_size) == 1:
+        try:
+            from scipy.optimize import direct, minimize
+
+            bounds_np = validate_bounds(boundaries)
+            bounds_list = [(float(lo), float(hi)) for lo, hi in bounds_np]
+            objective_function.to(dtype=torch.double)
+
+            def scipy_objective(z):
+                z_tensor = torch.as_tensor(np.asarray(z, dtype=float).reshape(1, -1), dtype=torch.double)
+                with torch.no_grad():
+                    value = objective_function(z_tensor)
+                return -float(value.detach().cpu().reshape(-1)[0].item())
+
+            best_x = None
+            best_value = float("inf")
+            result = direct(
+                scipy_objective,
+                bounds_list,
+                maxfun=max(1, int(direct_maxfun)),
+                maxiter=max(1, int(direct_maxiter)),
+                locally_biased=True,
+            )
+            if np.isfinite(float(result.fun)):
+                best_x = np.clip(np.asarray(result.x, dtype=float), bounds_np[:, 0], bounds_np[:, 1])
+                best_value = float(result.fun)
+
+            if best_x is not None and method in {"direct-local", "direct+local"}:
+                local_result = minimize(
+                    scipy_objective,
+                    best_x,
+                    method="Nelder-Mead",
+                    bounds=bounds_list,
+                    options={"maxfev": max(1, int(local_maxfun))},
+                )
+                if np.isfinite(float(local_result.fun)) and float(local_result.fun) < best_value:
+                    best_x = np.clip(np.asarray(local_result.x, dtype=float), bounds_np[:, 0], bounds_np[:, 1])
+
+            if best_x is not None:
+                return torch.as_tensor(best_x.reshape(1, -1), dtype=torch.double)
+        except Exception:
+            pass
+
     from botorch.optim import optimize_acqf
 
     if isinstance(boundaries, torch.Tensor):

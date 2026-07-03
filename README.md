@@ -43,6 +43,7 @@ The optimizer is designed for problems where the original dimension `D` is large
 - **Lengthscale optimization**
   - Includes bounded marginal-likelihood search for scalar lengthscale.
   - Can use SciPy DIRECT / optional CMA-style refinement when enabled.
+  - Set `use_cma_lengthscale_refinement=False` to use DIRECT/fallback lengthscale search without CMA refinement.
   - Reoptimizes every `lengthscale_reoptimize_interval` iterations by default.
 
 - **Acquisition optimization backends**
@@ -140,6 +141,7 @@ optimizer = APREMBO(
     acquisition_direct_maxfun=500,
     acquisition_direct_maxiter=200,
     acquisition_local_maxfun=800,
+    use_cma_lengthscale_refinement=False,
     lipschitz_mode="predict",
     verbose=True,
 )
@@ -179,6 +181,7 @@ print("best z:", optimizer.best_z)
 | `embedding_radius` | Embedded search radius; default is `sqrt(d_embedding)` |
 | `lengthscale_lower_bound` | Lower bound for scalar lengthscale search |
 | `lengthscale_upper_bound` | Upper bound for scalar lengthscale search |
+| `use_cma_lengthscale_refinement` | If `False`, skip optional CMA refinement in direct lengthscale search |
 | `threshold_trace_risk_tolerances` | Risk tolerances used for threshold trace logging |
 | `verbose` | If `True`, print dtype/device/start value and one progress line per objective evaluation |
 
