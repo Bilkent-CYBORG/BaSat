@@ -1,6 +1,6 @@
-"""Single-file REMBO-UCB optimizer library.
 
-Typical usage:
+
+""" Typical usage:
     ``optimizer = APREMBO(...); result = optimizer.optimize(objective)``
 
 Main constructor arguments:
