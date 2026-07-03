@@ -45,6 +45,10 @@ The optimizer is designed for problems where the original dimension `D` is large
   - Can use SciPy DIRECT / optional CMA-style refinement when enabled.
   - Reoptimizes every `lengthscale_reoptimize_interval` iterations by default.
 
+- **Acquisition optimization backends**
+  - Default backend is BoTorch `optimize_acqf`.
+  - Set `acquisition_optimizer="direct-local"` to optimize the selected node's acquisition with SciPy DIRECT, then refine the result with bounded Nelder-Mead. This mirrors the DIRECT plus bounded local-search style used by the original REMBO MATLAB experiments.
+
 - **Lipschitz estimation**
   - `lipschitz_mode="predict"`: estimates the Lipschitz constant from the GP posterior mean gradient.
   - `lipschitz_mode="user"`: uses a fixed user-provided `L`.
@@ -132,6 +136,10 @@ optimizer = APREMBO(
     R=0.01,
     kernel_name="matern52",
     auto_select_kernel=True,
+    acquisition_optimizer="direct-local",
+    acquisition_direct_maxfun=500,
+    acquisition_direct_maxiter=200,
+    acquisition_local_maxfun=800,
     lipschitz_mode="predict",
     verbose=True,
 )
@@ -162,6 +170,10 @@ print("best z:", optimizer.best_z)
 | `kernel_name` | Fallback kernel name: `rbf`, `matern12`, `matern32`, `matern52` |
 | `auto_select_kernel` | If `True`, select kernel by marginal log likelihood |
 | `kernel_candidates` | Candidate kernels for automatic kernel selection |
+| `acquisition_optimizer` | Acquisition optimizer backend: `botorch`, `direct`, or `direct-local` |
+| `acquisition_direct_maxfun` | DIRECT function-evaluation cap when using `direct` or `direct-local` |
+| `acquisition_direct_maxiter` | DIRECT iteration cap when using `direct` or `direct-local` |
+| `acquisition_local_maxfun` | Bounded Nelder-Mead function-evaluation cap for `direct-local` |
 | `lipschitz_mode` | `predict` or `user` |
 | `L` | Fixed Lipschitz constant, required only when `lipschitz_mode="user"` |
 | `embedding_radius` | Embedded search radius; default is `sqrt(d_embedding)` |
@@ -179,6 +191,33 @@ Starting from fbest = 64.0
 iteration: 1 Best Value: 26.9 Current Value: 26.9
 iteration: 2 Best Value: 25.66 Current Value: 25.66
 ```
+
+---
+
+## Acquisition Optimizer
+
+APREMBO supports two acquisition-optimization styles:
+
+```python
+acquisition_optimizer="botorch"
+```
+
+uses BoTorch `optimize_acqf` with multistart raw samples. This is the default.
+
+```python
+acquisition_optimizer="direct-local"
+```
+
+uses SciPy DIRECT inside the currently selected embedded tree cell and then refines the best point with bounded Nelder-Mead. This mode is intended for experiments that should resemble the original REMBO MATLAB optimization style. In `Sentetic_experiments.py`, APREMBO is configured with:
+
+```python
+acquisition_optimizer="direct-local"
+acquisition_direct_maxfun=500
+acquisition_direct_maxiter=200
+acquisition_local_maxfun=800
+```
+
+For `batch_size > 1`, APREMBO falls back to the BoTorch optimizer because DIRECT returns a single point.
 
 ---
 
