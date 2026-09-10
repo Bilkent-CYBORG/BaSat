@@ -16,6 +16,7 @@ from .algorithms import (
     AddGPUCBConfig,
     AdveRS,
     AdveRSConfig,
+    AG_VSConfig,
     AGVSConfig,
     ALEBOConfig,
     CGPUCBConfig,
@@ -53,6 +54,7 @@ from .algorithms.algorithm import (
 from .algorithms.Contextual import AcquisitionOptimizerSpec
 from .algorithms.Distributional import ActionOptimizerSpec
 from .algorithms.helper import AlgorithmDiagnostics, AlgorithmResult, SourceRecord
+from .catalog import adapt_environment, algorithm_names, make_algorithm
 from .datasets import DatasetFamily, DatasetSchema, LoadedDataset, load_dataset
 from .environments import (
     AdversarialEnvironment,
@@ -70,18 +72,53 @@ from .environments import (
     StochasticContextAdapter,
     StochasticEnvironment,
 )
-from .experiment import Experiment
-from .models import AcquisitionConfig, GaussianProcessConfig, KernelConfig
+from .experiment import (
+    Experiment,
+    ExperimentCheckpointError,
+    ExperimentComparisonResult,
+    ExperimentConfigurationError,
+    ExperimentFailure,
+    ExperimentProtocolError,
+)
+from .models import AcquisitionConfig, GaussianProcess, GaussianProcessConfig, KernelConfig
 from .models.utils import DEFAULT_DEVICE, DEFAULT_DTYPE, Bounds
+from .plotting import PlotResult, plot, show
 from .stopping import (
     MaximumEvaluationsStoppingRule,
     MaximumRoundsStoppingRule,
     MaximumTimeStoppingRule,
+    NoImprovementStoppingRule,
     StoppingContext,
     StoppingDecision,
     StoppingRule,
+    TargetValueStoppingRule,
     all_of,
     any_of,
+)
+from .warnings import (
+    BayOPyAcquisitionWarning,
+    BayOPyBackendWarning,
+    BayOPyExperimentWarning,
+    BayOPyJitterWarning,
+    BayOPyNumericalWarning,
+    BayOPyWarning,
+)
+from .workflow import (
+    array,
+    find_path,
+    get_seed,
+    join_path,
+    linspace,
+    mean,
+    new_run_directory,
+    runtime_info,
+    save_csv,
+    save_dataset,
+    set_seed,
+    sin,
+    square,
+    sum,
+    to_list,
 )
 
 __version__ = "0.1.0"
@@ -102,6 +139,7 @@ __all__ = [
     "REMBO",
     "SAASBO",
     "AGVSConfig",
+    "AG_VSConfig",
     "ALEBOConfig",
     "AcquisitionConfig",
     "AcquisitionOptimizerSpec",
@@ -118,6 +156,12 @@ __all__ = [
     "AttackProvider",
     "AvailableActions",
     "BallPerturbations",
+    "BayOPyAcquisitionWarning",
+    "BayOPyBackendWarning",
+    "BayOPyExperimentWarning",
+    "BayOPyJitterWarning",
+    "BayOPyNumericalWarning",
+    "BayOPyWarning",
     "Bounds",
     "CGPUCBConfig",
     "ContextProvider",
@@ -136,7 +180,14 @@ __all__ = [
     "EnvironmentHistory",
     "EnvironmentRecord",
     "Experiment",
+    "ExperimentCheckpointError",
+    "ExperimentComparisonResult",
+    "ExperimentConfigurationError",
+    "ExperimentFailure",
+    "ExperimentProtocolError",
+    "ExperimentTrialsResult",
     "FullDomainPerturbations",
+    "GaussianProcess",
     "GaussianProcessConfig",
     "GoodActionConfig",
     "HeSBO",
@@ -151,6 +202,8 @@ __all__ = [
     "MaximumRoundsStoppingRule",
     "MaximumTimeStoppingRule",
     "MultiStartSolver",
+    "NoImprovementStoppingRule",
+    "PlotResult",
     "REMBOConfig",
     "RoBOS",
     "RoBOSConfig",
@@ -164,10 +217,34 @@ __all__ = [
     "StoppingContext",
     "StoppingDecision",
     "StoppingRule",
+    "TargetValueStoppingRule",
+    "TrialStatistics",
     "TuRBO",
     "TuRBOConfig",
     "__version__",
+    "adapt_environment",
+    "algorithm_names",
     "all_of",
     "any_of",
+    "array",
+    "find_path",
+    "get_seed",
+    "join_path",
+    "linspace",
     "load_dataset",
+    "make_algorithm",
+    "mean",
+    "new_run_directory",
+    "plot",
+    "runtime_info",
+    "save_csv",
+    "save_dataset",
+    "set_seed",
+    "show",
+    "sin",
+    "square",
+    "sum",
+    "to_list",
 ]
+
+from .trials import ExperimentTrialsResult, TrialStatistics

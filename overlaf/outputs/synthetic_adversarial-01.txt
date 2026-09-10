@@ -1,0 +1,98 @@
+Saved-result refresh (no optimization was executed).
+Source: results/last_guide/synthetic_adversarial/run_crdnppew/results.json
+Trials: 5/5; limits: {'max_evaluations': 50, 'max_rounds': None}
+Algorithm | evaluations per trial | final mean best reward | failures
+REMBO | [50, 50, 50, 50, 50] | -0.00055410314 | 0
+HeSBO | [50, 50, 50, 50, 50] | -0.016273457 | 0
+ALEBO | [50, 50, 50, 50, 50] | 0.00280157 | 0
+ADD_GP_UCB | [50, 50, 50, 50, 50] | 0.013408545 | 0
+TuRBO | [50, 50, 50, 50, 50] | 0.013585926 | 0
+Dropout | [50, 50, 50, 50, 50] | 0.0021817932 | 0
+MCTS_VS | [50, 50, 50, 50, 50] | -0.022155244 | 0
+SAASBO | [50, 50, 50, 50, 50] | 0.011131831 | 0
+AG_VS | [50, 50, 50, 50, 50] | 0.0078923088 | 0
+LA_MCTS | [50, 50, 50, 50, 50] | 0.0021800672 | 0
+PG | [50, 50, 50, 50, 50] | -0.043551361 | 0
+EG | [50, 50, 50, 50, 50] | -0.0076407504 | 0
+GS | [50, 50, 50, 50, 50] | -0.017379693 | 0
+Satisficing_TS | [50, 50, 50, 50, 50] | -0.052480618 | 0
+CGP_UCB | [50, 50, 50, 50, 50] | 0.014266291 | 0
+DRBO | [50, 50, 50, 50, 50] | 0.013001037 | 0
+RoBOS | [50, 50, 50, 50, 50] | -0.022551717 | 0
+StableOPT | [50, 50, 50, 50, 50] | 0.010088486 | 0
+AdveRS | [50, 50, 50, 50, 50] | -0.032116127 | 0
+Total recorded evaluations: 4750; failed trials: 0
+
+Recorded stopping reasons by trial:
+REMBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+HeSBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+ALEBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+ADD_GP_UCB: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+TuRBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Dropout: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+MCTS_VS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+SAASBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+AG_VS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+LA_MCTS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+PG: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+EG: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+GS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Satisficing_TS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+CGP_UCB: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+DRBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+RoBOS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+StableOPT: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+AdveRS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+
+Recorded warnings (deduplicated per algorithm):
+REMBO: REMBOWarning: REMBO is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+HeSBO: HeSBOWarning: HeSBO is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+HeSBO: HeSBOWarning: The sampled HeSBO map has empty buckets; finite inverse coordinates require metadata.
+ALEBO: ALEBOWarning: ALEBO is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+ADD_GP_UCB: ADD_GP_UCBWarning: ADD_GP_UCB is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+TuRBO: TuRBOWarning: TuRBO is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+Dropout: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-03 during GP hyperparameter fitting (training-covariance Cholesky) because the covariance matrix was not positive definite.
+Dropout: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-04 during GP hyperparameter fitting (training-covariance Cholesky) because the covariance matrix was not positive definite.
+Dropout: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-05 during GP hyperparameter fitting (training-covariance Cholesky) because the covariance matrix was not positive definite.
+Dropout: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-06 during GP hyperparameter fitting (training-covariance Cholesky) because the covariance matrix was not positive definite.
+Dropout: DropoutWarning: Dropout is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+MCTS_VS: MCTS_VSWarning: MCTS_VS is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+MCTS_VS: MCTS_VSWarning: Non-default MCTS-VS tree parameters change source-regression mode.
+SAASBO: DeprecationWarning: `torch.jit.trace` is deprecated. Please switch to `torch.compile` or `torch.export`.
+SAASBO: SAASBOWarning: NUTS reported 1 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 2 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 3 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 8 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: SAASBO is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+AG_VS: AG_VSWarning: AG_VS is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+AG_VS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+AG_VS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+LA_MCTS: LA_MCTSWarning: LA_MCTS is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+LA_MCTS: LA_MCTSWarning: Selected LA-MCTS numerical settings differ from the configuration defaults.
+PG: BayOPyAcquisitionWarning: BayOPy used random acquisition-optimizer restart points during continuous acquisition optimization because the sampled acquisition values were all zero. The optimization continues, but this usually indicates a locally flat acquisition surface.
+PG: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+PG: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+PG: PGWarning: PG is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+EG: BayOPyAcquisitionWarning: BayOPy used random acquisition-optimizer restart points during continuous acquisition optimization because the sampled acquisition values were all zero. The optimization continues, but this usually indicates a locally flat acquisition surface.
+EG: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+EG: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+EG: EGWarning: EG is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+GS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+GS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+GS: GSWarning: GS is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+Satisficing_TS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+Satisficing_TS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+Satisficing_TS: Satisficing_TSWarning: Satisficing_TS is outside its native environment type ['stochastic'] in the 'adversarial' environment. No required inputs are missing; no internal defaults were needed. Additional environment information is ignored.
+CGP_UCB: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+CGP_UCB: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+CGP_UCB: CGP_UCBWarning: CGP_UCB is outside its native environment type ['contextual'] in the 'adversarial' environment. Applied the explicit 'constant_context' adapter.
+CGP_UCB: CGP_UCBWarning: Missing pre-action context: internal context=[0.0]. Any environment-provided current context takes precedence.
+DRBO: DRBOWarning: DRBO is outside its native environment type ['distributional'] in the 'adversarial' environment. Applied the explicit 'singleton_distribution' adapter.
+DRBO: DRBOWarning: Missing distributional inputs use internal defaults: context_support is the zero context as a singleton when absent; reference_distribution is a point mass on the supplied context, or uniform over supplied support when no current context is provided; margin=0. Environment-provided values override each default. Actual contexts and evaluated actions remain attached to their observed rewards.
+RoBOS: RoBOSWarning: Missing distributional inputs use internal defaults: context_support is the zero context as a singleton when absent; reference_distribution is a point mass on the supplied context, or uniform over supplied support when no current context is provided; margin=0. Environment-provided values override each default. Actual contexts and evaluated actions remain attached to their observed rewards.
+RoBOS: RoBOSWarning: RoBOS is outside its native environment type ['distributional'] in the 'adversarial' environment. Applied the explicit 'singleton_distribution' adapter.
+StableOPT: StableOPTWarning: Applying an external attack after StableOPT's internal robust query is a BayOPy extension.
+AdveRS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+AdveRS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+
+Saved results: results/last_guide/synthetic_adversarial/run_crdnppew

@@ -1,0 +1,98 @@
+Saved-result refresh (no optimization was executed).
+Source: results/last_guide/real_stochastic/run_32679mqf/results.json
+Trials: 5/5; limits: {'max_evaluations': 50, 'max_rounds': None}
+Algorithm | evaluations per trial | final mean best reward | failures
+REMBO | [50, 50, 50, 50, 50] | -38.2 | 0
+HeSBO | [50, 50, 50, 50, 50] | -36.8 | 0
+ALEBO | [50, 50, 50, 50, 50] | -41 | 0
+ADD_GP_UCB | [50, 50, 50, 50, 50] | -31 | 0
+TuRBO | [50, 50, 50, 50, 50] | -43 | 0
+Dropout | [50, 50, 50, 50, 50] | -41.6 | 0
+MCTS_VS | [50, 50, 50, 50, 50] | -42.2 | 0
+SAASBO | [50, 50, 50, 50, 50] | -42.6 | 0
+AG_VS | [50, 50, 50, 50, 50] | -34.2 | 0
+LA_MCTS | [50, 50, 50, 50, 50] | -45 | 0
+PG | [50, 50, 50, 50, 50] | -49 | 0
+EG | [50, 50, 50, 50, 50] | -49 | 0
+GS | [50, 50, 50, 50, 50] | -49 | 0
+Satisficing_TS | [50, 50, 50, 50, 50] | -49 | 0
+CGP_UCB | [50, 50, 50, 50, 50] | -37 | 0
+DRBO | [50, 50, 50, 50, 50] | -49 | 0
+RoBOS | [50, 50, 50, 50, 50] | -49 | 0
+StableOPT | [50, 50, 50, 50, 50] | -31 | 0
+AdveRS | [50, 50, 50, 50, 50] | -49 | 0
+Total recorded evaluations: 4750; failed trials: 0
+
+Recorded stopping reasons by trial:
+REMBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+HeSBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+ALEBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+ADD_GP_UCB: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+TuRBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Dropout: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+MCTS_VS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+SAASBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+AG_VS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+LA_MCTS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+PG: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+EG: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+GS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Satisficing_TS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+CGP_UCB: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+DRBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+RoBOS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+StableOPT: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+AdveRS: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+
+Recorded warnings (deduplicated per algorithm):
+REMBO: REMBOWarning: REMBO compresses available finite action rows into embedding coordinates and scores those rows directly. It returns the actual recorded action; rewards are not interpolated. Context, distribution and perturbation information are not used by this stochastic policy. This finite-data extension does not inherit the original embedding guarantees. Set finite_candidate_mode='exact' to require the original embedding geometry.
+REMBO: REMBOWarning: REMBO finite-table selection is a BayOPy ask-tell extension to the governing source.
+HeSBO: HeSBOWarning: HeSBO compresses available finite action rows into embedding coordinates and scores those rows directly. It returns the actual recorded action; rewards are not interpolated. Context, distribution and perturbation information are not used by this stochastic policy. This finite-data extension does not inherit the original embedding guarantees. Set finite_candidate_mode='exact' to require the original embedding geometry.
+HeSBO: HeSBOWarning: HeSBO finite-table selection is a BayOPy ask-tell extension to the governing source.
+HeSBO: HeSBOWarning: The sampled HeSBO map has empty buckets; finite inverse coordinates require metadata.
+ALEBO: ALEBOWarning: ALEBO compresses available finite action rows into embedding coordinates and scores those rows directly. It returns the actual recorded action; rewards are not interpolated. Context, distribution and perturbation information are not used by this stochastic policy. This finite-data extension does not inherit the original embedding guarantees. Set finite_candidate_mode='exact' to require the original embedding geometry.
+ALEBO: ALEBOWarning: ALEBO finite-table selection is a BayOPy ask-tell extension to the governing source.
+ADD_GP_UCB: ADD_GP_UCBWarning: ADD_GP_UCB finite-table selection is a BayOPy ask-tell extension to the governing source.
+ADD_GP_UCB: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+TuRBO: TuRBOWarning: TuRBO finite-table selection is a BayOPy ask-tell extension to the governing source.
+Dropout: DropoutWarning: Dropout finite-table selection is a BayOPy ask-tell extension to the governing source.
+MCTS_VS: MCTS_VSWarning: MCTS_VS finite-table selection is a BayOPy ask-tell extension to the governing source.
+MCTS_VS: MCTS_VSWarning: Non-default MCTS-VS tree parameters change source-regression mode.
+SAASBO: DeprecationWarning: `torch.jit.trace` is deprecated. Please switch to `torch.compile` or `torch.export`.
+SAASBO: SAASBOWarning: NUTS effective sample size is below the configured floor. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 1 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 10 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 18 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 2 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 3 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 4 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: NUTS reported 6 divergent transitions. Finite, loadable posterior draws were retained under diagnostic_policy='warn'; source guarantees no longer apply.
+SAASBO: SAASBOWarning: SAASBO finite-table selection is a BayOPy ask-tell extension to the governing source.
+AG_VS: AG_VSWarning: AG_VS finite-table selection is a BayOPy ask-tell extension to the governing source.
+AG_VS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+AG_VS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+LA_MCTS: LA_MCTSWarning: LA_MCTS finite-table selection is a BayOPy ask-tell extension to the governing source.
+LA_MCTS: LA_MCTSWarning: Selected LA-MCTS numerical settings differ from the configuration defaults.
+PG: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+PG: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+PG: PGWarning: PG finite-table selection is a BayOPy ask-tell extension to the governing source.
+EG: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+EG: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+EG: EGWarning: EG finite-table selection is a BayOPy ask-tell extension to the governing source.
+GS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+GS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+GS: GSWarning: GS finite-table selection is a BayOPy ask-tell extension to the governing source.
+Satisficing_TS: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+Satisficing_TS: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+Satisficing_TS: Satisficing_TSWarning: Satisficing_TS finite-table selection is a BayOPy ask-tell extension to the governing source.
+CGP_UCB: CGP_UCBWarning: CGP_UCB is outside its native environment type ['contextual'] in the 'stochastic' environment. Applied the explicit 'constant_context' adapter.
+CGP_UCB: CGP_UCBWarning: Missing pre-action context: internal context=[0.0]. Any environment-provided current context takes precedence.
+DRBO: DRBOWarning: DRBO is outside its native environment type ['distributional'] in the 'stochastic' environment. Applied the explicit 'singleton_distribution' adapter.
+DRBO: DRBOWarning: Missing distributional inputs use internal defaults: context_support is the zero context as a singleton when absent; reference_distribution is a point mass on the supplied context, or uniform over supplied support when no current context is provided; margin=0. Environment-provided values override each default. Actual contexts and evaluated actions remain attached to their observed rewards.
+RoBOS: RoBOSWarning: Missing distributional inputs use internal defaults: context_support is the zero context as a singleton when absent; reference_distribution is a point mass on the supplied context, or uniform over supplied support when no current context is provided; margin=0. Environment-provided values override each default. Actual contexts and evaluated actions remain attached to their observed rewards.
+RoBOS: RoBOSWarning: RoBOS is outside its native environment type ['distributional'] in the 'stochastic' environment. Applied the explicit 'singleton_distribution' adapter.
+StableOPT: StableOPTWarning: StableOPT finite-table selection is a BayOPy ask-tell extension to the governing source.
+AdveRS: AdveRSWarning: AdveRS is outside its native environment type ['adversarial'] in the 'stochastic' environment. Applied the explicit 'zero_external_attack' adapter.
+AdveRS: AdveRSWarning: Missing external-attack metadata: evaluated_action defaults to the nominal action and perturbation defaults to evaluated_action - nominal_action (zero when no attack is reported). Environment-provided values take precedence. The source is evaluated unchanged. source context/distribution information is ignored by this learner. This is a cross-environment extension, not an adversarial source guarantee.
+
+Saved results: results/last_guide/real_stochastic/run_32679mqf

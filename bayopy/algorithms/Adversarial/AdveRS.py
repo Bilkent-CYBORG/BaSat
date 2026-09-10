@@ -308,6 +308,14 @@ class AdveRS(Algorithm):
         )
         self.state = self._empty_state()
 
+    def prepare_feedback(self, feedback: Mapping[str, Any], *, action: Any) -> dict[str, Any]:
+        result = super().prepare_feedback(feedback, action=action)
+        if result.get("perturbation") is None:
+            nominal = torch.as_tensor(action, dtype=self.dtype, device=self.device)
+            result["perturbation"] = torch.as_tensor(result["evaluated_action"], dtype=self.dtype, device=self.device) - nominal
+            self._warn_environment_default("perturbation", "evaluated_action - nominal_action (zero without an external attack)")
+        return result
+
     @staticmethod
     def _validate_config(config: AdveRSConfig) -> None:
         """Validate variant, perturbation geometry, and solver invariants."""
@@ -1391,15 +1399,16 @@ class AdveRS(Algorithm):
 
         if not self.state.proposals:
             return self._best_observed()
-        scores = torch.tensor(self.state.optimistic_scores)
+        scores = torch.tensor(self.state.optimistic_scores, dtype=self.dtype, device=self.device)
         finite = torch.isfinite(scores)
-        if self.config.variant == "RS2":
-            position = int(torch.argmax(scores).item())
-        elif finite.any():
-            indices = torch.nonzero(finite, as_tuple=False).reshape(-1)
-            position = int(indices[torch.argmin(scores[indices])].item())
-        else:
-            position = len(self.state.proposals) - 1
+        if not finite.any():
+            # Initial-design proposals have no acquisition score. An infinite
+            # RS1/RSG fragility also supplies no finite certificate. Preserve
+            # a nominal proposal while reporting that no score is available.
+            return self.state.proposals[-1].detach().clone(), None
+        indices = torch.nonzero(finite, as_tuple=False).reshape(-1)
+        select = torch.argmax if self.config.variant == "RS2" else torch.argmin
+        position = int(indices[select(scores[indices])].item())
         return self.state.proposals[position].detach().clone(), float(scores[position].item())
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
@@ -1440,6 +1449,7 @@ class AdveRS(Algorithm):
             "variant": self.config.variant,
             "aspiration": self.config.aspiration,
             "p": self.config.p,
+            "gp": self.gp.state_dict(),
             "state": {name: getattr(self.state, name) for name in self.state.__dataclass_fields__},
         }
 
@@ -1459,7 +1469,7 @@ class AdveRS(Algorithm):
             raise AdveRSCheckpointError("AdveRS state is incomplete.", algorithm=self)
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
-        """Restore validated AdveRS traces and reset the GP for a fresh fit."""
+        """Restore traces and the learned GP warm start for exact continuation."""
 
         del strict
         raw = state["state"]
@@ -1485,7 +1495,10 @@ class AdveRS(Algorithm):
                 worst_points=[tensor(x) for x in raw["worst_points"]],
                 aspiration_satisfied=[bool(x) for x in raw["aspiration_satisfied"]],
             )
-            self.gp.reset()
+            if isinstance(state.get("gp"), dict):
+                self.gp.load_state_dict(dict(state["gp"]))
+            else:
+                self.gp.reset()
         except Exception as error:
             raise AdveRSCheckpointError(
                 f"Invalid AdveRS checkpoint: {error}", algorithm=self

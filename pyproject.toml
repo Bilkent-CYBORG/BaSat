@@ -28,7 +28,23 @@ dependencies = [
   "torch>=2.6,<2.11",
   "gpytorch>=1.14,<1.16",
   "botorch>=0.15,<0.18",
+  "cma>=4,<5",
+  "scikit-learn>=1.5,<2",
+  "pyro-ppl>=1.9,<2",
+  "cvxpy>=1.6,<2",
+  "matplotlib>=3.9,<4",
+  "umap-learn>=0.5.7,<0.6",
+  "ipykernel>=7,<8",
+  "ipywidgets>=8.1,<9",
+  "jupyterlab>=4,<5",
+  "nbformat>=5,<6",
+  "nbclient>=0.10,<1",
+  "reportlab>=4,<6",
+  "pypdf>=6,<7",
 ]
+
+[project.scripts]
+bayopy = "bayopy.__main__:main"
 
 [project.optional-dependencies]
 optimizers = ["cma>=4,<5"]

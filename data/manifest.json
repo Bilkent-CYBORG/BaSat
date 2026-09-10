@@ -1,0 +1,76 @@
+[
+  {
+    "environment": "stochastic",
+    "name": "diabetes",
+    "task": "regression",
+    "path": "data/stochastic/diabetes_observations.csv",
+    "rows": 442,
+    "features": 10,
+    "sha256": "d6a20b0c5f246e6d8b92cfb376b036f79b6cbd55fd968d58772943363272be4b",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/diabetes_data_raw.csv.gz",
+        "sha256": "a3e94cc7cea00f8a84fa5f6345203913a68efa42df18f87ddf9bead721bfd503"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/diabetes_target.csv.gz",
+        "sha256": "8e53f65eb811df43c206f3534bb3af0e5fed213bc37ed6ba36310157d6023803"
+      }
+    ]
+  },
+  {
+    "environment": "contextual",
+    "name": "wine",
+    "task": "classification",
+    "path": "data/contextual/wine_observations.csv",
+    "rows": 178,
+    "features": 13,
+    "sha256": "4a89dcee8a7682248f2632915efd26eecc813178455e0815763d073624d286ff",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/wine_data.csv",
+        "sha256": "10e8a802908b34f86e5da8ce962f3c806694bc98450a18f61851af59f324bede"
+      }
+    ]
+  },
+  {
+    "environment": "distributional",
+    "name": "opsd_wind_power",
+    "task": "wind energy commitment",
+    "path": "data/distributional/opsd_wind_2013.csv",
+    "rows": 98,
+    "sha256": "bec340914646f01f2c2c9fa1ec5d9a4d74088e7f49338afd020fd122c77d908f",
+    "sources": [
+      {
+        "url": "https://data.open-power-system-data.org/time_series/2019-06-05/time_series_60min_singleindex.csv",
+        "retained_subset": "data/distributional/opsd_wind_2013.csv",
+        "sha256": "bec340914646f01f2c2c9fa1ec5d9a4d74088e7f49338afd020fd122c77d908f",
+        "years": [
+          2013
+        ],
+        "columns": [
+          "utc_timestamp",
+          "DE_wind_generation_actual",
+          "DE_wind_capacity",
+          "DE_wind_profile"
+        ],
+        "rows": 98
+      }
+    ]
+  },
+  {
+    "environment": "adversarial",
+    "name": "iris",
+    "task": "classification",
+    "path": "data/adversarial/iris_observations.csv",
+    "rows": 150,
+    "features": 4,
+    "sha256": "6dc4ca4e0d913496f6f10e623a6e923c6bdfda76c850403c5acc680c2652f67e",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/iris.csv",
+        "sha256": "f13ffa8fdd56fd8e6c8d16d4081a3fbd3114bcd0aae4256c43205169cd9d1449"
+      }
+    ]
+  }
+]

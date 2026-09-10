@@ -2,16 +2,16 @@
 
 The search lives in ``y in Y subset R^d``.  Actions are generated only through
 the paper map ``x = p_X(Ay)`` in the symmetric ambient box and then transformed
-back to physical environment bounds.  Finite rows require caller-supplied
-embedded coordinates and are never assigned a pseudoinverse representation.
+back to physical environment bounds. Finite rows use a warned projected-coordinate
+selection extension by default; exact stored-coordinate mode remains available.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any, ClassVar, Literal
 
 import gpytorch
 import torch
@@ -123,8 +123,11 @@ class REMBOConfig:
         Reduced dimension and optional explicit search-box endpoints.
     kernel_type, custom_kernel:
         Paper kernel coordinate system or qualified custom kernel.
-    acquisition, batch_size:
-        EI/UCB rule and sequential or documented BayOPy q-extension size.
+    acquisition, initial_points, batch_size:
+        EI/UCB rule, optional initial-design count, and sequential or
+        documented BayOPy q-extension size.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     lengthscale_lower, lengthscale_upper, initial_lengthscale:
         Algorithm-3 lengthscale interval and initial value.
     t_sigma, refit_interval, exploitation_count_limit, upper_bound_multiplier:
@@ -134,11 +137,14 @@ class REMBOConfig:
     """
 
     embedding_dimension: int
+    finite_candidate_mode: Literal["project", "exact"] = field(default="project", kw_only=True)
     Y_lower: Any | None = None
     Y_upper: Any | None = None
     kernel_type: Literal["low_dimensional", "high_dimensional", "categorical"] = "low_dimensional"
     custom_kernel: gpytorch.kernels.Kernel | None = None
     acquisition: Literal["EI", "UCB"] = "EI"
+    initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     batch_size: int | None = 1
     q_batch: int | None = None
     lengthscale_lower: float = 0.01
@@ -194,6 +200,10 @@ class REMBO(Algorithm):
     """
 
     ACQUISITION_POLICY = "configurable EI or UCB in the random embedding"
+    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = {
+        "initial_points": None,
+        "initial_points_sampling_method": "paper",
+    }
 
     EXCEPTION_CLASS = REMBOException
     native_environments = frozenset({"stochastic"})
@@ -251,6 +261,7 @@ class REMBO(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -302,6 +313,8 @@ class REMBO(Algorithm):
 
         if not isinstance(config, REMBOConfig):
             raise AlgorithmConfigurationError("config must be REMBOConfig.")
+        if config.finite_candidate_mode not in {"project", "exact"}:
+            raise AlgorithmConfigurationError("finite_candidate_mode must be project or exact.")
         resolve_batch_configuration(batch_size=config.batch_size, q_batch=config.q_batch)
         if (
             isinstance(config.embedding_dimension, bool)
@@ -319,6 +332,12 @@ class REMBO(Algorithm):
             )
         if config.acquisition not in {"EI", "UCB"}:
             raise AlgorithmConfigurationError("REMBO acquisition must be EI or UCB.")
+        if config.initial_points is not None and (
+            isinstance(config.initial_points, bool)
+            or not isinstance(config.initial_points, int)
+            or config.initial_points < 1
+        ):
+            raise AlgorithmConfigurationError("initial_points must be positive or None.")
         for name in ("refit_interval", "exploitation_count_limit"):
             value = getattr(config, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -447,6 +466,14 @@ class REMBO(Algorithm):
             ),
         )
 
+    def _finite_coordinates(self, actions: torch.Tensor, metadata: Mapping[str, Any], *, historical: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compress measured rows without replacing actions or imputing rewards."""
+        if self.config.finite_candidate_mode == "exact":
+            Y = self._embedded_metadata(metadata, actions.shape[0])
+            return Y, self._verify_representation(actions, Y, historical=historical)
+        X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
+        return X @ torch.linalg.pinv(self.state.A).T, X
+
     def _embedded_metadata(self, source: Mapping[str, Any], rows: int) -> torch.Tensor:
         """Read exact ``(rows, D_model)`` REMBO coordinates from public metadata.
 
@@ -500,15 +527,14 @@ class REMBO(Algorithm):
         return self._project_to_X(Y)
 
     def _initialize_from_environment_impl(self, data: Any) -> None:
-        """Load exact embedded coordinates and observations from visible history."""
+        """Encode learner-visible history according to the finite-data policy."""
 
         rows = int(data.observations.shape[0])
         if rows == 0:
             return
         metadata = data.metadata if isinstance(data.metadata, Mapping) else {}
-        Y = self._embedded_metadata(metadata, rows)
         actions = torch.as_tensor(data.actions, dtype=self.dtype, device=self.device)
-        X = self._verify_representation(actions, Y, historical=True)
+        Y, X = self._finite_coordinates(actions, metadata, historical=True)
         self.state.Y_train = Y.detach().clone()
         self.state.X_train = X.detach().clone()
         self.state.function_values = (
@@ -527,8 +553,7 @@ class REMBO(Algorithm):
     ) -> DiscreteAcquisitionCandidates:
         """Construct the one-to-one finite table in configured kernel coordinates."""
 
-        Y = self._embedded_metadata(round_info, candidate_actions.shape[0])
-        X = self._verify_representation(candidate_actions, Y, historical=False)
+        Y, X = self._finite_coordinates(candidate_actions, round_info)
         return DiscreteAcquisitionCandidates(
             environment_actions=candidate_actions.detach().clone(),
             model_inputs=self._kernel_coordinates(Y, X).detach().clone(),
@@ -707,10 +732,10 @@ class REMBO(Algorithm):
     def _initial_design_size(self) -> int:
         """Return the paper initial-design size in embedded coordinates."""
 
-        return max(2 * self.config.embedding_dimension, 4)
+        return self.config.initial_points or max(2 * self.config.embedding_dimension, 4)
 
     def _ask_impl(self, *, round_info: Mapping[str, Any]) -> torch.Tensor:
-        """Select a continuous or exact finite REMBO action batch."""
+        """Select a continuous or finite REMBO action batch."""
 
         finite = "candidate_actions" in round_info
         table: DiscreteAcquisitionCandidates | None = None
@@ -721,14 +746,14 @@ class REMBO(Algorithm):
                 candidate_dataset_indices=round_info["candidate_dataset_indices"],
                 round_info=round_info,
             )
-            finite_Y = self._embedded_metadata(round_info, table.environment_actions.shape[0])
+            finite_Y, _ = self._finite_coordinates(table.environment_actions, round_info)
         if self.state.function_values.numel() < self._initial_design_size():
             if table is not None:
                 order = torch.argsort(table.dataset_indices)[: self.request_size]
                 actions = table.environment_actions[order]
                 assert finite_Y is not None
                 Y = finite_Y[order]
-                X = self._project_to_X(Y)
+                X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
             else:
                 region = Bounds(self.Y_lower, self.Y_upper)
                 design = self._sample_design(
@@ -759,7 +784,7 @@ class REMBO(Algorithm):
                 actions = result.environment_actions
                 assert finite_Y is not None
                 Y = finite_Y[result.selected_rows]
-                X = self._project_to_X(Y)
+                X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
                 value = float(result.acquisition_values.sum().item())
             else:
                 Y, acquisition_value = self._maximize_paper_acquisition(acquisition)

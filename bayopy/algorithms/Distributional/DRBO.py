@@ -28,6 +28,7 @@ from .Exception.exception_DRBO import (
     DRBOMMDMatrixError,
     DRBOReferenceDistributionError,
 )
+from .Exception.exception_RoBOS import RoBOSContextSupportError
 from .RoBOS import _FiniteContextGPAlgorithm, theoretical_beta
 
 
@@ -59,9 +60,6 @@ class DRBOConfig:
 
     Parameters
     ----------
-    contexts:
-        Public finite context support with shape ``(K, D_context)``. Realized
-        feedback contexts must match one support row unambiguously.
     context_kernel:
         Kernel for context coordinates and the ``(K, K)`` MMD Gram matrix.
     action_kernel:
@@ -95,7 +93,6 @@ class DRBOConfig:
         Seed for algorithm-owned candidate generation and deterministic replay.
     """
 
-    contexts: torch.Tensor | np.ndarray
     context_kernel: KernelConfig | gpytorch.kernels.Kernel = field(default_factory=KernelConfig)
     action_kernel: KernelConfig | gpytorch.kernels.Kernel = field(default_factory=KernelConfig)
     beta: Callable[[int], float] | float = theoretical_beta
@@ -180,14 +177,12 @@ class DRBO(_FiniteContextGPAlgorithm):
 
     Examples
     --------
-    >>> import torch
     >>> import bayopy
     >>> bounds = bayopy.Bounds(lower=[-1.0, 0.0], upper=[1.0, 1.0])
-    >>> contexts = torch.tensor([[0.0], [0.5], [1.0]])
     >>> algorithm = bayopy.DRBO(
     ...     bounds=bounds,
     ...     config=bayopy.DRBOConfig(
-    ...         contexts=contexts, inner_solver="enumeration", initial_points=3, seed=7
+    ...         inner_solver="enumeration", initial_points=3, seed=7
     ...     ),
     ... )
     """
@@ -230,9 +225,8 @@ class DRBO(_FiniteContextGPAlgorithm):
         bounds:
             Box constraints for the ``D_action`` learner-controlled coordinates.
         config:
-            Immutable context-support, MMD-program, GP, and optimizer settings.
-            The configured context matrix has shape ``(K, D_context)`` and is
-            concatenated with actions only inside the joint GP input space.
+            Immutable MMD-program, GP, and optimizer settings. Context support
+            belongs to the environment and is bound before optimization.
         maximize:
             Optimization direction.  Version 1 implements maximization only.
         dtype, device:
@@ -267,7 +261,7 @@ class DRBO(_FiniteContextGPAlgorithm):
         )
         try:
             self._initialize_finite_context_model(
-                contexts=config.contexts,
+                contexts=None,
                 action_kernel=config.action_kernel,
                 context_kernel=config.context_kernel,
                 joint_kernel_combination="product",
@@ -357,6 +351,13 @@ class DRBO(_FiniteContextGPAlgorithm):
             solver_residuals=[],
             realized_contexts=[],
         )
+
+    def bind_environment_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Bind public support and preserve DRBO-specific error reporting."""
+        try:
+            super().bind_environment_metadata(metadata)
+        except RoBOSContextSupportError as error:
+            raise DRBOContextSupportError(str(error), algorithm=self) from error
 
     def _validate_context_support(self) -> None:
         """Validate finite contexts and translate failures to the DRBO error type."""
@@ -826,9 +827,12 @@ class DRBO(_FiniteContextGPAlgorithm):
     ) -> tuple[torch.Tensor, float, torch.Tensor, dict[str, float]]:
         """Refine robust-UCB starts using a certified black-box outer solve.
 
-        The inner MMD program is rerun after each successful local solve.  Raw
-        Sobol candidates determine deterministic starts only; if every restart
-        fails, no unchecked screening point is returned as a fallback.
+        The inner MMD program is rerun after each successful local solve. A
+        solver endpoint must improve on its start beyond the configured
+        numerical tolerance; otherwise that start is independently recertified.
+        This prevents derivative-free line searches from moving to a box corner
+        on a flat acquisition. If every restart fails, no unchecked screening
+        point is returned as a fallback.
         """
 
         try:
@@ -914,6 +918,25 @@ class DRBO(_FiniteContextGPAlgorithm):
                 continue
             if not math.isfinite(value):
                 continue
+            improvement_tolerance = self.config.optimizer_tolerance * (
+                1.0 + abs(raw_values[position])
+            )
+            if value <= raw_values[position] + improvement_tolerance:
+                # Powell can report success after drifting across a plateau or
+                # returning a slightly worse point. A successful local solve
+                # cannot justify discarding its superior certified start.
+                action = raw_actions[position].detach().clone()
+                bound_residual = self._action_bound_residual(action)
+                if bound_residual > self.config.feasibility_tolerance:
+                    continue
+                try:
+                    value, worst, certificate = self._worst_case_expected_ucb(
+                        self._ucb_vector(action), reference, margin, gram
+                    )
+                except DRBOInnerSolverError:
+                    continue
+                if not math.isfinite(value):
+                    continue
             certificate = dict(certificate)
             certificate["outer_bounds"] = bound_residual
             accepted_actions.append(action.detach().clone())
@@ -945,6 +968,7 @@ class DRBO(_FiniteContextGPAlgorithm):
         nor inspected.
         """
 
+        self.bind_environment_metadata(round_info)
         reference, margin = self._validate_reference_and_margin(
             round_info["reference_distribution"], round_info["margin"]
         )
@@ -1013,15 +1037,16 @@ class DRBO(_FiniteContextGPAlgorithm):
 
         if not self.state.selected_actions:
             return self._best_observed()
-        scores = torch.tensor(self.state.robust_values)
+        scores = torch.tensor(self.state.robust_values, dtype=self.dtype, device=self.device)
         finite = torch.isfinite(scores)
         if finite.any():
             indices = torch.nonzero(finite, as_tuple=False).reshape(-1)
             position = int(indices[torch.argmax(scores[indices])].item())
         else:
-            position = len(self.state.selected_actions) - 1
-        return self.state.selected_actions[position].detach().clone(), float(
-            scores[position].item()
+            return self._best_observed()
+        value = float(scores[position].item())
+        return self.state.selected_actions[position].detach().clone(), (
+            value if self.maximize else -value
         )
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
@@ -1051,6 +1076,8 @@ class DRBO(_FiniteContextGPAlgorithm):
 
         return {
             "contexts": self.contexts,
+            "context_support_is_dynamic": getattr(self, "_dynamic_context_support", False),
+            "gp": self.gp.state_dict(),
             "ambiguity_metric": self.config.ambiguity_metric,
             "state": {name: getattr(self.state, name) for name in self.state.__dataclass_fields__},
         }
@@ -1059,6 +1086,11 @@ class DRBO(_FiniteContextGPAlgorithm):
         """Validate checkpoint support, ambiguity metric, and required mappings."""
 
         del strict
+        if not self.contexts.numel() or state.get("context_support_is_dynamic", False):
+            self.bind_environment_metadata({
+                "context_support": state.get("contexts"),
+                "context_support_is_dynamic": state.get("context_support_is_dynamic", False),
+            })
         if (
             not self._support_matches(state.get("contexts"))
             or state.get("ambiguity_metric") != "mmd"
@@ -1093,7 +1125,10 @@ class DRBO(_FiniteContextGPAlgorithm):
                 solver_residuals=[dict(x) for x in raw["solver_residuals"]],
                 realized_contexts=[tensor(x) for x in raw["realized_contexts"]],
             )
-            self.gp.reset()
+            if isinstance(state.get("gp"), dict):
+                self.gp.load_state_dict(dict(state["gp"]))
+            else:
+                self.gp.reset()
         except Exception as error:
             raise DRBOCheckpointError(
                 f"Invalid DRBO checkpoint: {error}", algorithm=self

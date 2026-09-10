@@ -414,6 +414,159 @@ class MaximumTimeStoppingRule(StoppingRule):
         return {"maximum_seconds": self.maximum_seconds}
 
 
+class TargetValueStoppingRule(StoppingRule):
+    """Stop when the best observed objective reaches a target.
+
+    ``maximize`` must match the algorithm's objective direction. This rule uses
+    observed rewards, including observation noise, rather than a posterior
+    certificate or an algorithm-specific recommended value.
+    """
+
+    def __init__(self, target: float, *, maximize: bool = True) -> None:
+        if not isinstance(maximize, bool):
+            raise StoppingRuleError("maximize must be bool.")
+        if isinstance(target, bool):
+            raise StoppingRuleError("target must be finite.")
+        try:
+            self.target = float(target)
+        except (TypeError, ValueError) as error:
+            raise StoppingRuleError("target must be finite.") from error
+        if not math.isfinite(self.target):
+            raise StoppingRuleError("target must be finite.")
+        self.maximize = maximize
+
+    def evaluate(self, context: StoppingContext) -> StoppingDecision:
+        value = getattr(context.algorithm_result, "best_observed_value", None)
+        stop = value is not None and (
+            value >= self.target if self.maximize else value <= self.target
+        )
+        return StoppingDecision(
+            stop=bool(stop),
+            reason="target_value" if stop else None,
+            details={"best_observed_value": value, "target": self.target},
+        )
+
+    def _configuration_state(self) -> Mapping[str, Any]:
+        return {"target": self.target, "maximize": self.maximize}
+
+
+class NoImprovementStoppingRule(StoppingRule):
+    """Stop after ``patience`` completed rounds without sufficient improvement.
+
+    Improvement must exceed ``min_delta`` relative to the last accepted best
+    observed reward. ``min_rounds`` protects the initial design from stopping
+    too early. Re-evaluating a completed round does not advance patience; state
+    is checkpointed. Set ``maximize`` to match the algorithm. Noisy observations
+    can delay or trigger this heuristic, so it is not a convergence certificate.
+    """
+
+    _best_value: float | None
+    _last_round: int
+    _last_improvement_round: int
+
+    def __init__(
+        self,
+        patience: int,
+        *,
+        min_delta: float = 0.0,
+        min_rounds: int = 0,
+        maximize: bool = True,
+    ) -> None:
+        self.patience = _validate_limit(patience, "patience")
+        if self.patience == 0:
+            raise StoppingRuleError("patience must be positive.")
+        self.min_rounds = _validate_limit(min_rounds, "min_rounds")
+        if not isinstance(maximize, bool):
+            raise StoppingRuleError("maximize must be bool.")
+        self.maximize = maximize
+        if isinstance(min_delta, bool):
+            raise StoppingRuleError("min_delta must be finite and non-negative.")
+        try:
+            self.min_delta = float(min_delta)
+        except (TypeError, ValueError) as error:
+            raise StoppingRuleError("min_delta must be finite and non-negative.") from error
+        if not math.isfinite(self.min_delta) or self.min_delta < 0:
+            raise StoppingRuleError("min_delta must be finite and non-negative.")
+        self.reset()
+
+    def evaluate(self, context: StoppingContext) -> StoppingDecision:
+        value = getattr(context.algorithm_result, "best_observed_value", None)
+        if value is not None and context.round > self._last_round:
+            signed_improvement = (
+                float("inf")
+                if self._best_value is None
+                else (float(value) - self._best_value) * (1 if self.maximize else -1)
+            )
+            if signed_improvement > self.min_delta:
+                self._best_value = float(value)
+                self._last_improvement_round = context.round
+            self._last_round = context.round
+        stale_rounds = max(0, context.round - self._last_improvement_round)
+        stop = (
+            self._best_value is not None
+            and context.round >= self.min_rounds
+            and stale_rounds >= self.patience
+        )
+        return StoppingDecision(
+            stop=stop,
+            reason="no_improvement" if stop else None,
+            details={
+                "stale_rounds": stale_rounds,
+                "patience": self.patience,
+                "best_observed_value": value,
+                "min_delta": self.min_delta,
+            },
+        )
+
+    def reset(self) -> None:
+        self._best_value = None
+        self._last_round = -1
+        self._last_improvement_round = 0
+
+    def _configuration_state(self) -> Mapping[str, Any]:
+        return {
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "min_rounds": self.min_rounds,
+            "maximize": self.maximize,
+        }
+
+    def _mutable_state(self) -> Mapping[str, Any]:
+        return {
+            "best_value": self._best_value,
+            "last_round": self._last_round,
+            "last_improvement_round": self._last_improvement_round,
+        }
+
+    def _load_mutable_state(self, state: Any, *, strict: bool) -> None:
+        super()._load_mutable_state(state, strict=strict)
+        best = state.get("best_value")
+        last = state.get("last_round")
+        improved = state.get("last_improvement_round")
+        if (
+            isinstance(last, bool)
+            or not isinstance(last, int)
+            or last < -1
+            or isinstance(improved, bool)
+            or not isinstance(improved, int)
+            or improved < 0
+            or improved > max(0, last)
+            or (
+                best is not None
+                and (
+                    isinstance(best, bool)
+                    or not isinstance(best, (int, float))
+                    or not math.isfinite(best)
+                    or last < 0
+                )
+            )
+        ):
+            raise StoppingRuleError("Invalid no-improvement stopping state.")
+        self._best_value = best
+        self._last_round = last
+        self._last_improvement_round = improved
+
+
 class CompositeStoppingRule(StoppingRule):
     """Combine child rules with deterministic ``any`` or ``all`` semantics."""
 
@@ -561,10 +714,12 @@ __all__ = [
     "MaximumEvaluationsStoppingRule",
     "MaximumRoundsStoppingRule",
     "MaximumTimeStoppingRule",
+    "NoImprovementStoppingRule",
     "StoppingContext",
     "StoppingDecision",
     "StoppingRule",
     "StoppingRuleError",
+    "TargetValueStoppingRule",
     "all_of",
     "any_of",
 ]

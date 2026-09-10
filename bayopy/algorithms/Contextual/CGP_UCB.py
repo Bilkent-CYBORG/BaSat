@@ -356,6 +356,39 @@ class CGP_UCB(Algorithm):
         if not torch.isfinite(actions).all() or not ((actions >= lower) & (actions <= upper)).all():
             raise AlgorithmConfigurationError("action_set must be finite and inside bounds.")
 
+    def prepare_round_info(self, round_info: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Use a revealed context, falling back to an internal zero vector."""
+        info = super().prepare_round_info(round_info)
+        if info.get("context") is None:
+            context = self._default_context()
+            if self.context_dimension is None and info.get("context_support") is not None:
+                support = torch.as_tensor(info["context_support"])
+                if support.ndim == 2:
+                    context = torch.zeros(support.shape[1], dtype=self.dtype, device=self.device)
+            self._warn_environment_default("context", str(context.tolist()))
+            info["context"] = context
+            info["context_is_default"] = True
+        return info
+
+    def prepare_feedback(self, feedback: Mapping[str, Any], *, action: Any) -> dict[str, Any]:
+        result = super().prepare_feedback(feedback, action=action)
+        if result.get("context") is None:
+            current = self.last_ask.round_info_snapshot.get("context") if self.last_ask else None
+            result["context"] = (
+                self._default_context() if current is None
+                else torch.as_tensor(current, dtype=self.dtype, device=self.device).detach().clone()
+            )
+            self._warn_environment_default("feedback.context", str(result["context"].tolist()))
+        return result
+
+    def _default_context(self) -> torch.Tensor:
+        """Internal neutral context used only when the environment omits it."""
+        dimension = getattr(self, "context_dimension", None)
+        if not dimension:
+            kernel = self.config.context_kernel
+            dimension = getattr(kernel, "ard_num_dims", None) or 1
+        return torch.zeros(int(dimension), dtype=self.dtype, device=self.device)
+
     def _ensure_context_dimension(self, context: Any) -> torch.Tensor:
         """Validate one context and freeze the joint GP coordinate dimension.
 
@@ -502,10 +535,11 @@ class CGP_UCB(Algorithm):
         if y.numel() == 0:
             return
         if data.contexts is None:
-            raise CGP_UCBDataCompatibilityError(
-                "Contextual previous_data requires contexts.", algorithm=self
-            )
-        contexts = torch.as_tensor(data.contexts, dtype=self.dtype, device=self.device)
+            default = self._default_context()
+            self._warn_environment_default("previous_data.contexts", str(default.tolist()))
+            contexts = default.unsqueeze(0).expand(actions.shape[0], -1).clone()
+        else:
+            contexts = torch.as_tensor(data.contexts, dtype=self.dtype, device=self.device)
         if contexts.ndim == 1:
             contexts = contexts.unsqueeze(-1)
         self._ensure_context_dimension(contexts[0])
@@ -812,12 +846,17 @@ class CGP_UCB(Algorithm):
         pending_context = torch.as_tensor(
             self.last_ask.algorithm_metadata["context"], dtype=self.dtype, device=self.device
         )
-        if not torch.equal(context, pending_context) or not torch.equal(
-            feedback_context, pending_context
+        if not torch.equal(context, pending_context) or (
+            not round_info.get("context_is_default", False)
+            and not torch.equal(feedback_context, pending_context)
         ):
             raise CGP_UCBContextError(
                 "tell context differs from the context held fixed during ask.", algorithm=self
             )
+        if round_info.get("context_is_default", False):
+            # The environment reveals the actual realization only after acting.
+            # Preserve its observation coordinates rather than fabricating a context.
+            context = feedback_context
         evaluated = feedback["evaluated_action"].reshape(1, -1)
         observation = feedback["observation"].reshape(-1)
         joint = torch.cat((evaluated, context.reshape(1, -1)), dim=-1)

@@ -1,0 +1,7 @@
+action_0,context_0,reference_probability,sampling_probability,margin,reward
+0.0,0.0,0.0,0.0,0.1,0.0
+0.0,0.1,0.0,0.0,0.1,0.010000000000000002
+0.0,0.2,0.0,0.0,0.1,0.020000000000000004
+0.0,0.3,0.6875,0.0,0.1,0.03
+Action dimension: 1
+Rows: 22

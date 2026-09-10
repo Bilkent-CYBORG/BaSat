@@ -1,4 +1,4 @@
-"""Good-Action Search using one-step Gaussian-process fantasy lookahead."""
+"""Good-Action Search using the authors' posterior-sample acquisition."""
 
 from __future__ import annotations
 
@@ -13,17 +13,19 @@ from bayopy.models.utils import Bounds
 from .Exception.exception_GS import (
     GSCheckpointError,
     GSException,
-    GSFantasyError,
     GSMaximumSamplingError,
+    GSPosteriorError,
 )
 from .PG import PG, GoodActionConfig, GoodActionState
 
 
 class GS(PG):
-    """Select evaluations likely to reveal that a good action exists.
+    """Rank actions by their sampled posterior probability of being good.
 
-    Temporary fantasy observations are used only inside acquisition scoring.
-    They are never appended to environment history or GP training data.
+    This follows ``gs`` and ``gs_acq`` in the authors' ``BO_methods.py``:
+    count threshold exceedances at each candidate and, if no sample meets the
+    threshold, select the largest sampled value. The paper's discussion of
+    future global maxima is not the acquisition used by that implementation.
 
     Examples
     --------
@@ -35,10 +37,10 @@ class GS(PG):
     ... )
     """
 
-    ACQUISITION_POLICY = "good-action search with fantasy observations"
+    ACQUISITION_POLICY = "posterior-sample good-action probability"
 
     EXCEPTION_CLASS = GSException
-    POSTERIOR_ERROR_TYPE = GSFantasyError
+    POSTERIOR_ERROR_TYPE = GSPosteriorError
     CHECKPOINT_ERROR_TYPE = GSCheckpointError
     SOURCE = SourceRecord(
         paper_title="Lenient Regret and Good-Action Identification in Gaussian Process Bandits",
@@ -46,7 +48,8 @@ class GS(PG):
         paper_url="https://proceedings.mlr.press/v139/cai21c.html",
         repository_url="https://github.com/caitree/GoodAction",
         repository_status="author",
-        notes="Clean-room fantasy/max-value Monte Carlo implementation.",
+        notes="Author-code GS posterior exceedance fraction and sampled-maximum fallback; "
+        "deterministic finite-candidate search replaces noisy local refinement.",
     )
 
     def __init__(
@@ -78,124 +81,42 @@ class GS(PG):
         self._last_tie_statistics: torch.Tensor | None = None
         self._last_mc_standard_errors: torch.Tensor | None = None
 
-    @staticmethod
-    def _condition_on_hypothetical(
-        mean: torch.Tensor,
-        covariance: torch.Tensor,
-        candidate_index: int,
-        hypothetical: torch.Tensor,
-        predictive_variance: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return exact Gaussian conditional moments without mutating the GP."""
-
-        denominator = predictive_variance.clamp_min(torch.finfo(mean.dtype).eps)
-        cross = covariance[:, candidate_index]
-        gain = cross / denominator
-        conditioned_mean = mean.unsqueeze(0) + (hypothetical - mean[candidate_index]).unsqueeze(
-            -1
-        ) * gain.unsqueeze(0)
-        conditioned_covariance = covariance - torch.outer(cross, cross) / denominator
-        conditioned_covariance = 0.5 * (
-            conditioned_covariance + conditioned_covariance.transpose(-1, -2)
-        )
-        return conditioned_mean, conditioned_covariance
-
-    @staticmethod
-    def _stable_cholesky(covariance: torch.Tensor) -> torch.Tensor:
-        """Factor a PSD fantasy covariance with bounded deterministic jitter."""
-
-        identity = torch.eye(covariance.shape[-1], dtype=covariance.dtype, device=covariance.device)
-        jitter = 1e-10 if covariance.dtype == torch.float64 else 1e-6
-        for _ in range(6):
-            factor, info = torch.linalg.cholesky_ex(covariance + jitter * identity)
-            if int(info.max().item()) == 0:
-                return factor
-            jitter *= 10.0
-        raise GSMaximumSamplingError(
-            "Fantasy posterior covariance is not numerically positive semidefinite."
-        )
-
-    def _sample_posterior_maxima(
-        self,
-        conditioned_mean: torch.Tensor,
-        conditioned_covariance: torch.Tensor,
-    ) -> torch.Tensor:
-        """Draw posterior maximum values for every hypothetical observation."""
-
-        factor = self._stable_cholesky(conditioned_covariance)
-        standard = torch.randn(
-            (
-                conditioned_mean.shape[0],
-                self.config.maximum_value_samples,
-                conditioned_mean.shape[1],
-            ),
-            dtype=self.dtype,
-            device=self.device,
-            generator=self.generator,
-        )
-        samples = conditioned_mean.unsqueeze(1) + torch.matmul(standard, factor.transpose(-1, -2))
-        return samples.max(dim=-1).values
-
-    def _gs_score_one_candidate(
-        self,
-        *,
-        candidate_index: int,
-        mean: torch.Tensor,
-        covariance: torch.Tensor,
-        predictive_variance: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return GS score, maximum tie statistic, and Monte Carlo standard error."""
-
-        scale = predictive_variance.sqrt().clamp_min(self.config.posterior_std_floor)
-        hypothetical = mean[candidate_index] + scale * torch.randn(
-            (self.config.lookahead_samples,),
-            dtype=self.dtype,
-            device=self.device,
-            generator=self.generator,
-        )
-        conditioned_mean, conditioned_covariance = self._condition_on_hypothetical(
-            mean,
-            covariance,
-            candidate_index,
-            hypothetical,
-            predictive_variance,
-        )
-        maxima = self._sample_posterior_maxima(conditioned_mean, conditioned_covariance)
-        indicators = (maxima >= self.config.threshold).to(self.dtype)
-        score = indicators.mean()
-        sample_count = indicators.numel()
-        standard_error = torch.sqrt((score * (1.0 - score)).clamp_min(0.0) / max(sample_count, 1))
-        return score, maxima.max(), standard_error
-
     def _score_candidate_set(
         self, candidates: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Evaluate fantasy lookahead on a common candidate representation."""
+        """Estimate each candidate's chance of meeting the reward threshold.
 
+        Averaging a *global* maximum event over hypothetical observations is
+        independent of the evaluated candidate by total expectation. Such a
+        score ranks Monte Carlo error rather than actions. The authors' code
+        instead estimates the candidate-specific posterior exceedance event.
+        The existing two Monte Carlo budgets determine the total number of
+        draws, preserving their effect on accuracy and checkpoint settings.
+        """
+
+        sample_count = self.config.lookahead_samples * self.config.maximum_value_samples
         try:
-            latent = self.gp.posterior(candidates, observation_noise=False)
-            predictive = self.gp.posterior(candidates, observation_noise=True)
-            mean = latent.mean.squeeze(-1)
-            covariance = latent.distribution.covariance_matrix
-            predictive_variance = predictive.variance.squeeze(-1)
+            samples = self.gp.sample_posterior(
+                candidates,
+                num_samples=sample_count,
+                seed=self.config.seed + self.iteration,
+                observation_noise=False,
+            ).reshape(sample_count, candidates.shape[0])
         except Exception as error:
-            raise GSFantasyError(
-                f"Unable to construct the GS posterior: {error}", algorithm=self
+            raise GSPosteriorError(
+                f"Unable to sample the GS posterior: {error}", algorithm=self
             ) from error
-        scores = torch.empty(candidates.shape[0], dtype=self.dtype, device=self.device)
-        ties = torch.empty_like(scores)
-        errors = torch.empty_like(scores)
-        for index in range(candidates.shape[0]):
-            scores[index], ties[index], errors[index] = self._gs_score_one_candidate(
-                candidate_index=index,
-                mean=mean,
-                covariance=covariance,
-                predictive_variance=predictive_variance[index],
+        if not torch.isfinite(samples).all():
+            raise GSMaximumSamplingError(
+                "GS posterior samples contain non-finite values.", algorithm=self
             )
+        scores = (samples >= self.config.threshold).to(self.dtype).mean(dim=0)
+        ties = samples.max(dim=0).values
+        errors = torch.sqrt((scores * (1.0 - scores)).clamp_min(0.0) / sample_count)
         return scores, ties, errors
 
     def _score_candidates(self, candidates: torch.Tensor) -> torch.Tensor:
-        """Cache fantasy scores, tie statistics, and Monte Carlo uncertainty."""
+        """Cache exceedance scores, fallback values, and Monte Carlo uncertainty."""
 
         scores, ties, errors = self._score_candidate_set(candidates)
         self._last_tie_statistics = ties.detach().clone()
@@ -203,12 +124,10 @@ class GS(PG):
         return scores
 
     def _supports_continuous_optimization(self) -> bool:
-        """Keep GS on its reproducible finite fantasy representation.
+        """Keep GS on its reproducible finite posterior-sample representation.
 
-        The guide permits continuous refinement only when the fantasy score is
-        differentiable and supported. This Monte Carlo implementation draws
-        discrete good-action indicators, so a gradient refinement would not be
-        mathematically meaningful.
+        Discrete threshold indicators have no useful gradient for local
+        refinement, so candidates are ranked directly.
         """
 
         return False
@@ -237,12 +156,15 @@ class GS(PG):
         return int(tied[0].item())
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
-        """Report fantasy sample sizes and the largest Monte Carlo error."""
+        """Report posterior sample count and the largest Monte Carlo error."""
 
         diagnostics = dict(super()._diagnostics_impl())
         diagnostics.update(
             {
-                "acquisition": "good_action_search_fantasy",
+                "acquisition": "good_action_search_posterior_probability",
+                "posterior_samples": (
+                    self.config.lookahead_samples * self.config.maximum_value_samples
+                ),
                 "lookahead_samples": self.config.lookahead_samples,
                 "maximum_value_samples": self.config.maximum_value_samples,
                 "maximum_mc_standard_error": (

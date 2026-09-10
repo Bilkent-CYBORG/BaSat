@@ -41,7 +41,7 @@ from .Exception.exception_AG_VS import (
 
 
 @dataclass(frozen=True, slots=True)
-class AGVSConfig:
+class AG_VSConfig:
     """Configuration for the AG-VS procedure in the local manuscript.
 
     ``batch_size`` is the manuscript batch size ``B`` and independently ranks
@@ -56,6 +56,8 @@ class AGVSConfig:
     sequence_length, split_groups, initial_points:
         Acquisition batches per visit, maximum split groups, and initial
         full-coordinate design size.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     acquisition:
         EI or UCB acquisition configuration used within the active coordinates.
     stopping_threshold, stopping_delta:
@@ -76,6 +78,7 @@ class AGVSConfig:
     sequence_length: int = 3
     split_groups: int = 2
     initial_points: int = 5
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     acquisition: AcquisitionConfig = field(default_factory=lambda: AcquisitionConfig(name="UCB"))
     stopping_threshold: float | None = None
     stopping_delta: float | None = None
@@ -204,7 +207,7 @@ class AG_VS(Algorithm):
     >>> bounds = bayopy.Bounds(lower=[-1.0] * 6, upper=[1.0] * 6)
     >>> algorithm = bayopy.AG_VS(
     ...     bounds=bounds,
-    ...     config=bayopy.AGVSConfig(effective_dimension=2, initial_points=5, seed=7),
+    ...     config=bayopy.AG_VSConfig(effective_dimension=2, initial_points=5, seed=7),
     ... )
     """
 
@@ -226,7 +229,7 @@ class AG_VS(Algorithm):
         self,
         *,
         bounds: Bounds,
-        config: AGVSConfig,
+        config: AG_VSConfig,
         maximize: bool = True,
         dtype: torch.dtype | str = torch.float64,
         device: torch.device | str = "cpu",
@@ -247,6 +250,7 @@ class AG_VS(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -257,7 +261,7 @@ class AG_VS(Algorithm):
         self.state = self._fresh_state()
 
     @staticmethod
-    def _validate_config(bounds: Bounds, config: AGVSConfig) -> None:
+    def _validate_config(bounds: Bounds, config: AG_VSConfig) -> None:
         """Validate dimensions, batching, GP budgets, stopping, and restarts."""
 
         try:
@@ -1368,4 +1372,9 @@ class AG_VS(Algorithm):
         self.model_input_dimension = self.action_dimension
 
 
-__all__ = ["AG_VS", "AGVSConfig", "AGVSNode", "AGVSState"]
+# Compatibility alias for releases that exposed the abbreviation without the
+# separator used by the algorithm's public name.
+AGVSConfig = AG_VSConfig
+
+
+__all__ = ["AG_VS", "AGVSConfig", "AGVSNode", "AGVSState", "AG_VSConfig"]

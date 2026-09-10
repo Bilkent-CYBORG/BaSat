@@ -9,10 +9,11 @@ available rows and never synthesizes an unevaluable inactive-coordinate fill.
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from itertools import pairwise
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 
@@ -28,6 +29,7 @@ from .Exception.exception_MCTS_VS import (
     MCTS_VSException,
     MCTS_VSInnerOptimizerError,
     MCTS_VSScoreError,
+    MCTS_VSWarning,
 )
 
 
@@ -43,8 +45,11 @@ class MCTSVSConfig:
     ----------
     Nv, Ns:
         Variables selected per rollout and samples evaluated per subset.
-    archive_size, bad_count_limit, split_threshold:
-        Best-k archive, strict reset counter, and leaf-size split rule.
+    archive_size, initial_points, bad_count_limit, split_threshold:
+        Best-k archive, initial sampling count, strict reset counter, and
+        leaf-size split rule.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     exploration_constant:
         Source UCB tree-exploration coefficient.
     inner_optimizer:
@@ -58,6 +63,8 @@ class MCTSVSConfig:
     Nv: int = 2
     Ns: int = 3
     archive_size: int = 20
+    initial_points: int = 5
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     bad_count_limit: int = 5
     split_threshold: int = 3
     exploration_constant: float = 0.1
@@ -192,6 +199,10 @@ class MCTS_VS(Algorithm):
     """
 
     ACQUISITION_POLICY = "MCTS variable score plus configured inner optimizer"
+    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = {
+        "initial_points": 5,
+        "initial_points_sampling_method": "paper",
+    }
 
     EXCEPTION_CLASS = MCTS_VSException
     native_batching = False
@@ -248,6 +259,7 @@ class MCTS_VS(Algorithm):
             dtype=dtype,
             device=device,
             seed=self.config.seed,
+            initial_points_sampling_method=self.config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -270,6 +282,7 @@ class MCTS_VS(Algorithm):
             "Nv": config.Nv,
             "Ns": config.Ns,
             "archive_size": config.archive_size,
+            "initial_points": config.initial_points,
             "bad_count_limit": config.bad_count_limit,
             "split_threshold": config.split_threshold,
             "candidate_pool_size": config.candidate_pool_size,
@@ -524,10 +537,11 @@ class MCTS_VS(Algorithm):
             selected_dataset_indices = table.dataset_indices[order]
         else:
             lower, upper = self._bounds_on_algorithm_device()
+            initial_phase = self.state.global_actions.shape[0] < self.config.initial_points
             pool = self._sample_design(
                 Bounds(lower[active], upper[active]),
                 self.config.candidate_pool_size,
-                phase="acquisition",
+                phase="initial" if initial_phase else "acquisition",
                 seed=self.config.seed + 15485863 * (self.iteration + 1),
                 paper_method="uniform",
             )
@@ -547,14 +561,19 @@ class MCTS_VS(Algorithm):
         self._last_acquisition_value = float(scores[order[0]].item())
 
     def _kernel_posterior(
-        self, candidate_inputs: torch.Tensor, active_indices: torch.Tensor
+        self,
+        candidate_inputs: torch.Tensor,
+        active_indices: torch.Tensor,
+        *,
+        history_size: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fit the configured nested GP and return its posterior moments."""
 
-        if self.state.global_actions.shape[0] < 2:
+        rows = self.state.global_actions.shape[0] if history_size is None else history_size
+        if rows < self.config.initial_points:
             zeros = torch.zeros(candidate_inputs.shape[0], dtype=self.dtype, device=self.device)
             return zeros, torch.ones_like(zeros)
-        model = self._make_inner_optimizer(active_indices)
+        model = self._make_inner_optimizer(active_indices, history_size=history_size)
         try:
             return model.predict(candidate_inputs)
         except Exception as error:
@@ -562,7 +581,9 @@ class MCTS_VS(Algorithm):
                 f"Nested {self.config.inner_optimizer} posterior failed: {error}"
             ) from error
 
-    def _make_inner_optimizer(self, active_indices: torch.Tensor) -> GaussianProcess:
+    def _make_inner_optimizer(
+        self, active_indices: torch.Tensor, *, history_size: int | None = None
+    ) -> GaussianProcess:
         """Construct and fit the rollout's vanilla-BO/TuRBO surrogate.
 
         TuRBO uses the same exact GP posterior here; its local trust-region
@@ -582,8 +603,8 @@ class MCTS_VS(Algorithm):
         )
         try:
             model.set_data(
-                self.state.global_actions[:, active_indices],
-                to_quality(self.state.global_observations, maximize=self.maximize),
+                self.state.global_actions[:history_size, active_indices],
+                to_quality(self.state.global_observations[:history_size], maximize=self.maximize),
             )
             if model.model is not None:
                 covariance = model.model.covar_module
@@ -597,7 +618,11 @@ class MCTS_VS(Algorithm):
         return model
 
     def _inner_scores(
-        self, candidate_inputs: torch.Tensor, active_indices: torch.Tensor
+        self,
+        candidate_inputs: torch.Tensor,
+        active_indices: torch.Tensor,
+        *,
+        history_size: int | None = None,
     ) -> torch.Tensor:
         """Score candidate rows in the currently selected model subspace.
 
@@ -606,10 +631,18 @@ class MCTS_VS(Algorithm):
         option additionally penalizes normalized distance from the archive best.
         """
 
-        mean, std = self._kernel_posterior(candidate_inputs, active_indices)
+        mean, std = self._kernel_posterior(
+            candidate_inputs, active_indices, history_size=history_size
+        )
         beta = self.config.acquisition_beta
-        if self.config.inner_optimizer == "turbo" and self.state.top_k_indices.numel():
-            best = self.state.global_actions[self.state.top_k_indices[0], active_indices]
+        archive = self.state.top_k_indices
+        if history_size is not None:
+            quality = to_quality(
+                self.state.global_observations[:history_size], maximize=self.maximize
+            )
+            archive = torch.argsort(quality, descending=True, stable=True)
+        if self.config.inner_optimizer == "turbo" and archive.numel():
+            best = self.state.global_actions[archive[0], active_indices]
             lower, upper = self._bounds_on_algorithm_device()
             distance = torch.linalg.vector_norm(
                 (candidate_inputs - best) / (upper - lower)[active_indices], dim=-1
@@ -701,6 +734,8 @@ class MCTS_VS(Algorithm):
         self.model_input_dimension = int(active.numel())
         if self.state.queued_actions.shape[0] == 0:
             self._queue_subset_actions(active, round_info)
+        else:
+            self._refresh_unavailable_queued_actions(active, round_info)
         position = self.state.rollout_sample_cursor
         actions = self.state.queued_actions[position : position + 1]
         selected_dataset_indices = (
@@ -723,6 +758,66 @@ class MCTS_VS(Algorithm):
             },
         )
         return actions[0]
+
+    def _refresh_unavailable_queued_actions(
+        self, active: torch.Tensor, round_info: Mapping[str, Any]
+    ) -> None:
+        """Refresh unavailable finite rows without consuming within-batch rewards.
+
+        A contextual table may reveal a different available set between two
+        sequential members of a source batch. Replace only the still-pending
+        proposals using current public rows and the batch-start history prefix.
+        The prefix length is recoverable from the checkpointed sample cursor;
+        no additional model cache or hidden environmental data is required.
+        """
+
+        if "candidate_actions" not in round_info:
+            return
+        candidates = torch.as_tensor(
+            round_info["candidate_actions"], dtype=self.dtype, device=self.device
+        )
+        indices = torch.as_tensor(
+            round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device
+        )
+        position = self.state.rollout_sample_cursor
+        pending = self.state.queued_actions[position]
+        matches = torch.isclose(candidates, pending, rtol=0.0, atol=1e-8).all(dim=1)
+        if self.state.queued_dataset_indices is not None:
+            matches &= indices == self.state.queued_dataset_indices[position]
+        if matches.any():
+            return
+        table = self.prepare_discrete_candidates(
+            candidate_actions=candidates,
+            candidate_dataset_indices=indices,
+            round_info=round_info,
+        )
+        history_size = self.state.global_actions.shape[0] - position
+        scores = self._inner_scores(table.model_inputs, active, history_size=history_size)
+        remaining = self.state.queued_actions.shape[0] - position
+        count = min(remaining, table.environment_actions.shape[0])
+        if count == 0:
+            raise MCTS_VSInnerOptimizerError(
+                "No currently available action can complete the variable-subset rollout."
+            )
+        order = torch.argsort(scores, descending=True, stable=True)[:count]
+        self.state.queued_actions = torch.cat(
+            (self.state.queued_actions[:position], table.environment_actions[order]), dim=0
+        ).detach().clone()
+        previous_indices = self.state.queued_dataset_indices
+        if previous_indices is None:
+            raise MCTS_VSInnerOptimizerError("A finite rollout lost its queued dataset indices.")
+        self.state.queued_dataset_indices = torch.cat(
+            (previous_indices[:position], table.dataset_indices[order]), dim=0
+        ).detach().clone()
+        self._last_acquisition_value = float(scores[order[0]].item())
+        self.invalidate_source_guarantees("mcts_vs.dynamic_candidate_batch")
+        warnings.warn(
+            "MCTS-VS's available finite rows changed within a logical batch. "
+            "Unavailable pending rows were replaced by current candidates using "
+            "the frozen batch-start observations; source guarantees no longer apply.",
+            MCTS_VSWarning,
+            stacklevel=3,
+        )
 
     def _tell_impl(
         self,

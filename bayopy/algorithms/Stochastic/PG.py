@@ -46,8 +46,9 @@ class GoodActionConfig:
         Optional sub-bounds or explicit finite action tensor. ``None`` uses the
         algorithm's environment-space bounds.
     initial_points:
-        Number of deterministic Sobol initialization rounds. ``None`` uses
-        ``max(2 * D_env, 4)``.
+        Number of initialization rounds. ``None`` uses ``max(2 * D_env, 4)``.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     hyperparameter_refit_cycle:
         Number of newly completed evaluations between full GP hyperparameter
         optimizations. Between those optimizations the latest learned
@@ -59,7 +60,8 @@ class GoodActionConfig:
     reference_point:
         STS reference action; the domain center is used when omitted.
     lookahead_samples, maximum_value_samples:
-        Monte Carlo sizes for GS fantasy and posterior-maximum calculations.
+        Legacy GS Monte Carlo budget names; their product is the number of
+        posterior draws used to estimate each candidate's good-action probability.
     candidate_samples:
         Size of the reproducible continuous search representation.
     fit_maxiter:
@@ -73,6 +75,7 @@ class GoodActionConfig:
     threshold: float
     candidate_domain: Bounds | torch.Tensor | np.ndarray[Any, Any] | None = None
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     hyperparameter_refit_cycle: int = 3
     acquisition_restarts: int = 10
     reference_point: torch.Tensor | np.ndarray[Any, Any] | None = None
@@ -118,8 +121,8 @@ class GoodActionState:
     last_score, last_probability_of_good:
         Most recent method acquisition and posterior-goodness diagnostics.
     last_fit_evaluations, last_fit_reused_hyperparameters:
-        In-process GP refit-cycle state. Loading a checkpoint resets this cycle
-        so the restored observations are fitted with the current budget.
+        GP refit-cycle state, retained with learned parameters on checkpoints.
+        Later scheduled fits use the currently configured numerical budget.
     last_continuous_optimizer_restarts:
         Number of independently requested acquisition restarts.
     """
@@ -247,6 +250,7 @@ class PG(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -771,6 +775,7 @@ class PG(Algorithm):
 
         return {
             "config": self._config_state(),
+            "gp": self.gp.state_dict(),
             "X_train": self.state.X_train.detach().clone(),
             "y_train": self.state.y_train.detach().clone(),
             "observation_noise_variance": (
@@ -881,7 +886,7 @@ class PG(Algorithm):
             )
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
-        """Restore method data and reset the GP for a fresh configured fit."""
+        """Restore method data and the GP parameters governing its refit cadence."""
 
         del strict
         self.state.X_train = (
@@ -914,10 +919,8 @@ class PG(Algorithm):
             if state["last_probability_of_good"] is None
             else float(state["last_probability_of_good"])
         )
-        # A resumed run refits from restored observations with the current
-        # fit_maxiter budget rather than restoring surrogate parameters.
-        self.state.last_fit_evaluations = -1
-        self.state.last_fit_reused_hyperparameters = False
+        self.state.last_fit_evaluations = state["last_fit_evaluations"]
+        self.state.last_fit_reused_hyperparameters = state["last_fit_reused_hyperparameters"]
         optimizer_restarts = state["last_continuous_optimizer_restarts"]
         self.state.last_continuous_optimizer_restarts = (
             None if optimizer_restarts is None else int(optimizer_restarts)
@@ -934,7 +937,15 @@ class PG(Algorithm):
             if indices is None
             else torch.as_tensor(indices, dtype=torch.long, device=self.device).detach().clone()
         )
-        self.gp.reset()
+        if "gp" in state:
+            self.gp.load_state_dict(dict(state["gp"]))
+        else:
+            # Legacy checkpoints omitted parameters. A fresh fit is the only
+            # possible continuation for those files; new saves retain the
+            # original fit schedule and numerical warm start exactly.
+            self.gp.reset()
+            self.state.last_fit_evaluations = -1
+            self.state.last_fit_reused_hyperparameters = False
 
     def _reset_impl(self) -> None:
         """Clear learned state while preserving immutable extension reporting."""

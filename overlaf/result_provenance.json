@@ -1,0 +1,487 @@
+{
+  "notebook": "docs/bayopy_last_ver_user_guide.ipynb",
+  "experiments_rerun": false,
+  "refreshed_cells": [
+    {
+      "cell": "synthetic_stochastic",
+      "result_json": "results/last_guide/synthetic_stochastic/run_lz813p1t/results.json",
+      "sha256": "2e1bdf37046813fd27d4d22018df4438094ef2fababd4717dcb5dce261c993a4",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/synthetic_stochastic/run_lz813p1t/trials/trial-001/results.json",
+          "sha256": "83258ae0028c9007e7ebb13d21705f88346743f1202342b6480a52c3b11ef086"
+        },
+        {
+          "path": "results/last_guide/synthetic_stochastic/run_lz813p1t/trials/trial-002/results.json",
+          "sha256": "2b876a12c227862a7ebfca2534936180e4ee2031ab7492df0b42fcf00c9c3e60"
+        },
+        {
+          "path": "results/last_guide/synthetic_stochastic/run_lz813p1t/trials/trial-003/results.json",
+          "sha256": "b24dd704fc7b3cd1d381e471479d1b3314700152d198fea460c09978f8d643df"
+        },
+        {
+          "path": "results/last_guide/synthetic_stochastic/run_lz813p1t/trials/trial-004/results.json",
+          "sha256": "1f3d782faf0b10e9800c0af463865b074c7df5b355db7770628a424ff34aef5e"
+        },
+        {
+          "path": "results/last_guide/synthetic_stochastic/run_lz813p1t/trials/trial-005/results.json",
+          "sha256": "cf69e7890a68df1aaf02639ead0f68444b904826a33e0f87dac69b1c8588de13"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "synthetic_contextual",
+      "result_json": "results/last_guide/synthetic_contextual/run_afer_4e9/results.json",
+      "sha256": "f33d3d6dca1ef926d8de7c3cbf2edf70de8abbbe905bf0972ce32eb000455469",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/synthetic_contextual/run_afer_4e9/trials/trial-001/results.json",
+          "sha256": "68265e22f4efda828b901bf4e929afba5adeadc1392ec21b4af3513308d91da7"
+        },
+        {
+          "path": "results/last_guide/synthetic_contextual/run_afer_4e9/trials/trial-002/results.json",
+          "sha256": "d2d6a2077177eaf2bd5e343d0cb359ed101218479cc078bd11c69376a9428bd9"
+        },
+        {
+          "path": "results/last_guide/synthetic_contextual/run_afer_4e9/trials/trial-003/results.json",
+          "sha256": "4c8a15ef860c1ceaf7c1e69b57b71455b41da3698af1fb789530dc6819eb1aeb"
+        },
+        {
+          "path": "results/last_guide/synthetic_contextual/run_afer_4e9/trials/trial-004/results.json",
+          "sha256": "e5742c966ca3ae141dd9d100cf9e587505fbb4420e7640510b681f7fbedc1e38"
+        },
+        {
+          "path": "results/last_guide/synthetic_contextual/run_afer_4e9/trials/trial-005/results.json",
+          "sha256": "5448b3e870d0153cac9b878b3fa31f1412d0151b0f9c91fea296f99873d6cca8"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "synthetic_distributional",
+      "result_json": "results/last_guide/synthetic_distributional/run_9g6_fprs/results.json",
+      "sha256": "071aa9e528b280aa74a54654f7708d3ba673102b5d603c60a7f386fc459b9a30",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/synthetic_distributional/run_9g6_fprs/trials/trial-001/results.json",
+          "sha256": "56f795a82ac5e90672e93c4fefe0158f78076fa9697782d7c9196d3d3fc6b2e0"
+        },
+        {
+          "path": "results/last_guide/synthetic_distributional/run_9g6_fprs/trials/trial-002/results.json",
+          "sha256": "07950c95eb8135c1cc4d1df262572239aaa4628ef2c69b56a87bc5c3932d2541"
+        },
+        {
+          "path": "results/last_guide/synthetic_distributional/run_9g6_fprs/trials/trial-003/results.json",
+          "sha256": "6a2845080d22121ad4817a68485c1c00cb48fa4f4d91f28a066e5a8ff687ebf1"
+        },
+        {
+          "path": "results/last_guide/synthetic_distributional/run_9g6_fprs/trials/trial-004/results.json",
+          "sha256": "ddd4f860de80299dc2b3546692c0f2d32798f10df0bd464960361b9c0bbc64d7"
+        },
+        {
+          "path": "results/last_guide/synthetic_distributional/run_9g6_fprs/trials/trial-005/results.json",
+          "sha256": "6d446790d4cbf7d0f8f79a31d91aeb4a1540df23cf4ca9fecced460bd3c19e09"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "synthetic_adversarial",
+      "result_json": "results/last_guide/synthetic_adversarial/run_crdnppew/results.json",
+      "sha256": "d70192f9f76abd594cd442e0e41484bab24992b6de1f07ed2b45072d4f690431",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/synthetic_adversarial/run_crdnppew/trials/trial-001/results.json",
+          "sha256": "01f68d76a42c68a299773fd56dce30ceaa0251ec863f836f49bfa026413fc526"
+        },
+        {
+          "path": "results/last_guide/synthetic_adversarial/run_crdnppew/trials/trial-002/results.json",
+          "sha256": "3c180a1eac97c1d97954e4d335f9aa37a1d4d961b0788524a3fdc88dd9c833bf"
+        },
+        {
+          "path": "results/last_guide/synthetic_adversarial/run_crdnppew/trials/trial-003/results.json",
+          "sha256": "ca528ecc193412288f49c0cce7d5684241aadb527023ef3c7204e8bab5299f94"
+        },
+        {
+          "path": "results/last_guide/synthetic_adversarial/run_crdnppew/trials/trial-004/results.json",
+          "sha256": "0775ade95a254eaf76a6e36b1238364c406374eb6f8fd3e4b8c236773295c89e"
+        },
+        {
+          "path": "results/last_guide/synthetic_adversarial/run_crdnppew/trials/trial-005/results.json",
+          "sha256": "47dbd6e4817a86b6f5b12794af24f8a18231426434e10a43975aa73c2af66398"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "real_stochastic",
+      "result_json": "results/last_guide/real_stochastic/run_32679mqf/results.json",
+      "sha256": "dfd6c2e8fae50476032af37231ccdeb39aa26d302aceac92c0f55fed7607c7d5",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/real_stochastic/run_32679mqf/trials/trial-001/results.json",
+          "sha256": "bd3c94313c2e379de699f8337a81490e9cf85c1fa0aa25c45797cfe03b8293e5"
+        },
+        {
+          "path": "results/last_guide/real_stochastic/run_32679mqf/trials/trial-002/results.json",
+          "sha256": "321ade1a0d3fc4864d7ba1be177e55f1564c283ca41a408486c0cccdac9d36a8"
+        },
+        {
+          "path": "results/last_guide/real_stochastic/run_32679mqf/trials/trial-003/results.json",
+          "sha256": "bff4c1a5e1a07dca6ec0702c4dbf827b33c7667c5f9abcd09ac620f9bcc3c05f"
+        },
+        {
+          "path": "results/last_guide/real_stochastic/run_32679mqf/trials/trial-004/results.json",
+          "sha256": "2918e01615dd794709276004934c9770604dfdb9465ff6f011a67af2822f13f9"
+        },
+        {
+          "path": "results/last_guide/real_stochastic/run_32679mqf/trials/trial-005/results.json",
+          "sha256": "8de4a20fbc54a75a610f77703e6cd96a5d1aec62b63087017b9096924c49ed13"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "real_contextual",
+      "result_json": "results/last_guide/real_contextual/run_r5auk5rn/results.json",
+      "sha256": "78ce2f6353bff3efcb0a029f14251f1e8ff2affb3f411d2097ced587b3f76dc8",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/real_contextual/run_r5auk5rn/trials/trial-001/results.json",
+          "sha256": "f6e75c21cae63437dd12ae50ed0776066d38c08f8672188a1fb0cbd76f269755"
+        },
+        {
+          "path": "results/last_guide/real_contextual/run_r5auk5rn/trials/trial-002/results.json",
+          "sha256": "56a07dd936048b6907f843168940b9fc8f1c15526c2e9031a4d6750e6e7f8a7d"
+        },
+        {
+          "path": "results/last_guide/real_contextual/run_r5auk5rn/trials/trial-003/results.json",
+          "sha256": "ef316cc0648091bd3d6e9919c56cb2f5c8c95a16168e15ef0718807a9d50e11d"
+        },
+        {
+          "path": "results/last_guide/real_contextual/run_r5auk5rn/trials/trial-004/results.json",
+          "sha256": "7948f9249d9e94539efbf7e9d761a82e459a84ed2729ca45e92d1d3a63624682"
+        },
+        {
+          "path": "results/last_guide/real_contextual/run_r5auk5rn/trials/trial-005/results.json",
+          "sha256": "16ebbdea4af38686b00235c8981d54b8d0f04d75af81bf35c2254114909a07a4"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "real_distributional",
+      "result_json": "results/last_guide/real_distributional_wind/run_matern_context/results.json",
+      "sha256": "0f8ed28f18edc30ef3d1fae7894acc9e7888a76cc01dbe104c1d7463746554c9",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/real_distributional_wind/run_matern_context/trials/trial-001/results.json",
+          "sha256": "41479bcc64c2e370fd71acc78f7973547d3c5d42db91ea1668766ace7891d5ca"
+        },
+        {
+          "path": "results/last_guide/real_distributional_wind/run_matern_context/trials/trial-002/results.json",
+          "sha256": "b08e6b745b605be581ba610cd8df760aa2554106efb35c9ef7b0b4eb0d3c4daf"
+        },
+        {
+          "path": "results/last_guide/real_distributional_wind/run_matern_context/trials/trial-003/results.json",
+          "sha256": "efdbfce07e2ce8e22e2fd04d755e3c76d89f11bcb663e4741641e0031793bb4c"
+        },
+        {
+          "path": "results/last_guide/real_distributional_wind/run_matern_context/trials/trial-004/results.json",
+          "sha256": "5bc9866d4834e5cb5ae6767623664ac49d5ac4d9f032e7b5b7e8fdfe76ae8cd7"
+        },
+        {
+          "path": "results/last_guide/real_distributional_wind/run_matern_context/trials/trial-005/results.json",
+          "sha256": "ca58bb9c29a544c375c849bd467c4393bf1a3ae296ff78ec7afb34e8fb3e1fbf"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "real_adversarial",
+      "result_json": "results/last_guide/real_adversarial/run_mimnzoy_/results.json",
+      "sha256": "aae0f9124c196df8657dc0ab74d812754e297380b46192da49c6adcabbae8ee5",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/real_adversarial/run_mimnzoy_/trials/trial-001/results.json",
+          "sha256": "4ba04018f01ab9867cf4857117a1e8acfc2e00636bf57906b1aa20d2143c1415"
+        },
+        {
+          "path": "results/last_guide/real_adversarial/run_mimnzoy_/trials/trial-002/results.json",
+          "sha256": "193b68c6b46328d2141c851089b91d3ea6c45d0775c71d6f3dc6867fa804a19e"
+        },
+        {
+          "path": "results/last_guide/real_adversarial/run_mimnzoy_/trials/trial-003/results.json",
+          "sha256": "ef252d2bd6f554a411fc9b67d911d9e1d72e0c545c6a2b7f6422b093e96f5c9b"
+        },
+        {
+          "path": "results/last_guide/real_adversarial/run_mimnzoy_/trials/trial-004/results.json",
+          "sha256": "cbd80a2b234424c080cf3d5be31eef3cfa28e9ac62452af5b767c2d31656fdc8"
+        },
+        {
+          "path": "results/last_guide/real_adversarial/run_mimnzoy_/trials/trial-005/results.json",
+          "sha256": "55dd6749665e736fc08c948534dea87645a6fcfc020bd8088e1d51a4e65bf25b"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 19,
+      "recorded_evaluations": 4750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "early_patience",
+      "result_json": "results/last_guide/early_patience/run_49k90o_1/results.json",
+      "sha256": "4f476f85c355e1c54a36cb529189192f5d7cec3e5e292dbe83aaabe1b7592a06",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/early_patience/run_49k90o_1/trials/trial-001/results.json",
+          "sha256": "8c541d4466c3bde3c55204f6e88cf2611aec5993692dd6eecd6592a3acb78740"
+        },
+        {
+          "path": "results/last_guide/early_patience/run_49k90o_1/trials/trial-002/results.json",
+          "sha256": "7617e6f14001dac53e4809ba2d9f5a22615965167c260b27c031fc030f3fd7ab"
+        },
+        {
+          "path": "results/last_guide/early_patience/run_49k90o_1/trials/trial-003/results.json",
+          "sha256": "8abf298cbc44f6943a6520809eb153aa5c2d6fa01316b919fdfc07cb65027db0"
+        },
+        {
+          "path": "results/last_guide/early_patience/run_49k90o_1/trials/trial-004/results.json",
+          "sha256": "3aa0c1951563ecbc2dfd51bc854b830d761fead4cf730f62cdb19aa216fcfc0f"
+        },
+        {
+          "path": "results/last_guide/early_patience/run_49k90o_1/trials/trial-005/results.json",
+          "sha256": "d4d31c764e4b1bfe3045d9bc9e5ef63bf9ddecb1a4045283517993918d9572aa"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 2,
+      "recorded_evaluations": 302,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "early_composition",
+      "result_json": "results/last_guide/early_composition/run_ls4_mgd8/result.json",
+      "sha256": "895c6cb13f255099a003501111aa18b1e89bfc3805b5a7a07458cccb5e4ceff0",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/early_composition/run_ls4_mgd8/trials/trial-001/result.json",
+          "sha256": "a0b5937b3c597f7818cc333a0b488ff2a337443a9fa2c24e5126088f8b407b7f"
+        },
+        {
+          "path": "results/last_guide/early_composition/run_ls4_mgd8/trials/trial-002/result.json",
+          "sha256": "1fd6525db38185f77ab1dc2c1f1cd0525ad136249fba5e4f5dec2b6c25a10674"
+        },
+        {
+          "path": "results/last_guide/early_composition/run_ls4_mgd8/trials/trial-003/result.json",
+          "sha256": "047fcc3c49c7e6380f1e5b7b97d2a1fcfc88753874f01099f548eedd765f37d4"
+        },
+        {
+          "path": "results/last_guide/early_composition/run_ls4_mgd8/trials/trial-004/result.json",
+          "sha256": "c245744f337d8183e0c4d831d36a1dcd0d065d3b7180ba24fc4d2a663135f064"
+        },
+        {
+          "path": "results/last_guide/early_composition/run_ls4_mgd8/trials/trial-005/result.json",
+          "sha256": "c08d19a25c466624d033ad87ab5f0fe628236a61802bda507a2c3fa7147c7159"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 1,
+      "recorded_evaluations": 60,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "settings_defaults",
+      "result_json": "results/last_guide/defaults/run_lnhzix6f/results.json",
+      "sha256": "fee3b87ff19a58f8e97e1f443fbcca1314aa4717c8a6be89f650504d8047f726",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/defaults/run_lnhzix6f/trials/trial-001/results.json",
+          "sha256": "5ff137247edc28073d7f0db576feb54ee46c723eb7d5a2af2a560ae56a60a76e"
+        },
+        {
+          "path": "results/last_guide/defaults/run_lnhzix6f/trials/trial-002/results.json",
+          "sha256": "4100cf51af143c30e7e537da6a6ae9ff7d979a72d54115c73fafe8209e679380"
+        },
+        {
+          "path": "results/last_guide/defaults/run_lnhzix6f/trials/trial-003/results.json",
+          "sha256": "f417626a3a1d40b5a944fc1a2591fc4e485bb742a0c036e89cfff22b38fbfd02"
+        },
+        {
+          "path": "results/last_guide/defaults/run_lnhzix6f/trials/trial-004/results.json",
+          "sha256": "9dec967168f48f5592c0e4669344089d50ca0d74f76b2990ae686b86843a0d32"
+        },
+        {
+          "path": "results/last_guide/defaults/run_lnhzix6f/trials/trial-005/results.json",
+          "sha256": "cb0aa0bf9c9d5d13642a6cb0ce5fe977729c6a1180fa0226c6912ca89bdf2a8d"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 2,
+      "recorded_evaluations": 500,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "settings_acquisitions",
+      "result_json": "results/last_guide/acquisitions/run_2zxmczxf/results.json",
+      "sha256": "47576771559847ca28f4f7815ac41b5164fba1b2564e1f93f239949caea1af0b",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/acquisitions/run_2zxmczxf/trials/trial-001/results.json",
+          "sha256": "ecddf55982b3f4d04404705d33703e225c14da5c79610b3aa16bbf067f618ddb"
+        },
+        {
+          "path": "results/last_guide/acquisitions/run_2zxmczxf/trials/trial-002/results.json",
+          "sha256": "6864348e2744adc2c5a223d0424266fcb42c30a78659418b527b2915f4e340a4"
+        },
+        {
+          "path": "results/last_guide/acquisitions/run_2zxmczxf/trials/trial-003/results.json",
+          "sha256": "90cb5af3debe1be931dcf7f860770725473d7c76cf5077f10b8564eb2b41a8c4"
+        },
+        {
+          "path": "results/last_guide/acquisitions/run_2zxmczxf/trials/trial-004/results.json",
+          "sha256": "1bdae3cc56baca6d879b7f15daf44245fac98408e8f8a45daafc6f2d1130101a"
+        },
+        {
+          "path": "results/last_guide/acquisitions/run_2zxmczxf/trials/trial-005/results.json",
+          "sha256": "3d8d0e0ca552a865cd0ad1c35cd418741425101683320df6f316d8a46a0ccebd"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 3,
+      "recorded_evaluations": 750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "settings_real_kernels",
+      "result_json": "results/last_guide/real_kernels/run_azy89pl6/results.json",
+      "sha256": "0664dc7d075f44aa1f1962214a2aea1fc9987894948d604eff792a273a33a6a0",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/real_kernels/run_azy89pl6/trials/trial-001/results.json",
+          "sha256": "53dc2ecf0f3f9d69b7b794b8cb24d40558852ff67d4cb0b2acc283082ee723a6"
+        },
+        {
+          "path": "results/last_guide/real_kernels/run_azy89pl6/trials/trial-002/results.json",
+          "sha256": "efc8158415b6e733608868a068d736d1e28c37bde809f9f9d5b4bb2ecb3d6b6f"
+        },
+        {
+          "path": "results/last_guide/real_kernels/run_azy89pl6/trials/trial-003/results.json",
+          "sha256": "149535f1eaa0ca8cff8908c95ed69574218e60699a71c2a490b158cf1fb4d8db"
+        },
+        {
+          "path": "results/last_guide/real_kernels/run_azy89pl6/trials/trial-004/results.json",
+          "sha256": "732dcb1ff515893f3d69ec9d87aad1a178b7ad21b1c6747ff8eca48630071dcf"
+        },
+        {
+          "path": "results/last_guide/real_kernels/run_azy89pl6/trials/trial-005/results.json",
+          "sha256": "f0719d8e12ef4272812d03111334259126e9efb5ccc4ad630e6e17e225108c98"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 3,
+      "recorded_evaluations": 750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "settings_sampling_batches",
+      "result_json": "results/last_guide/sampling_batches/run_3q5zetrd/results.json",
+      "sha256": "601d2897dadb412b6630dd340a14a19a9acf4d866c6bea589477e5019c7e7846",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/sampling_batches/run_3q5zetrd/trials/trial-001/results.json",
+          "sha256": "f417c1c9ccafea6c04dd72d1b684790ec0c5c8c1b8d1bcfb28de3a66f506eacf"
+        },
+        {
+          "path": "results/last_guide/sampling_batches/run_3q5zetrd/trials/trial-002/results.json",
+          "sha256": "e43e48bab7bd65985c54491d70aa44823dfdfc37752393678e4bbae94bc0d069"
+        },
+        {
+          "path": "results/last_guide/sampling_batches/run_3q5zetrd/trials/trial-003/results.json",
+          "sha256": "e1bde7959ccf1894f5d35dc7db4b6763903cf82a7a71b48f6f9c52584201e7db"
+        },
+        {
+          "path": "results/last_guide/sampling_batches/run_3q5zetrd/trials/trial-004/results.json",
+          "sha256": "3612eb5e639c7509b6ac6d4425153519d7ac2502bed6794e9bf9f230c51c7591"
+        },
+        {
+          "path": "results/last_guide/sampling_batches/run_3q5zetrd/trials/trial-005/results.json",
+          "sha256": "46d97639afa8f7518e9391e904f84ad0cf235509a018fdac5841f29a592364db"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 3,
+      "recorded_evaluations": 750,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    },
+    {
+      "cell": "settings_resume",
+      "result_json": "results/last_guide/resume/run_4gsf9_g4/result.json",
+      "sha256": "ee4f0130b2372aeacae3cf39f3c084fcd7ea910b91e03b8c456f582e1e31713d",
+      "trial_jsons": [
+        {
+          "path": "results/last_guide/resume/run_4gsf9_g4/trials/trial-001/result.json",
+          "sha256": "296b5ca9ed6ec3829bc5a33da29c029ae84057feadcae4428f02c888a8732e67"
+        },
+        {
+          "path": "results/last_guide/resume/run_4gsf9_g4/trials/trial-002/result.json",
+          "sha256": "d51e415fb9086b2b3950baa77066f88e618fc6490c266221b5eb55f8427dd357"
+        },
+        {
+          "path": "results/last_guide/resume/run_4gsf9_g4/trials/trial-003/result.json",
+          "sha256": "af772752a0a3dbd48b77371937af637bcd269ec357bc7b438dc4b8f5e399437c"
+        },
+        {
+          "path": "results/last_guide/resume/run_4gsf9_g4/trials/trial-004/result.json",
+          "sha256": "ea8b33ca10693cf11bb55a75d6581704da5633784b401e6f581afd8a7a047345"
+        },
+        {
+          "path": "results/last_guide/resume/run_4gsf9_g4/trials/trial-005/result.json",
+          "sha256": "6c2a81e13665835ce8948299ef0888a5a478fed8b8408cc1494ead18339f4eb8"
+        }
+      ],
+      "trial_count": 5,
+      "algorithm_count": 1,
+      "recorded_evaluations": 250,
+      "failed_trials": 0,
+      "statistics_verified_against_individual_trials": true
+    }
+  ],
+  "notebook_sha256": "2dfc395cb5173492baf951964608bc9bf64611c75c4c2240a73e9a0841f98011"
+}

@@ -1,0 +1,15 @@
+Saved-result refresh (no optimization was executed).
+Source: results/last_guide/resume/run_4gsf9_g4/result.json
+Trials: 5/5; limits: {'max_evaluations': 50, 'max_rounds': None}
+Algorithm | evaluations per trial | final mean best reward | failures
+TuRBO | [50, 50, 50, 50, 50] | -1.8840406e-05 | 0
+Total recorded evaluations: 250; failed trials: 0
+
+Recorded stopping reasons by trial:
+TuRBO: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+This is the final saved state after continuation. The earlier 10-evaluation stage was not rerun.
+
+Recorded warnings (deduplicated per algorithm):
+TuRBO: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-06 during GP posterior sampling because the covariance matrix was not positive definite.
+
+Saved results: results/last_guide/resume/run_4gsf9_g4

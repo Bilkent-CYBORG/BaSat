@@ -115,16 +115,26 @@ class AdversarialEnvironment(Environment):
             generator=self.generator,
         )
         try:
-            perturbation = (
-                torch.as_tensor(raw, dtype=self.dtype, device=self.device).detach().clone()
+            calculation_device = "cpu" if self.device.type == "mps" else self.device
+            precise_perturbation = (
+                torch.as_tensor(raw, dtype=torch.float64, device=calculation_device)
+                .detach()
+                .clone()
             )
+            perturbation = precise_perturbation.to(dtype=self.dtype, device=self.device)
         except (TypeError, ValueError, RuntimeError) as exc:
             raise InvalidActionError("attack must return a numeric vector.") from exc
         if perturbation.shape != action.shape:
             raise InvalidActionError(f"attack must return shape ({self.action_dimension},).")
         if not bool(torch.isfinite(perturbation).all()):
             raise InvalidActionError("attack returned a non-finite perturbation.")
-        evaluated_action = self.validate_action(action + perturbation)
+        # A finite attack may return a precise difference to a stored point.
+        # Casting that difference before adding can lose the destination by
+        # more than the exact-table tolerance in float32. Round once, after
+        # adding, without relaxing the lookup or bounds contract.
+        evaluated_action = self.validate_action(
+            action.to(device=calculation_device, dtype=torch.float64) + precise_perturbation
+        )
         return perturbation, evaluated_action
 
     def _evaluate_one(self, action: torch.Tensor) -> _Evaluation:

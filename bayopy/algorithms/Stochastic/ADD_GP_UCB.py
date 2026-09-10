@@ -44,6 +44,8 @@ class AddGPUCBConfig:
         Paper schedule, scalar, or callable confidence multiplier.
     initial_points:
         Optional initial-design size; ``None`` selects the documented default.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     component_optimizer:
         Optional callable optimizer at the additive-group boundary.
     batch_size:
@@ -59,6 +61,7 @@ class AddGPUCBConfig:
     refresh_cycle: int = 25
     beta: Callable[[int, int], float] | float | Literal["paper"] = "paper"
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     component_optimizer: Any | None = None
     batch_size: int | None = 1
     q_batch: int | None = None
@@ -166,6 +169,7 @@ class ADD_GP_UCB(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,

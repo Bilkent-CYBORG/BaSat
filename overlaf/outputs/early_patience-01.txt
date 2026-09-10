@@ -1,0 +1,17 @@
+Saved-result refresh (no optimization was executed).
+Source: results/last_guide/early_patience/run_49k90o_1/results.json
+Trials: 5/5; limits: {'max_evaluations': 50, 'max_rounds': None}
+Algorithm | evaluations per trial | final mean best reward | failures
+TuRBO / patience | [27, 25, 33, 37, 33] | -0.00012339228 | 0
+AG_VS / patience | [39, 24, 32, 32, 20] | -0.00057300596 | 0
+Total recorded evaluations: 302; failed trials: 0
+
+Recorded stopping reasons by trial:
+TuRBO / patience: ['any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement']
+AG_VS / patience: ['any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement', 'any_of:no_improvement']
+
+Recorded warnings (deduplicated per algorithm):
+AG_VS / patience: BayOPyNumericalWarning: BayOPy numerical event during GP hyperparameter fitting (training-covariance Cholesky): Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+AG_VS / patience: BayOPyNumericalWarning: BayOPy numerical event during GP posterior moments: Negative variance values detected. This is likely due to numerical instabilities. Rounding negative variances up to 1e-10.
+
+Saved results: results/last_guide/early_patience/run_49k90o_1

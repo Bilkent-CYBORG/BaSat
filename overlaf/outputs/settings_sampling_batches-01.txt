@@ -1,0 +1,19 @@
+Saved-result refresh (no optimization was executed).
+Source: results/last_guide/sampling_batches/run_3q5zetrd/results.json
+Trials: 5/5; limits: {'max_evaluations': 50, 'max_rounds': None}
+Algorithm | evaluations per trial | final mean best reward | failures
+Sobol / batch2 | [50, 50, 50, 50, 50] | -5.3890733e-05 | 0
+Uniform / batch2 | [50, 50, 50, 50, 50] | -0.019207686 | 0
+Joint EI / q2 | [50, 50, 50, 50, 50] | -4.6761665e-06 | 0
+Total recorded evaluations: 750; failed trials: 0
+
+Recorded stopping reasons by trial:
+Sobol / batch2: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Uniform / batch2: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+Joint EI / q2: ['maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations', 'maximum_evaluations']
+
+Recorded warnings (deduplicated per algorithm):
+Sobol / batch2: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-06 during GP posterior sampling because the covariance matrix was not positive definite.
+Uniform / batch2: BayOPyJitterWarning: BayOPy added diagonal jitter=1.0e-06 during GP posterior sampling because the covariance matrix was not positive definite.
+
+Saved results: results/last_guide/sampling_batches/run_3q5zetrd

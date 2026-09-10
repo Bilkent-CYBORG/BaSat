@@ -37,7 +37,8 @@ class KernelConfig:
     active_dims:
         Optional unique model-coordinate indices consumed by this kernel.
     use_outputscale:
-        Wrap the base kernel in :class:`gpytorch.kernels.ScaleKernel`.
+        Wrap the base kernel in :class:`gpytorch.kernels.ScaleKernel`, except
+        spectral mixtures whose mixture weights already provide scaling.
     lengthscale_prior, outputscale_prior:
         Optional GPyTorch prior instances.
     kwargs:
@@ -100,11 +101,24 @@ def build_kernel(config: KernelConfig, *, input_dimension: int) -> gpytorch.kern
                 "active_dims contains an index outside the model coordinates."
             )
     modeled_dimension = input_dimension if active_dims is None else len(active_dims)
-    if config.ard_num_dims is not None and config.ard_num_dims != modeled_dimension:
-        raise InvalidKernelConfigError(
-            "ard_num_dims must equal the number of modeled coordinates "
-            f"({modeled_dimension}), not an environment dimension."
-        )
+    if config.ard_num_dims is not None:
+        if isinstance(config.ard_num_dims, bool) or not isinstance(config.ard_num_dims, int):
+            raise InvalidKernelConfigError("ard_num_dims must be a positive integer.")
+        if config.ard_num_dims != modeled_dimension:
+            raise InvalidKernelConfigError(
+                "ard_num_dims must equal the number of modeled coordinates "
+                f"({modeled_dimension}), not an environment dimension."
+            )
+    if not isinstance(config.use_outputscale, bool):
+        raise InvalidKernelConfigError("use_outputscale must be bool.")
+    if not isinstance(config.name, str):
+        raise InvalidKernelConfigError("name must be a string identifying a kernel family.")
+    for label, prior in {
+        "lengthscale_prior": config.lengthscale_prior,
+        "outputscale_prior": config.outputscale_prior,
+    }.items():
+        if prior is not None and not isinstance(prior, gpytorch.priors.Prior):
+            raise InvalidKernelConfigError(f"{label} must be a GPyTorch prior.")
     if not isinstance(config.kwargs, Mapping):
         raise InvalidKernelConfigError("kwargs must be a mapping.")
 
@@ -141,6 +155,8 @@ def build_kernel(config: KernelConfig, *, input_dimension: int) -> gpytorch.kern
                     "Polynomial kernels do not accept ARD or a lengthscale prior."
                 )
             power = kwargs.pop("power", 2)
+            if isinstance(power, bool) or not isinstance(power, int) or power < 1:
+                raise InvalidKernelConfigError("Polynomial power must be a positive integer.")
             base = gpytorch.kernels.PolynomialKernel(power=power, active_dims=active_dims, **kwargs)
         elif name in {"spectralmixture", "spectral"}:
             if config.lengthscale_prior is not None:
@@ -148,6 +164,8 @@ def build_kernel(config: KernelConfig, *, input_dimension: int) -> gpytorch.kern
                     "Spectral-mixture kernels do not accept a lengthscale prior."
                 )
             num_mixtures = kwargs.pop("num_mixtures", 4)
+            if isinstance(num_mixtures, bool) or not isinstance(num_mixtures, int) or num_mixtures < 1:
+                raise InvalidKernelConfigError("num_mixtures must be a positive integer.")
             base = gpytorch.kernels.SpectralMixtureKernel(
                 num_mixtures=num_mixtures,
                 ard_num_dims=modeled_dimension,
@@ -164,6 +182,12 @@ def build_kernel(config: KernelConfig, *, input_dimension: int) -> gpytorch.kern
         raise InvalidKernelConfigError(
             f"Invalid arguments for kernel {config.name!r}: {exc}"
         ) from exc
+    if isinstance(base, gpytorch.kernels.SpectralMixtureKernel):
+        if config.outputscale_prior is not None:
+            raise InvalidKernelConfigError(
+                "Spectral mixtures use mixture weights and do not accept outputscale_prior."
+            )
+        return base
     if not config.use_outputscale:
         if config.outputscale_prior is not None:
             raise InvalidKernelConfigError("outputscale_prior requires use_outputscale=True.")

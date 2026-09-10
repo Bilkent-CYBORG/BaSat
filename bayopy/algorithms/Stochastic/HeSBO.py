@@ -13,7 +13,7 @@ from bayopy.algorithms.algorithm import (
     AlgorithmConfigurationError,
     resolve_batch_configuration,
 )
-from bayopy.algorithms.helper import SourceRecord, to_quality
+from bayopy.algorithms.helper import LastAskRecord, SourceRecord, to_quality
 from bayopy.models.Acquisitions import (
     AcquisitionConfig,
     DiscreteAcquisitionCandidates,
@@ -40,12 +40,18 @@ class HeSBOConfig:
 
     Parameters
     ----------
+    finite_candidate_mode:
+        "project" scores actual finite rows in compressed coordinates (a warned
+        extension); "exact" requires original embedding geometry. Continuous
+        proposal generation is unchanged.
     embedding_dimension:
         Reduced signed-hash dimension ``D_model``.
     acquisition:
         EI/UCB construction and Monte Carlo settings.
     initial_points:
         Optional initial-design size.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     hash_family:
         Immutable paper hash/sign construction selector.
     batch_size, seed:
@@ -53,8 +59,10 @@ class HeSBOConfig:
     """
 
     embedding_dimension: int
+    finite_candidate_mode: Literal["project", "exact"] = field(default="project", kw_only=True)
     acquisition: AcquisitionConfig = field(default_factory=AcquisitionConfig)
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     hash_family: Literal["paper"] = "paper"
     batch_size: int | None = 1
     q_batch: int | None = None
@@ -109,7 +117,7 @@ class HeSBO(Algorithm):
         paper_url="https://proceedings.mlr.press/v97/nayebi19a.html",
         repository_url="https://github.com/aminnayebi/HesBO",
         repository_status="author",
-        notes="Clean-room signed-hash implementation with exact finite inverse checks.",
+        notes="Signed-hash continuous search with a warned finite-row compression extension.",
     )
 
     def __init__(
@@ -156,6 +164,7 @@ class HeSBO(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -194,6 +203,8 @@ class HeSBO(Algorithm):
 
         if not isinstance(config, HeSBOConfig):
             raise AlgorithmConfigurationError("config must be HeSBOConfig.")
+        if config.finite_candidate_mode not in {"project", "exact"}:
+            raise AlgorithmConfigurationError("finite_candidate_mode must be project or exact.")
         if (
             isinstance(config.embedding_dimension, bool)
             or not isinstance(config.embedding_dimension, int)
@@ -285,8 +296,17 @@ class HeSBO(Algorithm):
         metadata: Mapping[str, Any] | None = None,
         historical: bool = False,
     ) -> torch.Tensor:
-        """Recover bucket coordinates only when every collision is consistent."""
+        """Compress bucket coordinates, or verify the exact map in strict mode."""
 
+        if self.config.finite_candidate_mode == "project":
+            X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
+            # Least-squares coordinates of the signed-hash expansion. Empty
+            # buckets carry no information and receive the minimum-norm value 0.
+            return torch.stack([
+                (X[:, members] * self.state.sign[members]).mean(dim=-1)
+                if members.numel() else X.new_zeros(X.shape[0])
+                for members in self.state.bucket_members
+            ], dim=-1)
         supplied = self._metadata_Y(metadata or {}, actions.shape[0])
         X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
         if supplied is None:
@@ -316,7 +336,7 @@ class HeSBO(Algorithm):
         return supplied.detach().clone()
 
     def _initialize_from_environment_impl(self, data: Any) -> None:
-        """Recover exact hash coordinates for learner-visible historical rows."""
+        """Encode learner-visible historical rows in signed-hash coordinates."""
 
         actions = torch.as_tensor(data.actions, dtype=self.dtype, device=self.device)
         if actions.shape[0] == 0:
@@ -344,7 +364,7 @@ class HeSBO(Algorithm):
         candidate_dataset_indices: torch.Tensor,
         round_info: Mapping[str, Any],
     ) -> DiscreteAcquisitionCandidates:
-        """Represent finite action rows exactly in signed-hash coordinates."""
+        """Represent available rows in signed-hash model coordinates."""
 
         Y = self._recover_y_if_exact(candidate_actions, metadata=round_info)
         return DiscreteAcquisitionCandidates(
@@ -362,6 +382,26 @@ class HeSBO(Algorithm):
                 to_quality(self.state.y_train, maximize=self.maximize),
             )
 
+    def _perturb_continuous_batch_record(
+        self, record: LastAskRecord, offset: int
+    ) -> LastAskRecord:
+        """Keep duplicate-batch displacements inside the signed-hash image."""
+
+        if record.model_inputs is None:
+            raise HeSBODataCompatibilityError("HeSBO batch proposal has no latent coordinates.")
+        Y = record.model_inputs.detach().clone()
+        coordinate = offset % self.config.embedding_dimension
+        step = 1e-4 * (1 + offset // self.config.embedding_dimension)
+        direction = -1.0 if Y[0, coordinate] > 0 else 1.0
+        Y[0, coordinate] = (Y[0, coordinate] + direction * step).clamp(-1.0, 1.0)
+        actions = self._map_y_to_action(Y)
+        return LastAskRecord(
+            actions=actions,
+            model_inputs=Y,
+            round_info_snapshot=record.round_info_snapshot,
+            algorithm_metadata=record.algorithm_metadata,
+        )
+
     def _fit_embedded_gp(self) -> None:
         """Fit the GP over the current ``D_model`` signed-hash coordinates."""
 
@@ -374,7 +414,7 @@ class HeSBO(Algorithm):
         return self.config.initial_points or max(2 * self.config.embedding_dimension, 4)
 
     def _ask_impl(self, *, round_info: Mapping[str, Any]) -> torch.Tensor:
-        """Select the next continuous or exact finite HeSBO action.
+        """Select the next continuous or finite HeSBO action.
 
         Raises
         ------

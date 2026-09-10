@@ -43,6 +43,8 @@ class TuRBOConfig:
     ----------
     batch_size, initial_points:
         Synchronous proposal size and initial-design budget.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     length_init, length_min, length_max:
         Normalized trust-region side-length bounds.
     success_tolerance, failure_tolerance:
@@ -65,6 +67,7 @@ class TuRBOConfig:
     batch_size: int | None = 1
     q_batch: int | None = None
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     length_init: float = 0.8
     length_min: float = 0.5**7
     length_max: float = 1.6
@@ -192,6 +195,7 @@ class TuRBO(Algorithm):
             dtype=dtype,
             device=device,
             seed=resolved_config.seed,
+            initial_points_sampling_method=resolved_config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -661,6 +665,7 @@ class TuRBO(Algorithm):
             X, quality = self._fit_local_gp()
             self.state.center_unit = self._select_center(X, quality)
             lower, upper = self._make_trust_region()
+            self.state.best_value_before_batch = float(quality.max().item())
             if table is None:
                 candidates = self._generate_paper_candidates(lower, upper)
                 selection_table = DiscreteAcquisitionCandidates(
@@ -674,11 +679,17 @@ class TuRBO(Algorithm):
                 unit = candidates[positions]
                 actions = unnormalize(unit, self.bounds.to(dtype=self.dtype, device=self.device))
             else:
+                restart_count = self.state.restart_count
                 filtered = self._filter_finite_candidates(table, lower, upper)
-                positions = self._acquisition_select(filtered)
+                if self.state.restart_count != restart_count:
+                    # Finite-region exhaustion starts a new local model. Its
+                    # observations must be collected before posterior scoring.
+                    positions = torch.argsort(filtered.dataset_indices)[: self.request_size]
+                    self.state.best_value_before_batch = None
+                else:
+                    positions = self._acquisition_select(filtered)
                 unit = filtered.model_inputs[positions]
                 actions = filtered.environment_actions[positions]
-            self.state.best_value_before_batch = float(quality.max().item())
         self._record_last_ask(
             actions=actions,
             model_inputs=unit,

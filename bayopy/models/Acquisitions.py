@@ -16,6 +16,8 @@ from botorch.optim.optimize import optimize_acqf
 from botorch.sampling.normal import SobolQMCNormalSampler
 from torch.quasirandom import SobolEngine
 
+from bayopy.warnings import translate_backend_warnings
+
 
 class AcquisitionError(Exception):
     """Base class for acquisition construction and optimization errors."""
@@ -31,6 +33,13 @@ class DiscreteAcquisitionError(AcquisitionError, ValueError):
 
 class NoAvailableCandidateError(DiscreteAcquisitionError):
     """Raised when a finite acquisition request cannot select ``q`` rows."""
+
+
+def _optimize_acqf_with_bayopy_warnings(**kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run BoTorch optimization while exposing only BayOPy-owned backend warnings."""
+
+    with translate_backend_warnings(operation="continuous acquisition optimization"):
+        return optimize_acqf(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +223,8 @@ def build_acquisition(
     if not torch.isfinite(torch.tensor(float(config.xi))) or config.xi < 0:
         raise InvalidAcquisitionConfigError("xi must be finite and non-negative.")
     botorch_model = _underlying_model(model)
+    if not isinstance(config.name, str):
+        raise InvalidAcquisitionConfigError("name must be a string identifying EI or UCB.")
     name = config.name.lower().replace("-", "").replace("_", "")
     sampler = SobolQMCNormalSampler(sample_shape=torch.Size([config.mc_samples]), seed=config.seed)
     if name in {"ei", "expectedimprovement"}:
@@ -374,6 +385,8 @@ def optimize_acquisition_continuous(
             raise AcquisitionError(f"{name} must be a positive integer.")
     if sampling_method not in {"paper", "sobol", "uniform"}:
         raise AcquisitionError("sampling_method must be 'paper', 'sobol', or 'uniform'.")
+    if isinstance(sampling_seed, bool) or not isinstance(sampling_seed, int) or sampling_seed < 0:
+        raise AcquisitionError("sampling_seed must be a non-negative integer.")
     if sampling_method != "paper":
         if constraints is not None:
             raise AcquisitionError(
@@ -382,8 +395,13 @@ def optimize_acquisition_continuous(
         pool_size = max(raw_samples, count * 16)
         draw_count = pool_size * count if mode == "joint" else pool_size
         if sampling_method == "sobol":
-            engine = SobolEngine(dimension=bounds.shape[1], scramble=True, seed=sampling_seed)
-            unit = engine.draw(draw_count, dtype=bounds.dtype).to(bounds.device)
+            # A joint q-batch is one point in q * D dimensions. Grouping
+            # consecutive D-dimensional Sobol points introduces dependencies
+            # and is not a Sobol design over the joint search space.
+            dimension = bounds.shape[1] * (count if mode == "joint" else 1)
+            engine = SobolEngine(dimension=dimension, scramble=True, seed=sampling_seed)
+            unit = engine.draw(pool_size, dtype=bounds.dtype).to(bounds.device)
+            unit = unit.reshape(draw_count, bounds.shape[1])
         else:
             if not isinstance(sampling_generator, torch.Generator):
                 raise AcquisitionError("uniform acquisition sampling requires sampling_generator.")
@@ -394,13 +412,17 @@ def optimize_acquisition_continuous(
                 generator=sampling_generator,
             )
         pool = bounds[0] + (bounds[1] - bounds[0]) * unit
-        pool = torch.unique(pool, dim=0)
+        pool = _distinct_rows_in_order(pool)
         if pool.shape[0] < draw_count:
             raise AcquisitionError("The sampler returned duplicate acquisition candidates.")
         with torch.no_grad():
             if mode == "joint":
                 sets = pool.reshape(pool_size, count, bounds.shape[1])
                 values = acquisition(sets).reshape(-1)
+                if values.numel() != pool_size or not torch.isfinite(values).all():
+                    raise AcquisitionError(
+                        "The acquisition must return one finite score per sampled batch."
+                    )
                 position = int(torch.argmax(values).item())
                 return sets[position], values[position]
             values = acquisition(pool.unsqueeze(-2)).reshape(-1)
@@ -416,13 +438,21 @@ def optimize_acquisition_continuous(
         # public ``raw_samples`` value as a minimum sampling budget rather than
         # silently reducing the explicitly requested multistart count.
         effective_raw_samples = max(raw_samples, num_restarts)
+        # SciPy's box-constrained L-BFGS-B default permits only 20 line-search
+        # steps. Smooth GP acquisitions can need more near flat optima or box
+        # boundaries; a larger budget prevents recoverable ``ABNORMAL`` exits
+        # without filtering BoTorch warnings or changing the selected solver.
+        optimizer_options: dict[str, bool | float | int | str] | None = (
+            None if constraints is not None else {"maxls": 100}
+        )
         if mode == "joint" or count == 1:
-            return optimize_acqf(
+            return _optimize_acqf_with_bayopy_warnings(
                 acq_function=acquisition,
                 bounds=bounds,
                 q=count,
                 num_restarts=num_restarts,
                 raw_samples=effective_raw_samples,
+                options=optimizer_options,
                 inequality_constraints=constraints,
                 sequential=False,
             )
@@ -436,19 +466,22 @@ def optimize_acquisition_continuous(
         # a deterministic Sobol candidate pool, score every row independently,
         # and retain the best distinct rows.  The pool prevents a multimethod
         # local optimizer from returning the same maximizer ``count`` times.
-        best_point, _ = optimize_acqf(
+        best_point, _ = _optimize_acqf_with_bayopy_warnings(
             acq_function=acquisition,
             bounds=bounds,
             q=1,
             num_restarts=num_restarts,
             raw_samples=effective_raw_samples,
+            options=optimizer_options,
             sequential=False,
         )
         pool_size = max(effective_raw_samples, count * 16)
-        engine = SobolEngine(dimension=bounds.shape[1], scramble=True, seed=0)
+        engine = SobolEngine(dimension=bounds.shape[1], scramble=True, seed=sampling_seed)
         unit = engine.draw(pool_size, dtype=bounds.dtype).to(bounds.device)
         pool = bounds[0] + (bounds[1] - bounds[0]) * unit
-        pool = torch.cat((best_point.reshape(1, -1), pool), dim=0)
+        pool = _distinct_rows_in_order(torch.cat((best_point.reshape(1, -1), pool), dim=0))
+        if pool.shape[0] < count:
+            raise AcquisitionError("Too few distinct acquisition candidates for batch_size.")
         with torch.no_grad():
             values = acquisition(pool.unsqueeze(-2)).reshape(-1)
         if values.numel() != pool.shape[0] or not torch.isfinite(values).all():
@@ -457,6 +490,17 @@ def optimize_acquisition_continuous(
         return pool[order], values[order]
     except (RuntimeError, ValueError) as exc:
         raise AcquisitionError(f"Continuous acquisition optimization failed: {exc}") from exc
+
+
+def _distinct_rows_in_order(rows: torch.Tensor) -> torch.Tensor:
+    """Remove duplicates without rearranging randomly sampled joint batches."""
+
+    unique, inverse = torch.unique(rows, dim=0, return_inverse=True)
+    first = torch.full((unique.shape[0],), rows.shape[0], device=rows.device, dtype=torch.long)
+    first.scatter_reduce_(
+        0, inverse, torch.arange(rows.shape[0], device=rows.device), reduce="amin"
+    )
+    return rows[torch.sort(first).values]
 
 
 def _best_position(values: torch.Tensor, dataset_indices: torch.Tensor) -> int:
@@ -548,6 +592,8 @@ def _optimize_discrete_q_batch(
         for _ in range(q):
             if selected_rows:
                 pending = candidates.model_inputs[torch.stack(selected_rows)]
+                if base_pending is not None:
+                    pending = torch.cat((base_pending, pending), dim=-2)
                 setter(pending)
             X = candidates.model_inputs[remaining].unsqueeze(-2)
             with torch.no_grad():

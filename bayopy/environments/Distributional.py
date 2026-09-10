@@ -270,9 +270,11 @@ class DistributionalEnvironment(Environment):
 
         if self._pending_round_info is not None:
             return _clone_tree(self._pending_round_info)
+        assert self.context_support is not None
         self.current_reference_distribution = self._resolve_reference_distribution()
         self.current_margin = self._resolve_margin()
         info: dict[str, Any] = {
+            "context_support": self.context_support.detach().clone(),
             "reference_distribution": self.current_reference_distribution.clone()
         }
         if self.current_margin is not None:

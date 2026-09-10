@@ -133,23 +133,22 @@ class LA_MCTSException(AlgorithmExceptionController):
         if self._config.gp_maxiter < 1:
             self.add_issue("error", "local_optimizer", "gp_maxiter must be positive.")
 
-    def _check_preset(self) -> None:
-        """Mark settings that depart from the explicit paper-general preset."""
+    def _check_default_settings(self) -> None:
+        """Identify explicit numerical settings that depart from config defaults."""
 
         config = self._config
-        defaults = (30, 1.0, 20, "turbo")
-        selected = (
-            config.initial_points,
-            config.exploration_constant,
-            config.split_threshold,
-            config.local_sampler,
+        default_config = type(config)()
+        fields = (
+            "initial_points", "exploration_constant", "split_threshold", "local_sampler"
         )
+        defaults = tuple(getattr(default_config, name) for name in fields)
+        selected = tuple(getattr(config, name) for name in fields)
         if selected != defaults:
             self.add_issue(
                 "warning",
                 "tree",
-                "Selected LA-MCTS values differ from the paper-general preset.",
-                details={"selected": selected, "paper_general": defaults},
+                "Selected LA-MCTS numerical settings differ from the configuration defaults.",
+                details={"fields": fields, "selected": selected, "defaults": defaults},
                 affects_source_guarantees=True,
             )
 
@@ -159,7 +158,7 @@ class LA_MCTSException(AlgorithmExceptionController):
         Returns
         -------
         ExceptionDiagnosticReport
-            Tree, classifier, region, local optimizer, dependency, and preset
+            Tree, classifier, region, local optimizer, dependency and configuration
             findings without reading hidden finite responses.
         """
 
@@ -169,7 +168,7 @@ class LA_MCTSException(AlgorithmExceptionController):
         self._check_classifier()
         self._check_region()
         self._check_local_optimizer()
-        self._check_preset()
+        self._check_default_settings()
         guarantees = base.guarantees_applicable and not any(
             bool(issue.details.get("affects_source_guarantees", False)) for issue in self.issues
         )

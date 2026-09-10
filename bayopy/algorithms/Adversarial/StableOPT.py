@@ -224,7 +224,8 @@ class StableOPTState:
     robust_ucb_values:
         Robust upper-confidence values recorded for proposed centers.
     robust_lcb_values:
-        Post-update robust lower-confidence audit values for proposed centers.
+        Pre-update robust lower-confidence values for proposed centers, as in
+        the paper's Eq. (17). Initial-design entries have no confidence value.
     """
 
     X_query_train: torch.Tensor
@@ -1769,27 +1770,32 @@ class StableOPT(Algorithm):
         self._recommendation_cache = None
 
     def _robust_recommendation(self) -> tuple[torch.Tensor | None, float | None]:
-        """Recommend the observed center with maximum posterior robust LCB."""
+        """Select the best recorded pre-update robust LCB (paper Eq. 17).
+
+        Recomputing all historical bounds with the final posterior changes the
+        paper's recommendation and makes a read-only result call run expensive
+        fits/solvers. The bounds needed here are already recorded by ask/tell.
+        """
 
         if self._recommendation_cache is not None:
             action, value = self._recommendation_cache
             return None if action is None else action.detach().clone(), value
         if not self.state.robust_centers:
             return self._best_observed()
-        self._fit_model()
-        values: list[float] = []
-        for center in self.state.robust_centers:
-            _, robust_lcb = self._select_internal_query_point(
-                center,
-                candidates=None,
-            )
-            values.append(robust_lcb)
-        value_tensor = torch.tensor(values, dtype=self.dtype, device=self.device)
-        centers = torch.stack(self.state.robust_centers)
+        value_tensor = torch.tensor(
+            self.state.robust_lcb_values, dtype=self.dtype, device=self.device
+        )
+        finite = torch.isfinite(value_tensor)
+        if not finite.any():
+            return self._best_observed()
+        positions = torch.nonzero(finite, as_tuple=False).reshape(-1)
+        centers = torch.stack(self.state.robust_centers)[positions]
+        value_tensor = value_tensor[positions]
         position = self._best_position(value_tensor, centers, maximize=True)
+        value = float(value_tensor[position].item())
         recommendation = (
-            self.state.robust_centers[position].detach().clone(),
-            values[position],
+            centers[position].detach().clone(),
+            value if self.maximize else -value,
         )
         self._recommendation_cache = recommendation
         return recommendation[0].detach().clone(), recommendation[1]
@@ -1817,7 +1823,16 @@ class StableOPT(Algorithm):
     def _result_metadata_impl(self) -> Mapping[str, Any]:
         """Return detached center, internal-query, and evaluated-point traces."""
 
+        has_confidence_bound = bool(self.state.robust_centers) and any(
+            math.isfinite(value) for value in self.state.robust_lcb_values
+        )
+        fallback_kind = "observed_reward" if self.observed_values.numel() else "unavailable"
+        fallback_rule = "best_observed" if self.observed_values.numel() else "unavailable"
         return {
+            "recommendation_value_kind": (
+                "historical_robust_confidence_bound" if has_confidence_bound else fallback_kind
+            ),
+            "recommendation_rule": "paper_eq_17" if has_confidence_bound else fallback_rule,
             "robust_centers": [item.detach().clone() for item in self.state.robust_centers],
             "query_points": [item.detach().clone() for item in self.state.query_points],
             "evaluated_points": [item.detach().clone() for item in self.state.evaluated_points],

@@ -949,15 +949,18 @@ class Environment(ABC):
         """Collapse duplicate actions to their smallest stable row index."""
 
         assert self.dataset is not None
+        ordered = indices.to(device=self.device, dtype=torch.long).sort().values
+        candidates = self.dataset.actions[ordered]
+        remaining = torch.ones(ordered.numel(), dtype=torch.bool, device=self.device)
         representatives: list[int] = []
-        for raw_index in sorted(int(value) for value in indices.tolist()):
-            action = self.dataset.actions[raw_index]
-            if any(
-                bool(self._row_match(action.unsqueeze(0), self.dataset.actions[rep])[0])
-                for rep in representatives
-            ):
+        for offset in range(ordered.numel()):
+            if not bool(remaining[offset]):
                 continue
-            representatives.append(raw_index)
+            representatives.append(int(ordered[offset]))
+            # Mark matches in one tensor operation rather than one Python call
+            # per pair. Greedy first-representative semantics are unchanged,
+            # including absolute tolerance; no quadratic match matrix is kept.
+            remaining &= ~self._row_match(candidates, candidates[offset])
         return torch.tensor(representatives, dtype=torch.long, device=self.device)
 
     def _remove_observed_actions(
@@ -977,9 +980,8 @@ class Environment(ABC):
             context_value = self._validate_context(context)
             observed_actions = observed_actions[self._row_match(observed.contexts, context_value)]
         keep = torch.ones(actions.shape[0], dtype=torch.bool, device=self.device)
-        for index, action in enumerate(actions):
-            if observed_actions.shape[0] and bool(self._row_match(observed_actions, action).any()):
-                keep[index] = False
+        for observed_action in observed_actions:
+            keep &= ~self._row_match(actions, observed_action)
         return actions[keep], indices[keep]
 
     def available_actions(
@@ -1774,8 +1776,8 @@ class Environment(ABC):
             active.add(identity)
             try:
                 callable_identity = (
-                    getattr(value, "__module__", type(value).__module__),
-                    getattr(value, "__qualname__", type(value).__qualname__),
+                    getattr(value, "__module__", None) or type(value).__module__,
+                    getattr(value, "__qualname__", None) or type(value).__qualname__,
                 )
                 digest.update(".".join(callable_identity).encode())
                 try:

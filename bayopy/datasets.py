@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -49,6 +50,36 @@ class DatasetSchema:
     lower_bounds: tuple[float, ...] | None = None
     upper_bounds: tuple[float, ...] | None = None
 
+    def __post_init__(self) -> None:
+        """Reject ambiguous column conventions and unknown source families."""
+
+        for name in ("action_prefix", "context_prefix", "observation_column"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string.")
+        if self.action_prefix.startswith(self.context_prefix) or self.context_prefix.startswith(
+            self.action_prefix
+        ):
+            raise ValueError("action_prefix and context_prefix must not overlap.")
+        if self.noise_variance_column is not None and (
+            not isinstance(self.noise_variance_column, str) or not self.noise_variance_column
+        ):
+            raise ValueError("noise_variance_column must be a non-empty string or None.")
+        if self.noise_variance_column == self.observation_column:
+            raise ValueError("Observation and noise variance columns must be distinct.")
+        for name in ("observation_column", "noise_variance_column"):
+            value = getattr(self, name)
+            if value is not None and value.startswith((self.action_prefix, self.context_prefix)):
+                raise ValueError(f"{name} must not overlap action or context coordinate columns.")
+        if self.environment_family not in {
+            None,
+            "stochastic",
+            "contextual",
+            "adversarial",
+            "distributional",
+        }:
+            raise ValueError("Unknown environment_family in dataset schema.")
+
 
 @dataclass(frozen=True, slots=True)
 class LoadedDataset:
@@ -70,6 +101,86 @@ class LoadedDataset:
     bounds: Bounds
     environment_family: DatasetFamily
     path: Path
+    context_support: torch.Tensor | None = None
+    reference_distribution: torch.Tensor | None = None
+    sampling_distribution: torch.Tensor | None = None
+    margin: float | None = None
+    attack: Any | None = None
+
+    def preview(self, rows: int = 3) -> str:
+        """Return the header and first ``rows`` CSV/TSV records for display."""
+
+        if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+            raise ValueError("rows must be a positive integer.")
+        if self.path.suffix.lower() not in {".csv", ".tsv"}:
+            raise ValueError("Text previews require a CSV or TSV dataset.")
+        delimiter = "\t" if self.path.suffix.lower() == ".tsv" else ","
+        output = StringIO()
+        writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
+        with self.path.open(newline="", encoding="utf-8") as stream:
+            reader = csv.reader(stream, delimiter=delimiter)
+            for index, record in enumerate(reader):
+                if index > rows:
+                    break
+                writer.writerow(record)
+        return output.getvalue().rstrip("\n")
+
+    def make_environment(self, **settings: Any) -> Any:
+        """Construct this table's native environment with optional settings.
+
+        ``settings`` accepts the corresponding environment constructor's
+        options, for example ``dtype="float64", seed=42``.  Distribution
+        probabilities and finite attacks are taken from the validated CSV;
+        explicit settings may replace these providers.
+        """
+
+        from .environments import (
+            AdversarialEnvironment,
+            ContextualEnvironment,
+            DistributionalEnvironment,
+            StochasticEnvironment,
+        )
+
+        constructors = {
+            "stochastic": StochasticEnvironment,
+            "contextual": ContextualEnvironment,
+            "distributional": DistributionalEnvironment,
+            "adversarial": AdversarialEnvironment,
+        }
+        options: dict[str, Any] = {"bounds": self.bounds, "dataset": self.dataset}
+        if self.environment_family == "distributional":
+            options.update(
+                context_support=self.context_support,
+                reference_distribution=self.reference_distribution,
+                sampling_distribution=self.sampling_distribution,
+                margin=self.margin,
+            )
+        elif self.environment_family == "adversarial":
+            options["attack"] = self.attack
+        options.update(settings)
+        return constructors[self.environment_family](**options)
+
+
+@dataclass(frozen=True, slots=True)
+class _FiniteAttack:
+    """An explicit action-to-evaluated-action map from a user-owned table."""
+
+    actions: torch.Tensor
+    evaluated_actions: torch.Tensor
+
+    def __call__(self, *, action: torch.Tensor, **_: Any) -> torch.Tensor:
+        candidates = self.actions.to(dtype=action.dtype, device=action.device)
+        matches = torch.isclose(candidates, action, atol=1e-8, rtol=0.0).all(dim=1)
+        if not bool(matches.any()):
+            raise ValueError("The adversarial CSV has no mapping for the requested action.")
+        index = int(torch.nonzero(matches, as_tuple=False)[0, 0])
+        evaluated = self.evaluated_actions[index].to(dtype=action.dtype, device=action.device)
+        calculation_device = "cpu" if action.device.type == "mps" else action.device
+        # Preserve an exact finite destination through subtraction and later
+        # addition, including when the environment itself uses float32.
+        return evaluated.to(device=calculation_device, dtype=torch.float64) - action.to(
+            device=calculation_device, dtype=torch.float64
+        )
 
 
 def _numbered_columns(fieldnames: list[str], prefix: str) -> list[str]:
@@ -109,7 +220,10 @@ def _bounds(actions: torch.Tensor, schema: DatasetSchema) -> Bounds:
         upper = torch.where(constant, upper + 0.5, upper)
     if bool((upper <= lower).any()):
         raise ValueError("Every upper dataset bound must be greater than its lower bound.")
-    return Bounds(lower, upper)
+    bounds = Bounds(lower, upper)
+    if not bool(bounds.contains(actions).all()):
+        raise ValueError("Dataset actions lie outside the supplied bounds.")
+    return bounds
 
 
 def _family(schema: DatasetSchema, contexts: torch.Tensor | None) -> DatasetFamily:
@@ -132,6 +246,8 @@ def _load_delimited(path: Path, schema: DatasetSchema) -> LoadedDataset:
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream, delimiter=delimiter)
         fieldnames = list(reader.fieldnames or [])
+        if len(set(fieldnames)) != len(fieldnames):
+            raise ValueError("Dataset column names must be unique.")
         rows = list(reader)
     if not rows:
         raise ValueError(f"Dataset {path} contains no data rows.")
@@ -209,7 +325,9 @@ def _load_npz(path: Path, schema: DatasetSchema) -> LoadedDataset:
         raise ValueError("NPZ actions must have nonempty shape (N,D).")
     if observations.reshape(-1).shape[0] != actions.shape[0]:
         raise ValueError("NPZ actions must be (N,D) and observations must contain N values.")
-    if contexts is not None and (contexts.ndim != 2 or contexts.shape[0] != actions.shape[0]):
+    if contexts is not None and (
+        contexts.ndim != 2 or contexts.shape[0] != actions.shape[0] or contexts.shape[1] == 0
+    ):
         raise ValueError("NPZ contexts must have shape (N,D_context).")
     if variance is not None and variance.reshape(-1).shape[0] != actions.shape[0]:
         raise ValueError("NPZ observation_noise_variance must contain N values.")
@@ -235,10 +353,152 @@ def _load_npz(path: Path, schema: DatasetSchema) -> LoadedDataset:
     )
 
 
+def _load_environment_table(path: Path, family: DatasetFamily) -> LoadedDataset:
+    """Read the reserved-column, reward-last native environment contract."""
+
+    if path.suffix.lower() not in {".csv", ".tsv"}:
+        raise ValueError("The explicit environment contract requires a CSV or TSV file.")
+    delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+    with path.open(newline="", encoding="utf-8") as stream:
+        reader = csv.reader(stream, delimiter=delimiter)
+        columns = next(reader, [])
+        raw_rows = list(reader)
+    if len(columns) != len(set(columns)):
+        raise ValueError("Dataset column names must be unique.")
+    if not columns or columns[-1] != "reward":
+        raise ValueError("The final CSV column must be named 'reward'.")
+    if not raw_rows or any(len(row) != len(columns) for row in raw_rows):
+        raise ValueError("The CSV must contain nonempty rows matching its column count.")
+    action_columns = _numbered_columns(columns, "action_")
+    context_columns = _numbered_columns(columns, "context_")
+    evaluated_columns = _numbered_columns(columns, "evaluated_action_")
+    if not action_columns:
+        raise ValueError("The CSV requires action_0, action_1, ... columns.")
+    needs_context = family in {"contextual", "distributional"}
+    if bool(context_columns) != needs_context:
+        requirement = "requires" if needs_context else "must not contain"
+        raise ValueError(f"A {family} CSV {requirement} context_0, context_1, ... columns.")
+    if family == "adversarial":
+        if len(evaluated_columns) != len(action_columns):
+            raise ValueError("Adversarial CSV requires one evaluated_action_i per action_i.")
+    elif evaluated_columns:
+        raise ValueError("Only an adversarial CSV may contain evaluated_action_i columns.")
+    allowed = set(action_columns + context_columns + evaluated_columns)
+    allowed.update({"reward", "observation_noise_variance"})
+    if family == "distributional":
+        allowed.update({"reference_probability", "sampling_probability", "margin"})
+        if "reference_probability" not in columns:
+            raise ValueError("A distributional CSV requires reference_probability.")
+    unexpected = sorted(set(columns) - allowed)
+    if unexpected:
+        raise ValueError(f"Unexpected columns in the {family} CSV: {unexpected}.")
+    try:
+        matrix = torch.tensor(
+            [[float(value) for value in row] for row in raw_rows], dtype=torch.float64
+        )
+    except (ValueError, TypeError) as error:
+        raise ValueError("All reserved CSV columns must contain numeric values.") from error
+    if not bool(torch.isfinite(matrix).all()):
+        raise ValueError("CSV values must be finite; NaN and infinity are invalid.")
+
+    def values(names: list[str]) -> torch.Tensor:
+        return matrix[:, [columns.index(name) for name in names]]
+
+    actions = values(action_columns)
+    contexts = values(context_columns) if context_columns else None
+    variance = (
+        values(["observation_noise_variance"]).flatten()
+        if "observation_noise_variance" in columns
+        else None
+    )
+    if variance is not None and bool((variance < 0).any()):
+        raise ValueError("observation_noise_variance cannot be negative.")
+    support = reference = sampling = None
+    if contexts is not None:
+        support = torch.tensor(
+            list(dict.fromkeys(tuple(row) for row in contexts.tolist())), dtype=torch.float64
+        )
+    margin = None
+    attack = None
+    if family == "distributional":
+        assert contexts is not None
+        context_keys = [tuple(row) for row in contexts.tolist()]
+        unique_contexts = list(dict.fromkeys(context_keys))
+        support = torch.tensor(unique_contexts, dtype=torch.float64)
+        action_keys = [tuple(row) for row in actions.tolist()]
+        pairs = set(zip(action_keys, context_keys, strict=True))
+        if len(pairs) != len(set(action_keys)) * len(unique_contexts):
+            raise ValueError("Distributional CSV must be a complete action-context grid.")
+
+        def probabilities(column: str) -> torch.Tensor:
+            per_row = values([column]).flatten()
+            result = []
+            for context in unique_contexts:
+                indices = [i for i, key in enumerate(context_keys) if key == context]
+                entries = per_row[indices]
+                if not bool(torch.isclose(entries, entries[0], atol=1e-10, rtol=0).all()):
+                    raise ValueError(f"{column} must be identical for a context across actions.")
+                result.append(float(entries[0]))
+            probability = torch.tensor(result, dtype=torch.float64)
+            if bool((probability < 0).any()) or abs(float(probability.sum()) - 1.0) > 1e-8:
+                raise ValueError(f"{column} must be nonnegative and sum to one over contexts.")
+            return probability
+
+        reference = probabilities("reference_probability")
+        sampling = (
+            probabilities("sampling_probability")
+            if "sampling_probability" in columns
+            else reference.clone()
+        )
+        margin = 0.0
+        if "margin" in columns:
+            margins = values(["margin"]).flatten()
+            if bool((margins < 0).any()) or not bool((margins == margins[0]).all()):
+                raise ValueError("margin must be a single nonnegative value repeated on every row.")
+            margin = float(margins[0])
+    elif family == "adversarial":
+        evaluated = values(evaluated_columns)
+        nominal_keys = [tuple(row) for row in actions.tolist()]
+        evaluated_keys = [tuple(row) for row in evaluated.tolist()]
+        if set(nominal_keys) != set(evaluated_keys):
+            raise ValueError("Adversarial nominal and evaluated finite action sets must match.")
+        mapping: dict[tuple[float, ...], tuple[float, ...]] = {}
+        for nominal, actual in zip(nominal_keys, evaluated_keys, strict=True):
+            if nominal in mapping and mapping[nominal] != actual:
+                raise ValueError("An adversarial nominal action must have one evaluated mapping.")
+            mapping[nominal] = actual
+        attack = _FiniteAttack(actions=actions.clone(), evaluated_actions=evaluated.clone())
+        # Native adversarial tables look up reward at the actually evaluated coordinate.
+        actions = evaluated
+    dataset = EnvironmentDataset(
+        actions=actions,
+        observations=values(["reward"]).flatten(),
+        contexts=contexts,
+        observation_noise_variance=variance,
+        metadata={
+            "source_path": str(path),
+            "environment_family": family,
+            "column_contract": "reward-last-v1",
+        },
+    )
+    return LoadedDataset(
+        dataset=dataset,
+        bounds=_bounds(actions, DatasetSchema()),
+        environment_family=family,
+        path=path,
+        context_support=support,
+        reference_distribution=reference,
+        sampling_distribution=sampling,
+        margin=margin,
+        attack=attack,
+    )
+
+
 def load_dataset(
     path: str | Path,
     *,
     schema: DatasetSchema | None = None,
+    environment: DatasetFamily | None = None,
 ) -> LoadedDataset:
     """Load and validate a user-owned CSV, TSV, or NPZ finite dataset.
 
@@ -251,6 +511,18 @@ def load_dataset(
     schema:
         Optional names, semantics, and bounds. The conventional schema is used
         when this argument is omitted.
+    environment:
+        Select the strict native CSV/TSV contract: numbered ``action_i``
+        columns and a final ``reward`` column. Contextual and distributional
+        files additionally require ``context_i``. Distributional files require
+        a complete action-context grid and ``reference_probability`` repeated
+        consistently per context; optional ``sampling_probability`` and
+        ``margin`` configure the hidden sampling provider and public ambiguity
+        radius. Adversarial files require ``evaluated_action_i`` and associate
+        each reward with that evaluated coordinate. The nominal and evaluated
+        finite action sets must agree. This option cannot be combined with
+        a custom ``schema``. Without it the existing configurable schema and
+        NPZ array contract remain available.
 
     Returns
     -------
@@ -272,7 +544,15 @@ def load_dataset(
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Dataset does not exist: {source}")
+    if environment is not None:
+        if schema is not None:
+            raise ValueError("Use either environment's reserved columns or a custom schema.")
+        if environment not in {"stochastic", "contextual", "distributional", "adversarial"}:
+            raise ValueError("Unknown dataset environment; expected one of the four families.")
+        return _load_environment_table(source, environment)
     selected_schema = DatasetSchema() if schema is None else schema
+    if not isinstance(selected_schema, DatasetSchema):
+        raise TypeError("schema must be a DatasetSchema instance or None.")
     suffix = source.suffix.lower()
     if suffix in {".csv", ".tsv"}:
         return _load_delimited(source, selected_schema)

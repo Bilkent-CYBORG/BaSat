@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
+import warnings
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal
 
 import gpytorch
 import torch
+from botorch.exceptions.errors import ModelFittingError
 from botorch.fit import fit_gpytorch_mll
 from botorch.models import SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim.core import OptimizationStatus
+from botorch.optim.fit import fit_gpytorch_mll_torch
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.sampling.normal import SobolQMCNormalSampler
 from gpytorch.likelihoods import FixedNoiseGaussianLikelihood
 from gpytorch.means import ConstantMean, ZeroMean
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
+from ..warnings import BayOPyNumericalWarning, translate_backend_warnings
 from .Kernels import KernelConfig, build_kernel
 from .utils import as_tensor, resolve_device, resolve_dtype
 
@@ -67,10 +75,15 @@ class GaussianProcessConfig:
     fit_method:
         ``"mle"`` ignores registered prior terms; ``"map"`` includes them.
     jitter:
-        Positive diagonal stabilization added to every posterior covariance and
-        used for guarded training factorizations.
+        Small positive diagonal stabilization used only when a covariance
+        factorization is not positive definite without it.
     max_cholesky_retries:
         Number of permitted Cholesky attempts in GPyTorch.
+    standardize_outcomes:
+        Standardize scalar training targets inside the BoTorch model and
+        automatically return posterior values in the original observation
+        units. This improves covariance conditioning without changing the
+        rewards seen by algorithms or users.
     dtype, device:
         Canonical tensor precision and execution device.
     """
@@ -82,6 +95,7 @@ class GaussianProcessConfig:
     fit_method: Literal["mle", "map"] = "mle"
     jitter: float = 1e-6
     max_cholesky_retries: int = 5
+    standardize_outcomes: bool = True
     dtype: torch.dtype | str = torch.float32
     device: torch.device | str = "cpu"
 
@@ -158,6 +172,8 @@ class GaussianProcess:
             raise InvalidGaussianProcessConfigError(
                 "max_cholesky_retries must be a positive integer."
             )
+        if not isinstance(config.standardize_outcomes, bool):
+            raise InvalidGaussianProcessConfigError("standardize_outcomes must be bool.")
         if config.noise_variance is not None:
             variance = torch.tensor(float(config.noise_variance))
             if not torch.isfinite(variance) or variance < 0:
@@ -257,37 +273,94 @@ class GaussianProcess:
             self.mll = None
             return
         train_y = self.y_train.unsqueeze(-1)
-        effective_noise = (
-            None
-            if self.observation_noise is None
-            else self.observation_noise.clamp_min(self.config.jitter)
-        )
+        effective_noise = self.observation_noise
         likelihood = None
         train_yvar = None
+        outcome_transform = (
+            Standardize(m=1, min_stdv=math.sqrt(torch.finfo(self.dtype).tiny))
+            if self.config.standardize_outcomes
+            else None
+        )
         if self.config.noise_mode == "fixed":
             assert effective_noise is not None
             train_yvar = effective_noise.unsqueeze(-1)
         elif effective_noise is not None:
             # Known measurement variance and an additional learned noise term are
             # distinct sources of uncertainty, so neither is silently discarded.
-            likelihood = FixedNoiseGaussianLikelihood(
-                noise=effective_noise, learn_additional_noise=True
-            )
+            # SingleTaskGP transforms train_Yvar, but never transforms the
+            # variances inside a caller-supplied likelihood. Match its target
+            # coordinates before constructing that likelihood.
+            if outcome_transform is not None:
+                _, transformed_noise = outcome_transform(
+                    train_y, effective_noise.unsqueeze(-1), X=self.X_train
+                )
+                assert transformed_noise is not None
+                effective_noise = transformed_noise.squeeze(-1)
+            with (
+                translate_backend_warnings(operation="GP measurement-noise construction"),
+                gpytorch.settings.min_fixed_noise(float_value=0.0, double_value=0.0),
+            ):
+                likelihood = FixedNoiseGaussianLikelihood(
+                    noise=effective_noise, learn_additional_noise=True
+                )
         mean_module = ZeroMean() if self.config.mean == "zero" else ConstantMean()
         try:
-            self.model = SingleTaskGP(
-                self.X_train,
-                train_y,
-                train_Yvar=train_yvar,
-                likelihood=likelihood,
-                covar_module=self._new_kernel(),
-                mean_module=mean_module,
-                outcome_transform=None,
-            ).to(dtype=self.dtype, device=self.device)
+            with (
+                translate_backend_warnings(operation="GP model construction"),
+                # Preserve known measurement variances in observation units.
+                # GPyTorch's default floor in standardized units can inflate
+                # them by orders of magnitude; factorization jitter is a
+                # separate configurable numerical safeguard.
+                gpytorch.settings.min_fixed_noise(float_value=0.0, double_value=0.0),
+            ):
+                self.model = SingleTaskGP(
+                    self.X_train,
+                    train_y,
+                    train_Yvar=train_yvar,
+                    likelihood=likelihood,
+                    covar_module=self._new_kernel(),
+                    mean_module=mean_module,
+                    outcome_transform=outcome_transform,
+                ).to(dtype=self.dtype, device=self.device)
         except (RuntimeError, ValueError) as exc:
             raise InvalidModelDataError(f"Unable to construct Gaussian process: {exc}") from exc
+        if isinstance(self.config.kernel, KernelConfig) and isinstance(
+            self.model.covar_module, gpytorch.kernels.SpectralMixtureKernel
+        ):
+            self._initialize_spectral_mixture(self.model.covar_module)
         self.likelihood = self.model.likelihood
         self.mll = self._make_mll(self.config.fit_method)
+
+    def _initialize_spectral_mixture(self, kernel: gpytorch.kernels.SpectralMixtureKernel) -> None:
+        """Give spectral components distinct, finite data-scaled starting values.
+
+        Equal GPyTorch defaults leave every mixture component identical under
+        gradient optimization. Use deterministic frequency quantiles with the
+        same inverse-spacing/range scaling as its data initializer, handling
+        repeated coordinates and constant targets without division by zero.
+        """
+
+        assert self.X_train is not None and self.model is not None
+        inputs = self.X_train
+        if kernel.active_dims is not None:
+            inputs = inputs[:, kernel.active_dims]
+        spans = inputs.amax(dim=0) - inputs.amin(dim=0)
+        spans = torch.where(spans > 0, spans, torch.ones_like(spans))
+        differences = inputs.sort(dim=0).values.diff(dim=0)
+        if differences.shape[0]:
+            spacing = differences.masked_fill(differences <= 0, float("inf")).amin(dim=0)
+            spacing = torch.where(torch.isfinite(spacing), spacing, spans)
+        else:
+            spacing = spans
+        fraction = (
+            torch.arange(kernel.num_mixtures, dtype=self.dtype, device=self.device) + 0.5
+        ) / kernel.num_mixtures
+        variance = self.model.train_targets.var(unbiased=False).clamp_min(1e-6)
+        kernel.initialize(
+            mixture_means=fraction[:, None, None] * (0.5 / spacing)[None, None, :],
+            mixture_scales=(0.5 + fraction[:, None, None]) / spans[None, None, :],
+            mixture_weights=variance.expand(kernel.num_mixtures) / kernel.num_mixtures,
+        )
 
     def _make_mll(self, method: Literal["mle", "map"]) -> ExactMarginalLogLikelihood:
         """Create an objective with or without registered prior penalties."""
@@ -416,20 +489,56 @@ class GaussianProcess:
             raise InvalidGaussianProcessConfigError("maxiter must be a positive integer.")
         assert self.model is not None and self.likelihood is not None
         self.mll = self._make_mll(method)
-        options = {"maxiter": maxiter, **optimizer_options}
+        # Single-precision objectives cannot reliably satisfy SciPy's default
+        # double-precision tolerance. A larger line-search budget also avoids
+        # otherwise recoverable ABNORMAL_TERMINATION_IN_LNSRCH failures.
+        options = {
+            "maxiter": maxiter,
+            "maxls": 100,
+            "ftol": max(1e-9, 10 * torch.finfo(self.dtype).eps),
+            **optimizer_options,
+        }
         started = time.perf_counter()
+        initial_state = copy.deepcopy(self.model.state_dict())
+        fallback_error = None
+        optimizer_name = "scipy_lbfgsb"
         try:
             self.model.train()
             self.likelihood.train()
             with (
+                translate_backend_warnings(
+                    operation="GP hyperparameter fitting (training-covariance Cholesky)"
+                ),
                 gpytorch.settings.cholesky_jitter(
                     float_value=self.config.jitter,
                     double_value=self.config.jitter,
                 ),
                 gpytorch.settings.cholesky_max_tries(self.config.max_cholesky_retries),
             ):
-                fit_gpytorch_mll(self.mll, optimizer_kwargs={"options": options})
+                try:
+                    fit_gpytorch_mll(self.mll, optimizer_kwargs={"options": options})
+                    objective = self._validated_fit_objective()
+                except (ModelFittingError, RuntimeError) as exc:
+                    # BoTorch restores its initial checkpoint after exhausting
+                    # SciPy retries. Explicitly restore it here as well, then
+                    # try a bounded first-order optimizer on the SAME MLE/MAP
+                    # objective. Never label an unfitted prior as a success.
+                    fallback_error = str(exc)
+                    self.model.load_state_dict(initial_state)
+                    objective = self._fit_with_adam(maxiter=maxiter)
+                    optimizer_name = "torch_adam"
+                self.model.eval()
+                self.likelihood.eval()
+                with torch.no_grad():
+                    assert self.X_train is not None
+                    posterior = self.model.posterior(self.X_train)
+                    if not (
+                        torch.isfinite(posterior.mean).all()
+                        and torch.isfinite(posterior.variance).all()
+                    ):
+                        raise RuntimeError("The fitted GP posterior contains non-finite values.")
         except Exception as exc:
+            self.model.load_state_dict(initial_state)
             self.is_fit = False
             self.last_fit_diagnostics = {
                 "method": method,
@@ -445,10 +554,80 @@ class GaussianProcess:
             "method": method,
             "success": True,
             "elapsed_seconds": time.perf_counter() - started,
-            "training_rows": int(self.X_train.shape[0]),  # type: ignore[union-attr]
+            "training_rows": int(self.X_train.shape[0]),
             "input_dimension": self.input_dimension,
+            "optimizer": optimizer_name,
+            "negative_log_likelihood": objective,
+            "fallback_reason": fallback_error,
         }
+        if fallback_error is not None:
+            warnings.warn(
+                "GP fitting recovered with bounded Adam after the SciPy optimizer failed; "
+                "the likelihood and posterior were validated. See last_fit_diagnostics.",
+                BayOPyNumericalWarning,
+                stacklevel=3,
+            )
         return dict(self.last_fit_diagnostics)
+
+    def _validated_fit_objective(self) -> float:
+        """Evaluate the training objective and reject invalid hyperparameters."""
+
+        assert self.model is not None and self.mll is not None
+        self.model.train()
+        self.mll.train()
+        if any(not torch.isfinite(parameter).all() for parameter in self.model.parameters()):
+            raise RuntimeError("GP optimization produced non-finite hyperparameters.")
+        with torch.no_grad():
+            value = -self.mll(self.model(*self.model.train_inputs), self.model.train_targets)
+        if value.numel() != 1 or not torch.isfinite(value).all():
+            raise RuntimeError("GP optimization produced a non-finite marginal likelihood.")
+        return float(value.item())
+
+    def _fit_with_adam(self, *, maxiter: int) -> float:
+        """Recover a failed line search with a finite, non-worsening bounded fit."""
+
+        assert self.model is not None and self.mll is not None
+        initial_objective = self._validated_fit_objective()
+        best_objective = initial_objective
+        best_state = copy.deepcopy(self.model.state_dict())
+
+        def retain_best(parameters: Any, result: Any) -> None:
+            nonlocal best_objective, best_state
+            if math.isfinite(result.fval) and result.fval < best_objective:
+                assert self.model is not None
+                best_objective = result.fval
+                best_state = copy.deepcopy(self.model.state_dict())
+
+        # BoTorch's torch fitter applies the model's parameter bounds after
+        # every step, including untransformed SingleTaskGP noise constraints.
+        result = fit_gpytorch_mll_torch(
+            self.mll,
+            step_limit=maxiter,
+            optimizer=partial(torch.optim.Adam, lr=0.025),
+            callback=retain_best,
+        )
+        if result.status not in {OptimizationStatus.SUCCESS, OptimizationStatus.STOPPED}:
+            raise RuntimeError(f"Adam GP recovery failed: {result.message}")
+        final_objective = self._validated_fit_objective()
+        if final_objective > best_objective:
+            self.model.load_state_dict(best_state)
+        objective = self._validated_fit_objective()
+        if objective > initial_objective + 10 * torch.finfo(self.dtype).eps:
+            raise RuntimeError("Adam GP recovery worsened the marginal likelihood.")
+        if objective >= initial_objective:
+            parameters = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+            loss = -self.mll(self.model(*self.model.train_inputs), self.model.train_targets)
+            gradients = torch.autograd.grad(loss, parameters, allow_unused=True)
+            if any(
+                gradient is not None
+                and (
+                    not torch.isfinite(gradient).all()
+                    or gradient.abs().max() > math.sqrt(torch.finfo(self.dtype).eps)
+                )
+                for gradient in gradients
+            ):
+                raise RuntimeError("Adam GP recovery made no progress on a non-stationary objective.")
+        return objective
 
     def _require_model(self) -> None:
         """Require a built model and training table."""
@@ -497,6 +676,7 @@ class GaussianProcess:
         inputs = self._prediction_inputs(X)
         assert self.model is not None
         with (
+            translate_backend_warnings(operation="GP posterior construction"),
             gpytorch.settings.cholesky_jitter(
                 float_value=self.config.jitter, double_value=self.config.jitter
             ),
@@ -507,7 +687,7 @@ class GaussianProcess:
                 raise InvalidModelDataError(
                     "Single-output Gaussian process returned an unsupported posterior type."
                 )
-            return GPyTorchPosterior(posterior.mvn.add_jitter(self.config.jitter))
+            return posterior
 
     def predict(
         self, X: Any, *, observation_noise: bool = False
@@ -527,9 +707,10 @@ class GaussianProcess:
             Posterior mean and non-negative standard deviation.
         """
 
-        posterior = self.posterior(X, observation_noise=observation_noise)
-        mean = posterior.mean.squeeze(-1)
-        variance = posterior.variance.squeeze(-1).clamp_min(0.0)
+        with translate_backend_warnings(operation="GP posterior moments"):
+            posterior = self.posterior(X, observation_noise=observation_noise)
+            mean = posterior.mean.squeeze(-1)
+            variance = posterior.variance.squeeze(-1).clamp_min(0.0)
         return mean, variance.sqrt()
 
     def sample_posterior(
@@ -564,6 +745,7 @@ class GaussianProcess:
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise InvalidModelDataError("seed must be a non-negative integer.")
         with (
+            translate_backend_warnings(operation="GP posterior sampling"),
             gpytorch.settings.cholesky_jitter(
                 float_value=self.config.jitter, double_value=self.config.jitter
             ),

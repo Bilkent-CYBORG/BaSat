@@ -44,6 +44,8 @@ class LAMCTSConfig:
     ----------
     initial_points, exploration_constant:
         Initial design and tree UCT exploration coefficient.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     split_threshold, min_child_size, max_depth:
         Classifier split eligibility and tree-complexity limits.
     classifier, local_sampler:
@@ -52,11 +54,12 @@ class LAMCTSConfig:
         Rejection-sampling pool and retry budgets.
     kernel_lengthscale, acquisition_beta, gp_maxiter:
         Local BO kernel, UCB, and GP fit settings.
-    batch_size, seed, preset:
-        Sequential size, random seed, and explicit named source preset.
+    batch_size, seed:
+        Sequential request size and random seed.
     """
 
     initial_points: int = 30
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     exploration_constant: float = 1.0
     split_threshold: int = 20
     min_child_size: int = 5
@@ -71,53 +74,6 @@ class LAMCTSConfig:
     batch_size: int | None = 1
     q_batch: int | None = None
     seed: int = 1
-    preset: Literal["paper_general", "repository_generic", "mujoco"] = "paper_general"
-
-    @classmethod
-    def from_preset(
-        cls, name: Literal["paper_general", "repository_generic", "mujoco"]
-    ) -> LAMCTSConfig:
-        """Construct an explicit named source or regression preset.
-
-        Parameters
-        ----------
-        name:
-            ``"paper_general"`` for the BayOPy default, or one of the named
-            repository/MuJoCo regression configurations.
-
-        Returns
-        -------
-        LAMCTSConfig
-            An immutable configuration with every preset value materialized.
-
-        Raises
-        ------
-        ValueError
-            If ``name`` is not a documented preset.
-        """
-
-        if name == "paper_general":
-            return cls()
-        if name == "repository_generic":
-            return cls(
-                initial_points=100,
-                exploration_constant=0.1,
-                split_threshold=10,
-                min_child_size=2,
-                local_sampler="random",
-                candidate_pool_size=20,
-                preset=name,
-            )
-        if name == "mujoco":
-            return cls(
-                initial_points=30,
-                exploration_constant=10.0,
-                split_threshold=100,
-                min_child_size=10,
-                candidate_pool_size=4096,
-                preset=name,
-            )
-        raise ValueError(f"Unknown LA-MCTS preset: {name!r}.")
 
 
 LA_MCTSConfig = LAMCTSConfig
@@ -244,7 +200,7 @@ class LA_MCTS(Algorithm):
         paper_url="https://proceedings.neurips.cc/paper/2020/hash/e2ce14e81dba66dbff9cbc35ecfdb704-Abstract.html",
         repository_url="https://github.com/facebookresearch/LA-MCTS",
         repository_status="official",
-        notes="Clean-room Torch/scikit-learn implementation of the paper-general preset.",
+        notes="Clean-room Torch/scikit-learn implementation with explicit algorithm settings.",
     )
 
     def __init__(
@@ -267,9 +223,9 @@ class LA_MCTS(Algorithm):
         bounds:
             Full physical action box in ``D_env`` coordinates.
         config:
-            Tree, RBF-SVM, local optimizer, preset, and seed settings. ``None``
-            selects the paper-general preset; repository-generic and MuJoCo
-            behavior must be requested explicitly with ``from_preset``.
+            Tree, RBF-SVM, local optimizer and seed settings. ``None`` uses
+            :class:`LAMCTSConfig` defaults. Supply individual configuration
+            fields to change the algorithm's settings.
         maximize:
             Whether larger learner-visible observations define higher quality.
         dtype, device:
@@ -294,6 +250,7 @@ class LA_MCTS(Algorithm):
             dtype=dtype,
             device=device,
             seed=self.config.seed,
+            initial_points_sampling_method=self.config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -303,7 +260,7 @@ class LA_MCTS(Algorithm):
 
     @staticmethod
     def _validate_config(config: LAMCTSConfig) -> None:
-        """Validate preset values, tree geometry, and local-optimizer selection."""
+        """Validate numerical settings, tree geometry and local-optimizer selection."""
 
         try:
             _, q_batch = resolve_batch_configuration(
@@ -859,7 +816,7 @@ class LA_MCTS(Algorithm):
         self.state.selected_path = []
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
-        """Report tree size, rebuilds, region acceptance, exhaustion, and preset."""
+        """Report tree size, rebuilds, region acceptance, exhaustion and sampler."""
 
         leaves = [node for node in self.state.nodes.values() if not node.child_ids]
         return {
@@ -869,7 +826,6 @@ class LA_MCTS(Algorithm):
             "last_acceptance_rate": self.state.last_acceptance_rate,
             "finite_exhausted_leaf_ids": tuple(sorted(self.state.finite_exhausted_leaf_ids)),
             "local_sampler": self.config.local_sampler,
-            "preset": self.config.preset,
         }
 
     @staticmethod

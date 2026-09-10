@@ -1,7 +1,7 @@
 """Stochastic Bayesian-optimization algorithms and typed configurations."""
 
 from .ADD_GP_UCB import ADD_GP_UCB, AddGPUCBConfig, AddGPUCBState
-from .AG_VS import AG_VS, AGVSConfig, AGVSNode, AGVSState
+from .AG_VS import AG_VS, AG_VSConfig, AGVSConfig, AGVSNode, AGVSState
 from .ALEBO import ALEBO, ALEBOConfig, ALEBOMahalanobisKernel, ALEBOState
 from .Dropout import Dropout, DropoutConfig, DropoutState
 from .EG import EG
@@ -38,6 +38,7 @@ __all__ = [
     "AGVSConfig",
     "AGVSNode",
     "AGVSState",
+    "AG_VSConfig",
     "ALEBOConfig",
     "ALEBOMahalanobisKernel",
     "ALEBOState",

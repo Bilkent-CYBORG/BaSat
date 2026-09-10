@@ -23,6 +23,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import fields, is_dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
@@ -253,13 +254,19 @@ class AlgorithmExceptionController:
         """Check the declared native/cross-environment policy."""
 
         native = self.algorithm.native_environments
-        if not native or self.environment_type in native:
-            return
         adapter_name = getattr(self.environment, "adapter_name", None)
-        message = (
-            f"{type(self.algorithm).__name__} is not declared for the "
-            f"{self.environment_type!r} environment family."
-        )
+        if not native or (self.environment_type in native and not adapter_name):
+            return
+        if self.environment_type in native:
+            message = (
+                f"{type(self.algorithm).__name__} uses runtime defaults for missing "
+                f"information in the {self.environment_type!r} environment."
+            )
+        else:
+            message = (
+                f"{type(self.algorithm).__name__} is outside its native environment "
+                f"type {sorted(native)} in the {self.environment_type!r} environment."
+            )
         if isinstance(adapter_name, str) and adapter_name:
             self.add_issue(
                 "warning",
@@ -284,7 +291,8 @@ class AlgorithmExceptionController:
             self.add_issue(
                 "warning",
                 "environment.cross_family_extension",
-                message,
+                message + " No required inputs are missing; no internal defaults were needed. "
+                "Additional environment information is ignored.",
                 details={"native_environments": sorted(native)},
                 affects_source_guarantees=True,
             )
@@ -293,6 +301,16 @@ class AlgorithmExceptionController:
         """Mark a supported finite-table adaptation as a BayOPy extension."""
 
         source_mode = getattr(self.environment, "source_mode", None)
+        if source_mode == "data" and getattr(getattr(self.algorithm, "config", None), "finite_candidate_mode", None) == "project":
+            self.add_issue(
+                "warning", "data.projected_embedding",
+                f"{type(self.algorithm).__name__} compresses available finite action rows into embedding coordinates "
+                "and scores those rows directly. It returns the actual recorded action; rewards are not interpolated. "
+                "Context, distribution and perturbation information are not used by this stochastic policy. "
+                "This finite-data extension does not inherit the original embedding guarantees. "
+                "Set finite_candidate_mode='exact' to require the original embedding geometry.",
+                details={"finite_candidate_mode": "project"}, affects_source_guarantees=True,
+            )
         if source_mode == "data" and self.environment_type in self.algorithm.native_environments:
             self.add_issue(
                 "warning",
@@ -381,6 +399,18 @@ class AlgorithmExceptionController:
             self.algorithm._validate_historical_data(data)
         except (AlgorithmDataError, TypeError, ValueError) as error:
             self.add_issue("error", "history.invalid", str(error))
+        if (
+            getattr(self.environment, "source_mode", None) != "data"
+            and getattr(getattr(self.algorithm, "config", None), "finite_candidate_mode", None) == "project"
+            and data.observations.numel()
+        ):
+            self.add_issue(
+                "warning", "history.projected_embedding",
+                f"{type(self.algorithm).__name__} compresses historical action rows into reduced coordinates. "
+                "These may differ from their original generating coordinates; projection can merge rows. "
+                "Set finite_candidate_mode='exact' to require original embedding geometry.",
+                affects_source_guarantees=True,
+            )
         return data
 
     def diagnose_initialization(self) -> ExceptionDiagnosticReport:
@@ -442,7 +472,13 @@ class AlgorithmExceptionController:
         return report
 
     def _apply_source_guarantee_issues(self, report: ExceptionDiagnosticReport) -> None:
-        """Persist compatibility metadata and source-guarantee warning codes."""
+        """Persist compatibility metadata and source-guarantee warning codes.
+
+        Warning emission belongs to :meth:`validate_initialization`.  Keeping
+        this helper side-effect free prevents a concrete algorithm controller
+        from emitting both a shared compatibility warning and its own warning
+        for the same diagnostic issue.
+        """
 
         self.algorithm.compatibility_status = report.compatibility_status
         self.algorithm.adapter_name = report.adapter_name
@@ -452,13 +488,10 @@ class AlgorithmExceptionController:
                 continue
             if issue.code == "environment.adapter_applied":
                 warning_codes.append("ADAPTER_APPLIED")
-                warnings.warn(issue.message, AdapterAppliedWarning, stacklevel=3)
             elif issue.code == "environment.cross_family_extension":
                 warning_codes.append("CROSS_ENVIRONMENT")
-                warnings.warn(issue.message, CrossEnvironmentWarning, stacklevel=3)
             elif bool(issue.details.get("affects_source_guarantees", False)):
                 warning_codes.append("ASSUMPTION_VIOLATION")
-                warnings.warn(issue.message, AssumptionViolationWarning, stacklevel=3)
             else:
                 warning_codes.append(issue.code)
         self.algorithm._last_warning_codes = tuple(dict.fromkeys(warning_codes))
@@ -521,6 +554,9 @@ class Algorithm(ABC):
     RESUME_MUTABLE_CONFIG_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {"fit_maxiter", "gp_maxiter", "gp_training_steps"}
     )
+    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = MappingProxyType(
+        {"initial_points_sampling_method": "paper"}
+    )
     SOURCE: ClassVar[SourceRecord] = SourceRecord(
         paper_title="BayOPy abstract algorithm contract",
         paper_year=2026,
@@ -540,6 +576,7 @@ class Algorithm(ABC):
         dtype: torch.dtype | str = torch.float32,
         device: torch.device | str = "cpu",
         seed: int = 1,
+        initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper",
         plot: bool = False,
         verbose: bool = False,
         verbose_setting: bool = False,
@@ -571,7 +608,11 @@ class Algorithm(ABC):
         if self.seed < 0:
             raise AlgorithmConfigurationError("seed must be non-negative.")
         self.generator = make_generator(seed=self.seed, device=self.device)
-        self.initial_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
+        if initial_points_sampling_method not in {"paper", "sobol", "uniform"}:
+            raise AlgorithmConfigurationError(
+                "initial_points_sampling_method must be 'paper', 'sobol', or 'uniform'."
+            )
+        self.initial_points_sampling_method = initial_points_sampling_method
         self.acquisition_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
 
         self.plot = bool(plot)
@@ -600,6 +641,8 @@ class Algorithm(ABC):
         self._active_request_size: int | None = None
         if self.batch_size is not None and self.batch_size > 1 and self.native_batching is False:
             self.invalidate_source_guarantees("bayopy.repeated_native_batch")
+        if self.initial_points_sampling_method != "paper":
+            self.invalidate_source_guarantees("bayopy.sampling_method_override")
 
     @property
     def request_size(self) -> int:
@@ -610,6 +653,16 @@ class Algorithm(ABC):
         selected = self.q_batch if self.q_batch is not None else self.batch_size
         assert selected is not None
         return selected
+
+    @property
+    def initial_sampling_method(self) -> Literal["paper", "sobol", "uniform"]:
+        """Backward-compatible alias for ``initial_points_sampling_method``."""
+
+        return self.initial_points_sampling_method
+
+    @initial_sampling_method.setter
+    def initial_sampling_method(self, value: Literal["paper", "sobol", "uniform"]) -> None:
+        self.initial_points_sampling_method = value
 
     @property
     def uses_joint_batch(self) -> bool:
@@ -709,7 +762,7 @@ class Algorithm(ABC):
             raise AlgorithmProtocolError(
                 "Sampling methods must be configured before algorithm initialization."
             )
-        self.initial_sampling_method = initial
+        self.initial_points_sampling_method = initial
         self.acquisition_sampling_method = acquisition
         if initial != "paper" or acquisition != "paper":
             self.invalidate_source_guarantees("bayopy.sampling_method_override")
@@ -786,15 +839,15 @@ class Algorithm(ABC):
         if self.initial_sampling_method != "paper" or self.acquisition_sampling_method != "paper":
             return (
                 ExceptionDiagnosticIssue(
-                    severity="warning",
-                    code="sampling.method_override",
+                    severity="info",
+                    code="bayopy.sampling_method_override",
                     message=(
-                        "BayOPy sampling-method override: initial="
+                        "BayOPy configured sampling methods: initial_points_sampling_method="
                         f"{self.initial_sampling_method!r}, acquisition="
                         f"{self.acquisition_sampling_method!r}."
                     ),
                     details={
-                        "initial_sampling_method": self.initial_sampling_method,
+                        "initial_points_sampling_method": self.initial_points_sampling_method,
                         "acquisition_sampling_method": self.acquisition_sampling_method,
                         "affects_source_guarantees": True,
                     },
@@ -903,6 +956,15 @@ class Algorithm(ABC):
         if not torch.isfinite(tensor).all():
             raise AlgorithmDataError(f"Historical {name} must contain only finite values.")
 
+    def bind_environment_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Receive declared public domain metadata before loading visible history.
+
+        Most policies require no extra metadata. Distributional policies use
+        this hook to initialize their GP from the environment's finite support.
+        No objective, hidden rewards, or true sampling distribution is supplied.
+        """
+        del metadata
+
     def initialize_from_environment(self, data: EnvironmentData) -> None:
         """Initialize from observations that are already visible to the learner.
 
@@ -952,6 +1014,30 @@ class Algorithm(ABC):
         if not isinstance(round_info, Mapping):
             raise AlgorithmProtocolError("round_info must be a mapping or None.")
         return _snapshot_value(round_info)
+
+    def _warn_environment_default(self, field: str, value: str) -> None:
+        """Report each missing-input assumption once and retain it in checkpoints."""
+        reason = f"environment.default.{field}"
+        if reason not in self.source_guarantee_reasons:
+            self.invalidate_source_guarantees(reason)
+            warning_type = getattr(self.EXCEPTION_CLASS, "WARNING_TYPE", UserWarning)
+            warnings.warn(
+                f"{type(self).__name__}: environment omitted {field}; internal default {value} is used. "
+                "Environment-provided values take precedence. Native source guarantees do not apply.",
+                warning_type, stacklevel=3,
+            )
+
+    def prepare_round_info(self, round_info: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Copy public information and fill algorithm-specific missing inputs."""
+        return self._normalize_round_info(round_info)
+
+    def prepare_feedback(self, feedback: Mapping[str, Any], *, action: Any) -> dict[str, Any]:
+        """Copy revealed feedback and supply missing physical-coordinate metadata."""
+        result = dict(_snapshot_value(feedback))
+        if result.get("evaluated_action") is None:
+            self._warn_environment_default("evaluated_action", "the selected nominal action")
+            result["evaluated_action"] = torch.as_tensor(action, dtype=self.dtype, device=self.device).clone()
+        return result
 
     def _validate_round_info(self, round_info: Mapping[str, Any]) -> None:
         """Validate required fields and the common finite-candidate table."""
@@ -1196,13 +1282,18 @@ class Algorithm(ABC):
         if "dataset_indices" in metadata:
             metadata["dataset_indices"] = indices[position : position + 1]
 
-        model_inputs = record.model_inputs
-        active = metadata.get("active_indices")
-        if active is not None:
-            active_indices = torch.as_tensor(active, dtype=torch.long, device=self.device)
-            model_inputs = replacement[:, active_indices]
-        elif model_inputs is not None and model_inputs.shape[1] == self.action_dimension:
-            model_inputs = replacement
+        # Transform the complete public table so row-aligned embedding
+        # metadata remains available. A raw slice cannot reconstruct unit-cube,
+        # signed-hash, or other algorithm-specific model coordinates.
+        projected = self._prepare_discrete_candidates_impl(
+            candidate_actions=candidates,
+            candidate_dataset_indices=indices,
+            round_info=round_info,
+        )
+        model_inputs = projected.model_inputs[position : position + 1]
+        if "acquisition_value" in metadata:
+            metadata["acquisition_value"] = None
+        metadata["batch_candidate_replaced"] = True
         return replacement, LastAskRecord(
             actions=replacement,
             model_inputs=model_inputs,
@@ -1245,9 +1336,14 @@ class Algorithm(ABC):
         return info
 
     def _make_continuous_action_distinct(
-        self, action: torch.Tensor, selected_actions: list[torch.Tensor], offset: int
+        self,
+        action: torch.Tensor,
+        selected_actions: list[torch.Tensor],
+        offset: int,
+        *,
+        record: LastAskRecord,
     ) -> torch.Tensor:
-        """Apply a minimal deterministic displacement to an exact duplicate."""
+        """Resolve duplicate proposals while preserving their model coordinates."""
 
         if not selected_actions:
             return action
@@ -1255,29 +1351,63 @@ class Algorithm(ABC):
         duplicate = torch.isclose(previous, action, rtol=0.0, atol=1e-8).all(dim=-1).any()
         if not bool(duplicate):
             return action
+        for attempt in range(max(32, 2 * self.action_dimension)):
+            replacement = self._perturb_continuous_batch_record(record, offset + attempt)
+            result = replacement.actions[0]
+            if not torch.isclose(previous, result, rtol=0.0, atol=1e-8).all(dim=-1).any():
+                record.actions = replacement.actions
+                record.model_inputs = replacement.model_inputs
+                record.algorithm_metadata = replacement.algorithm_metadata
+                return result
+        raise AlgorithmProtocolError(
+            "Unable to construct a distinct continuous batch action in the algorithm's domain."
+        )
+
+    def _perturb_continuous_batch_record(
+        self, record: LastAskRecord, offset: int
+    ) -> LastAskRecord:
+        """Displace an ambient-space proposal and recompute its model projection.
+
+        Embedding algorithms override this hook to move in their feasible
+        latent domain. An ambient displacement alone can leave that image and
+        associate feedback with incorrect GP training coordinates.
+        """
+
         lower, upper = self._bounds_on_algorithm_device()
-        result = action.detach().clone()
+        action = record.actions[0].detach().clone()
         coordinate = offset % self.action_dimension
         span = upper[coordinate] - lower[coordinate]
         step = span * (1e-5 * (1 + offset // self.action_dimension))
-        midpoint = (lower[coordinate] + upper[coordinate]) / 2
-        direction = -1.0 if result[coordinate] > midpoint else 1.0
-        result[coordinate] = torch.clamp(
-            result[coordinate] + direction * step,
+        direction = -1.0 if action[coordinate] > (lower[coordinate] + upper[coordinate]) / 2 else 1.0
+        action[coordinate] = torch.clamp(
+            action[coordinate] + direction * step,
             min=lower[coordinate],
             max=upper[coordinate],
         )
-        return result
+        actions = action.unsqueeze(0)
+        projection = self._prepare_discrete_candidates_impl(
+            candidate_actions=actions,
+            candidate_dataset_indices=torch.zeros(1, dtype=torch.long, device=self.device),
+            round_info=record.round_info_snapshot,
+        )
+        return LastAskRecord(
+            actions=actions,
+            model_inputs=projection.model_inputs,
+            round_info_snapshot=record.round_info_snapshot,
+            algorithm_metadata=record.algorithm_metadata,
+        )
 
     def _ask_repeated_native_batch(self, round_info: Mapping[str, Any]) -> torch.Tensor:
         """Form an independent batch by repeating the native one-point rule."""
 
         request_size = self.request_size
+        original_batch_size = self.batch_size
         original_iteration = self.iteration
         selected_actions: list[torch.Tensor] = []
         records: list[LastAskRecord] = []
         try:
             self._active_request_size = 1
+            self.batch_size = 1
             for offset in range(request_size):
                 self.iteration = original_iteration + offset
                 info = self._microbatch_round_info(round_info, selected_actions)
@@ -1296,7 +1426,9 @@ class Algorithm(ABC):
                     )
                 action = proposed[0]
                 if "candidate_actions" not in info:
-                    action = self._make_continuous_action_distinct(action, selected_actions, offset)
+                    action = self._make_continuous_action_distinct(
+                        action, selected_actions, offset, record=record
+                    )
                 proposed = action.unsqueeze(0)
                 self._validate_proposed_actions(proposed, info)
                 records.append(
@@ -1311,6 +1443,7 @@ class Algorithm(ABC):
                 self.last_ask = None
         finally:
             self.iteration = original_iteration
+            self.batch_size = original_batch_size
             self._active_request_size = None
         actions = torch.stack(selected_actions)
         model_inputs: torch.Tensor | None = None
@@ -1365,7 +1498,7 @@ class Algorithm(ABC):
             raise AlgorithmProtocolError("initialize_from_environment must be called before ask.")
         if self.last_ask is not None:
             raise AlgorithmProtocolError("Cannot call ask while feedback is pending.")
-        info = self._normalize_round_info(round_info)
+        info = self.prepare_round_info(round_info)
         self._validate_round_info(info)
 
         try:
@@ -1422,8 +1555,10 @@ class Algorithm(ABC):
         """Replay a completed independent batch through the native tell rule."""
 
         pending = self.last_ask
+        original_batch_size = self.batch_size
         try:
             self._active_request_size = 1
+            self.batch_size = 1
             for index, value in enumerate(records):
                 record = self._last_ask_from_dict(value)
                 self.last_ask = record
@@ -1436,6 +1571,7 @@ class Algorithm(ABC):
             self.last_ask = pending
             raise
         finally:
+            self.batch_size = original_batch_size
             self._active_request_size = None
         self.last_ask = pending
 
@@ -1563,11 +1699,13 @@ class Algorithm(ABC):
         info = (
             _snapshot_value(self.last_ask.round_info_snapshot)
             if round_info is None
-            else self._normalize_round_info(round_info)
+            else self.prepare_round_info(round_info)
         )
         self._validate_round_info(info)
         self._validate_tell_round_info(info)
-        normalized_feedback, observations = self._normalize_feedback(feedback)
+        normalized_feedback, observations = self._normalize_feedback(
+            self.prepare_feedback(feedback, action=action)
+        )
 
         microbatch_values = self.last_ask.algorithm_metadata.get("microbatch_records")
         if isinstance(microbatch_values, tuple) and microbatch_values:
@@ -1673,10 +1811,16 @@ class Algorithm(ABC):
             label=name,
         )
         axes[1].set_title("Incumbent reward")
+        for axis in axes:
+            axis.set_xlim(1, max(2, int(self._observed_values.numel())))
         figure.suptitle(f"{name} optimization progress")
         figure.tight_layout()
         if show and str(plt.get_backend()).lower() != "agg":
             plt.show()
+        elif not show:
+            # Detach from pyplot so Jupyter's end-of-cell hook cannot auto-display it.
+            # The returned figure remains usable for explicit display or saving.
+            plt.close(figure)
         return figure, axes
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
@@ -1692,7 +1836,7 @@ class Algorithm(ABC):
         specific.setdefault("initialized", self._initialized)
         specific.setdefault("pending_feedback", self.last_ask is not None)
         specific.setdefault("source_guarantee_reasons", tuple(self.source_guarantee_reasons))
-        specific.setdefault("initial_sampling_method", self.initial_sampling_method)
+        specific.setdefault("initial_points_sampling_method", self.initial_points_sampling_method)
         specific.setdefault("acquisition_sampling_method", self.acquisition_sampling_method)
         specific.setdefault("acquisition_policy", self.ACQUISITION_POLICY)
         return AlgorithmDiagnostics(
@@ -1932,7 +2076,7 @@ class Algorithm(ABC):
             # still contain those keys. Filter both old and new snapshots so a
             # training-budget change never masquerades as a problem mismatch.
             filtered = self._without_resume_mutable_fields(snapshot)
-            return filtered if isinstance(filtered, Mapping) else None
+            return self._with_checkpoint_added_defaults(filtered)
         implementation = state.get("algorithm_state")
         if not isinstance(implementation, Mapping):
             return None
@@ -1946,12 +2090,28 @@ class Algorithm(ABC):
                 return None
         else:
             return None
-        return {
+        reconstructed = {
             "base": self._fingerprint_value(state.get("base_configuration")),
             "algorithm_config": self._without_resume_mutable_fields(
                 self._fingerprint_value(parsed_config)
             ),
         }
+        return self._with_checkpoint_added_defaults(reconstructed)
+
+    @classmethod
+    def _with_checkpoint_added_defaults(cls, snapshot: Any) -> Mapping[str, Any] | None:
+        """Fill newly introduced default config fields in older checkpoints."""
+
+        if not isinstance(snapshot, Mapping):
+            return None
+        normalized = dict(snapshot)
+        algorithm_config = normalized.get("algorithm_config")
+        if isinstance(algorithm_config, Mapping):
+            expanded = dict(algorithm_config)
+            for key, default in cls.CHECKPOINT_ADDED_CONFIG_DEFAULTS.items():
+                expanded.setdefault(key, cls._fingerprint_value(default))
+            normalized["algorithm_config"] = expanded
+        return normalized
 
     def _state_dict_impl(self) -> Mapping[str, Any]:
         """Return all mutable source-specific state affecting future actions."""
@@ -2104,10 +2264,8 @@ class Algorithm(ABC):
                     "State configuration fingerprint does not match; the legacy checkpoint "
                     "does not contain enough information to identify individual fields."
                 )
-            differences = self._configuration_differences(
-                stored_snapshot,
-                self._configuration_snapshot(),
-            )
+            current_snapshot = self._with_checkpoint_added_defaults(self._configuration_snapshot())
+            differences = self._configuration_differences(stored_snapshot, current_snapshot)
             if differences:
                 detail = "; ".join(differences[:8])
                 if len(differences) > 8:
@@ -2226,6 +2384,16 @@ class Algorithm(ABC):
         """Clear all source-specific mutable state."""
 
         return None
+
+    def clone_for_trial(self, seed_offset: int) -> Algorithm:
+        """Build a fresh method with all explicit configuration seeds offset.
+
+        Custom algorithms may override this method when constructor arguments
+        are not available as instance attributes.
+        """
+        from bayopy.trials import fresh_algorithm
+
+        return fresh_algorithm(self, seed_offset)
 
     def reset(self, seed: int | None = None) -> None:
         """Return the algorithm to a fresh, uninitialized state.

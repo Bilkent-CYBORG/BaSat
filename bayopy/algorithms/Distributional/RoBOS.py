@@ -89,9 +89,6 @@ class RoBOSConfig:
 
     Parameters
     ----------
-    contexts:
-        Public finite context support with shape ``(K, D_context)``. Realized
-        feedback contexts must match one row unambiguously.
     aspiration:
         Finite reward threshold used in the optimistic fragility numerator.
     context_kernel:
@@ -141,7 +138,6 @@ class RoBOSConfig:
         Seed for algorithm-owned candidate generation and deterministic replay.
     """
 
-    contexts: torch.Tensor | np.ndarray
     aspiration: float
     context_kernel: KernelConfig | gpytorch.kernels.Kernel = field(default_factory=KernelConfig)
     action_kernel: KernelConfig | gpytorch.kernels.Kernel = field(default_factory=KernelConfig)
@@ -231,6 +227,52 @@ class _FiniteContextGPAlgorithm(Algorithm):
     _joint_kernel_combination: str
     _custom_joint_kernel: gpytorch.kernels.Kernel | None
 
+    def prepare_round_info(self, round_info: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Fill only absent support, reference and ambiguity inputs."""
+        info = super().prepare_round_info(round_info)
+        if info.get("context_support") is None:
+            if info.get("context") is not None:
+                support = torch.as_tensor(info["context"], dtype=self.dtype, device=self.device).reshape(1, -1)
+                info["context_support_is_dynamic"] = True
+            elif self.contexts.numel():
+                support = self.contexts.detach().clone()
+            else:
+                support = self._default_context().reshape(1, -1)
+                info["context_support_is_dynamic"] = True
+            self._warn_environment_default("context_support", "the supplied current context as a singleton, or internal zero singleton")
+            info["context_support"] = support
+        self.bind_environment_metadata(info)
+        if info.get("reference_distribution") is None:
+            reference = torch.full((self.contexts.shape[0],), 1.0 / self.contexts.shape[0], dtype=self.dtype, device=self.device)
+            if info.get("context") is not None:
+                context = torch.as_tensor(info["context"], dtype=self.dtype, device=self.device).reshape(-1)
+                matches = torch.isclose(self.contexts, context, rtol=0.0, atol=1e-8).all(dim=-1)
+                if int(matches.sum()) == 1:
+                    reference.zero_()
+                    reference[matches] = 1.0
+            info["reference_distribution"] = reference
+            self._warn_environment_default("reference_distribution", str(reference.tolist()))
+        if "margin" in self.required_round_info and info.get("margin") is None:
+            info["margin"] = 0.0
+            self._warn_environment_default("margin", "0")
+        return info
+
+    def prepare_feedback(self, feedback: Mapping[str, Any], *, action: Any) -> dict[str, Any]:
+        result = super().prepare_feedback(feedback, action=action)
+        if result.get("context") is None:
+            # A concrete supported row keeps the finite-context update well-defined.
+            result["context"] = self.contexts[0].clone()
+            self._warn_environment_default("feedback.context", str(result["context"].tolist()))
+        return result
+
+    def _default_context(self) -> torch.Tensor:
+        """Internal neutral context used only when the environment omits it."""
+        dimension = getattr(self, "context_dimension", None)
+        if not dimension:
+            kernel = self.config.context_kernel
+            dimension = getattr(kernel, "ard_num_dims", None) or 1
+        return torch.zeros(int(dimension), dtype=self.dtype, device=self.device)
+
     def _initialize_finite_context_model(
         self,
         *,
@@ -247,14 +289,19 @@ class _FiniteContextGPAlgorithm(Algorithm):
         ``D_model = D_action + D_context``.
         """
 
-        support = torch.as_tensor(contexts, dtype=self.dtype, device=self.device)
-        if support.ndim == 1:
-            support = support.unsqueeze(-1)
-        self.contexts = support.detach().clone()
         self._action_kernel_spec = action_kernel
         self._context_kernel_spec = context_kernel
         self._joint_kernel_combination = joint_kernel_combination
         self._custom_joint_kernel = joint_kernel
+        if contexts is None:
+            self.contexts = torch.empty((0, 0), dtype=self.dtype, device=self.device)
+            self.context_dimension = 0
+            self.model_input_dimension = self.action_dimension
+            return
+        support = torch.as_tensor(contexts, dtype=self.dtype, device=self.device)
+        if support.ndim == 1:
+            support = support.unsqueeze(-1)
+        self.contexts = support.detach().clone()
         self._validate_context_support()
         self.context_dimension = int(self.contexts.shape[1])
         self.model_input_dimension = self.action_dimension + self.context_dimension
@@ -264,6 +311,66 @@ class _FiniteContextGPAlgorithm(Algorithm):
             ),
             input_dimension=self.model_input_dimension,
         )
+
+    def _empty_state(self) -> Any:
+        """Construct the concrete method's empty context-dependent history."""
+        raise NotImplementedError
+
+    def bind_environment_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Receive public finite support without accessing confidential distributions.
+
+        The support and its row ordering are fixed for a run; references and
+        realized contexts are delivered separately at their proper round times.
+        """
+        dynamic = bool(metadata.get("context_support_is_dynamic", False)) or getattr(self, "_dynamic_context_support", False)
+        self._dynamic_context_support = dynamic or getattr(self, "_dynamic_context_support", False)
+        support = metadata.get("context_support")
+        if support is None:
+            if self.contexts.numel():
+                return
+            support = self._default_context().reshape(1, -1)
+            self._dynamic_context_support = True
+            self._warn_environment_default("context_support", str(support.tolist()))
+        if self.contexts.numel():
+            if not self._support_matches(support):
+                if dynamic:
+                    candidate = torch.as_tensor(support, dtype=self.dtype, device=self.device)
+                    if candidate.ndim != 2:
+                        raise RoBOSContextSupportError("context_support must have shape (K, D_context).", algorithm=self)
+                    if candidate.shape[1] != self.context_dimension:
+                        if self.state.y_train.numel():
+                            raise RoBOSContextSupportError("Runtime context dimension changed.", algorithm=self)
+                        self._initialize_finite_context_model(
+                            contexts=candidate, action_kernel=self._action_kernel_spec,
+                            context_kernel=self._context_kernel_spec,
+                            joint_kernel_combination=self._joint_kernel_combination,
+                            joint_kernel=self._custom_joint_kernel,
+                        )
+                        self.state = self._empty_state()
+                        return
+                    previous = self.contexts
+                    self.contexts = candidate.detach().clone()
+                    try:
+                        self._validate_context_support()
+                    except Exception:
+                        self.contexts = previous
+                        raise
+                    # Only the integration support changes. Keep the fitted GP and
+                    # all observations at their actual historical contexts.
+                    return
+                raise RoBOSContextSupportError(
+                    "Environment context_support differs from the initialized support or its row order. "
+                    "Create a fresh algorithm for a different support; do not duplicate support in config.",
+                    algorithm=self,
+                )
+            return
+        self._initialize_finite_context_model(
+            contexts=support, action_kernel=self._action_kernel_spec,
+            context_kernel=self._context_kernel_spec,
+            joint_kernel_combination=self._joint_kernel_combination,
+            joint_kernel=self._custom_joint_kernel,
+        )
+        self.state = self._empty_state()
 
     def _validate_context_support(self) -> None:
         """Validate finite, unique, non-overlapping context support rows.
@@ -559,14 +666,29 @@ class _FiniteContextGPAlgorithm(Algorithm):
         y = torch.as_tensor(data.observations, dtype=self.dtype, device=self.device).reshape(-1)
         if y.numel() == 0:
             return
+        if not self.contexts.numel():
+            if data.contexts is None:
+                self.bind_environment_metadata({})
+            else:
+                historical = torch.as_tensor(data.contexts, dtype=self.dtype, device=self.device)
+                if historical.ndim == 1:
+                    historical = historical.unsqueeze(-1)
+                # Only already observed context values are used to form support.
+                self.bind_environment_metadata({
+                    "context_support": torch.unique(historical, dim=0),
+                    "context_support_is_dynamic": True,
+                })
+                self._warn_environment_default("context_support", "unique already-observed historical context rows")
         if data.contexts is None:
-            raise RoBOSDataCompatibilityError(
-                "Distributional previous_data requires realized contexts.", algorithm=self
-            )
-        contexts = torch.as_tensor(data.contexts, dtype=self.dtype, device=self.device)
+            default = self.contexts[0]
+            self._warn_environment_default("previous_data.contexts", str(default.tolist()))
+            contexts = default.unsqueeze(0).expand(actions.shape[0], -1).clone()
+        else:
+            contexts = torch.as_tensor(data.contexts, dtype=self.dtype, device=self.device)
         if contexts.ndim == 1:
             contexts = contexts.unsqueeze(-1)
-        self._match_contexts(contexts)
+        if not getattr(self, "_dynamic_context_support", False):
+            self._match_contexts(contexts)
         evaluated_raw = getattr(data, "evaluated_actions", None)
         evaluated = (
             actions
@@ -600,6 +722,7 @@ class _FiniteContextGPAlgorithm(Algorithm):
         environment's confidential sampling distribution.
         """
 
+        self.bind_environment_metadata(round_info)
         reference = self._validate_reference(round_info["reference_distribution"])
         expected_context = reference @ self.contexts
         model_inputs = self._joint_input(candidate_actions, expected_context)
@@ -901,14 +1024,12 @@ class RoBOS(_FiniteContextGPAlgorithm):
 
     Examples
     --------
-    >>> import torch
     >>> import bayopy
     >>> bounds = bayopy.Bounds(lower=[-1.0, 0.0], upper=[1.0, 1.0])
-    >>> contexts = torch.tensor([[0.0], [0.5], [1.0]])
     >>> algorithm = bayopy.RoBOS(
     ...     bounds=bounds,
     ...     config=bayopy.RoBOSConfig(
-    ...         contexts=contexts, aspiration=0.0, initial_points=3, seed=7
+    ...         aspiration=0.0, initial_points=3, seed=7
     ...     ),
     ... )
     """
@@ -980,7 +1101,7 @@ class RoBOS(_FiniteContextGPAlgorithm):
         )
         try:
             self._initialize_finite_context_model(
-                contexts=config.contexts,
+                contexts=None,
                 action_kernel=config.action_kernel,
                 context_kernel=config.context_kernel,
                 joint_kernel_combination=config.joint_kernel_combination,
@@ -1633,6 +1754,7 @@ class RoBOS(_FiniteContextGPAlgorithm):
         output; the true sampling distribution is never read.
         """
 
+        self.bind_environment_metadata(round_info)
         reference = self._validate_reference(round_info["reference_distribution"])
         actions, indices = self._candidate_actions(round_info)
         residuals: dict[str, float]
@@ -1706,13 +1828,13 @@ class RoBOS(_FiniteContextGPAlgorithm):
 
         if not self.state.selected_actions:
             return self._best_observed()
-        scores = torch.tensor(self.state.selected_fragilities)
+        scores = torch.tensor(self.state.selected_fragilities, dtype=self.dtype, device=self.device)
         finite = torch.isfinite(scores)
         if finite.any():
             indices = torch.nonzero(finite, as_tuple=False).reshape(-1)
             position = int(indices[torch.argmin(scores[indices])].item())
         else:
-            position = len(self.state.selected_actions) - 1
+            return self._best_observed()
         return self.state.selected_actions[position].detach().clone(), float(
             scores[position].item()
         )
@@ -1749,6 +1871,8 @@ class RoBOS(_FiniteContextGPAlgorithm):
 
         return {
             "contexts": self.contexts,
+            "context_support_is_dynamic": getattr(self, "_dynamic_context_support", False),
+            "gp": self.gp.state_dict(),
             "aspiration": self.config.aspiration,
             "state": {name: getattr(self.state, name) for name in self.state.__dataclass_fields__},
         }
@@ -1757,6 +1881,11 @@ class RoBOS(_FiniteContextGPAlgorithm):
         """Validate source-critical support, aspiration, state, and GP payloads."""
 
         del strict
+        if not self.contexts.numel() or state.get("context_support_is_dynamic", False):
+            self.bind_environment_metadata({
+                "context_support": state.get("contexts"),
+                "context_support_is_dynamic": state.get("context_support_is_dynamic", False),
+            })
         if (
             not self._support_matches(state.get("contexts"))
             or state.get("aspiration") != self.config.aspiration
@@ -1793,7 +1922,10 @@ class RoBOS(_FiniteContextGPAlgorithm):
                 realized_contexts=[tensor(x) for x in raw["realized_contexts"]],
                 aspiration_satisfied=[bool(x) for x in raw["aspiration_satisfied"]],
             )
-            self.gp.reset()
+            if isinstance(state.get("gp"), dict):
+                self.gp.load_state_dict(dict(state["gp"]))
+            else:
+                self.gp.reset()
         except Exception as error:
             raise RoBOSCheckpointError(
                 f"Invalid RoBOS checkpoint: {error}", algorithm=self

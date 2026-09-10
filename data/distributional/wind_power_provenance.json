@@ -1,0 +1,54 @@
+{
+  "environment": "distributional",
+  "dataset": "opsd_wind_power",
+  "path": "data/distributional/wind_power_bandit.csv",
+  "rows": 1111,
+  "columns": [
+    "action_0",
+    "context_0",
+    "reference_probability",
+    "sampling_probability",
+    "margin",
+    "reward"
+  ],
+  "unique_actions": 101,
+  "context_support": [
+    0.0,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    1.0
+  ],
+  "sha256": "097ba412d5351767cc6bd0a76e91c686723ac6241b634647e84fd370fef11bfa",
+  "sources": [
+    {
+      "url": "https://data.open-power-system-data.org/time_series/2019-06-05/time_series_60min_singleindex.csv",
+      "retained_subset": "data/distributional/opsd_wind_2013.csv",
+      "sha256": "bec340914646f01f2c2c9fa1ec5d9a4d74088e7f49338afd020fd122c77d908f",
+      "years": [
+        2013
+      ],
+      "columns": [
+        "utc_timestamp",
+        "DE_wind_generation_actual",
+        "DE_wind_capacity",
+        "DE_wind_profile"
+      ],
+      "rows": 98
+    }
+  ],
+  "paper": "https://proceedings.mlr.press/v108/kirschner20a/kirschner20a.pdf",
+  "source_documentation": "https://data.open-power-system-data.org/time_series/2019-06-05/",
+  "action_meanings": [
+    "Energy commitment as a fraction of capacity, grid 0:0.01:1"
+  ],
+  "context_meaning": "Recorded German wind capacity factor, rounded to nearest 0.1. All 11 grid contexts are present in the reward table.",
+  "reward_meaning": "Constructed revenue 0.1*max(c-x,0)+min(x,c)-5*max(x-c,0); not a recorded market payment.",
+  "construction": "50-hour chronological replay after 48-hour public history. Reference updated using only the preceding 48 observations. Private sampling vector is a point mass on the next recorded, quantized observation. Margin 0.1 is an illustrative fixed choice. Finite CSV grid computes revenue from the published formula, not inferred missing physical measurements. Repeated actions allowed. This is a reduced replay adaptation, not a reproduction of the paper annual simulator experiment."
+}

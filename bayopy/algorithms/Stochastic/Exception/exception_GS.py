@@ -20,8 +20,12 @@ class GSThresholdError(GSError):
     """Raised for an invalid satisfaction threshold or direction."""
 
 
-class GSFantasyError(GSError):
-    """Raised when fantasy conditioning fails."""
+class GSPosteriorError(GSError):
+    """Raised when the GS posterior cannot be constructed or sampled."""
+
+
+# Keep exception imports from earlier releases working.
+GSFantasyError = GSPosteriorError
 
 
 class GSMaximumSamplingError(GSError):
@@ -39,8 +43,8 @@ class GSCheckpointError(GSError):
 ERROR_BY_CODE = {
     "threshold": GSThresholdError,
     "direction": GSThresholdError,
-    "posterior": GSFantasyError,
-    "fantasy": GSFantasyError,
+    "posterior": GSPosteriorError,
+    "fantasy": GSPosteriorError,
     "maximum_sampling": GSMaximumSamplingError,
     "environment_data": GSDataCompatibilityError,
     "previous_data": GSDataCompatibilityError,
@@ -50,13 +54,13 @@ ERROR_BY_CODE = {
 
 
 class GSException(PGException):
-    """Validate GS Monte Carlo and fantasy configuration."""
+    """Validate GS posterior Monte Carlo configuration."""
 
     ERROR_TYPE = GSError
     WARNING_TYPE = GSWarning
 
     def _check_posterior(self) -> None:
-        """Validate sequential operation and positive fantasy sample budgets."""
+        """Validate sequential operation and positive posterior sample budgets."""
 
         super()._check_posterior()
         config = getattr(self.algorithm, "config", None)
@@ -66,7 +70,7 @@ class GSException(PGException):
             self.add_issue("error", "maximum_sampling", "maximum_value_samples must be positive.")
 
     def validate_initialization(self) -> ExceptionDiagnosticReport:
-        """Map shared and fantasy diagnostics to GS-specific error types."""
+        """Map shared and posterior diagnostics to GS-specific error types."""
 
         report = self.diagnose_initialization()
         self.algorithm.initialization_diagnostics = report
@@ -92,6 +96,7 @@ __all__ = [
     "GSException",
     "GSFantasyError",
     "GSMaximumSamplingError",
+    "GSPosteriorError",
     "GSThresholdError",
     "GSWarning",
 ]

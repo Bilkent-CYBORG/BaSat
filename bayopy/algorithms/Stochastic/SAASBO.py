@@ -9,18 +9,21 @@ substitutes an MLE ARD model or a sparsity penalty for posterior sampling.
 from __future__ import annotations
 
 import math
+import random
 import threading
 import types
 import warnings
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
+import numpy as np
 import torch
 
 from bayopy.models.Acquisitions import DiscreteAcquisitionCandidates
 from bayopy.models.utils import Bounds
+from bayopy.warnings import translate_backend_warnings
 
 from ..algorithm import Algorithm, resolve_batch_configuration
 from ..helper import SourceRecord, to_quality
@@ -46,16 +49,21 @@ class SAASBOConfig:
         Global half-Cauchy SAAS inverse-lengthscale prior scale.
     warmup_steps, posterior_samples, thinning, num_chains, max_tree_depth:
         Exact Pyro NUTS sampling controls.
+    target_accept_prob:
+        NUTS acceptance target in (0, 1). Larger values favor smaller integration
+        steps and may reduce divergences at increased computational cost.
     initial_points:
         Optional initial-design count.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     acquisition, num_restarts, raw_samples, mc_samples, ucb_beta:
         Fully Bayesian EI/UCB and continuous optimization controls.
     max_r_hat, min_effective_sample_size, allow_divergences:
         Posterior diagnostic acceptance policy.  Set
         ``min_effective_sample_size=None`` only for explicitly non-inferential
         smoke runs that need to retain draws when a very short chain makes
-        Pyro's ESS estimator unavailable or nonphysical.  The paper/default
-        profile remains strict.
+        Pyro's ESS estimator unavailable or nonphysical. The runtime
+        ``diagnostic_policy`` determines whether failed diagnostics warn or raise.
     batch_size, seed:
         Request size and checkpointed sampler/acquisition seed.
     """
@@ -66,8 +74,10 @@ class SAASBOConfig:
     thinning: int = 16
     num_chains: int = 1
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     acquisition: Literal["EI", "UCB"] = "EI"
     max_tree_depth: int = 6
+    target_accept_prob: float = field(default=0.8, kw_only=True)
     num_restarts: int = 10
     raw_samples: int = 256
     mc_samples: int = 128
@@ -123,6 +133,9 @@ class SAASBO(Algorithm):
     ... )
     """
 
+    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS, "target_accept_prob": 0.8,
+    }
     ACQUISITION_POLICY = "configurable fully Bayesian EI or UCB"
 
     EXCEPTION_CLASS = SAASBOException
@@ -149,7 +162,7 @@ class SAASBO(Algorithm):
         verbose: bool = False,
         verbose_setting: bool = False,
         verbose_iter_by_iter: bool = False,
-        diagnostic_policy: Literal["raise", "warn"] = "raise",
+        diagnostic_policy: Literal["raise", "warn"] = "warn",
         jit_compile: bool = False,
         mcmc_num_threads: int | None = None,
     ) -> None:
@@ -170,8 +183,9 @@ class SAASBO(Algorithm):
         plot, verbose, verbose_setting, verbose_iter_by_iter:
             Presentation flags; ``verbose`` also controls Pyro's progress bar.
         diagnostic_policy:
-            Runtime handling for NUTS convergence diagnostics. ``"raise"``
-            preserves the strict historical BayOPy policy. ``"warn"`` follows
+            Runtime handling for NUTS convergence diagnostics. Explicit
+            ``"raise"`` enforces strict diagnostic acceptance. The default
+            ``"warn"`` follows
             the source BoTorch fitting path by retaining nonempty, finite,
             loadable posterior draws while warning and invalidating source
             guarantees when divergences, low ESS, or poor R-hat are reported.
@@ -218,6 +232,7 @@ class SAASBO(Algorithm):
             dtype=dtype,
             device=device,
             seed=self.config.seed,
+            initial_points_sampling_method=self.config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -236,6 +251,12 @@ class SAASBO(Algorithm):
             raise SAASBOMCMCError(str(error)) from error
         if not math.isfinite(config.shrinkage_scale) or config.shrinkage_scale <= 0:
             raise SAASBOPriorError("shrinkage_scale must be finite and positive.")
+        if (
+            isinstance(config.target_accept_prob, bool)
+            or not isinstance(config.target_accept_prob, (int, float))
+            or not 0 < config.target_accept_prob < 1
+        ):
+            raise SAASBOMCMCError("target_accept_prob must lie strictly between 0 and 1.")
         integer_fields = {
             "warmup_steps": config.warmup_steps,
             "posterior_samples": config.posterior_samples,
@@ -253,8 +274,12 @@ class SAASBO(Algorithm):
                 raise SAASBOMCMCError(f"{name} must be an integer >= {minimum}.")
         if config.posterior_samples // config.thinning < 1:
             raise SAASBOMCMCError("thinning must retain at least one posterior draw.")
-        if config.initial_points is not None and config.initial_points < 0:
-            raise SAASBOMCMCError("initial_points must be non-negative or None.")
+        if config.initial_points is not None and (
+            isinstance(config.initial_points, bool)
+            or not isinstance(config.initial_points, int)
+            or config.initial_points < 1
+        ):
+            raise SAASBOMCMCError("initial_points must be a positive integer or None.")
         if config.acquisition not in {"EI", "UCB"}:
             raise SAASBOMCMCError("acquisition must be 'EI' or 'UCB'.")
         if not math.isfinite(config.ucb_beta) or config.ucb_beta < 0:
@@ -417,6 +442,7 @@ class SAASBO(Algorithm):
                     ignore_jit_warnings=True,
                     jit_compile=jit_compile,
                     max_tree_depth=self.config.max_tree_depth,
+                    target_accept_prob=self.config.target_accept_prob,
                 )
                 return MCMC(
                     nuts,
@@ -459,11 +485,17 @@ class SAASBO(Algorithm):
             ).item()
         )
         fork_devices: list[int] = []
-        if self.device.type == "cuda" and self.device.index is not None:
-            fork_devices = [self.device.index]
+        if self.device.type == "cuda":
+            fork_devices = [
+                torch.cuda.current_device() if self.device.index is None else self.device.index
+            ]
         thread_context = (
             _TORCH_NUM_THREADS_LOCK if self.mcmc_num_threads is not None else nullcontext()
         )
+        # Pyro also seeds Python and NumPy. Preserve all ambient RNGs so a
+        # posterior fit cannot alter another algorithm or the user's objective.
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
         try:
             with thread_context:
                 previous_num_threads: int | None = None
@@ -503,13 +535,22 @@ class SAASBO(Algorithm):
             raise
         except Exception as error:
             raise SAASBOMCMCError(f"NUTS failed before producing a posterior: {error}") from error
+        finally:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
         raw = mcmc.get_samples(group_by_chain=False)
         processed = model.pyro_model.postprocess_mcmc_samples(mcmc_samples=raw)
         retained = {
             name: value[:: self.config.thinning].detach().clone()
             for name, value in processed.items()
         }
-        diagnostics = mcmc.diagnostics()
+        if self.config.posterior_samples < 4:
+            diagnostics = {
+                "unavailable": "Pyro requires at least four draws per chain to compute "
+                "split-chain convergence diagnostics."
+            }
+        else:
+            diagnostics = mcmc.diagnostics()
         return retained, diagnostics
 
     @staticmethod
@@ -529,14 +570,15 @@ class SAASBO(Algorithm):
                 collected.extend(SAASBO._diagnostic_values(item, key))
         return collected
 
-    def _handle_mcmc_diagnostic(self, message: str, *, reason: str) -> None:
+    def _handle_mcmc_diagnostic(self, message: str, *, reason: str, allow: bool = False) -> None:
         """Raise or retain a usable posterior according to the runtime policy."""
 
-        if self.diagnostic_policy == "raise":
+        if self.diagnostic_policy == "raise" and not allow:
             raise SAASBODivergenceError(message)
+        policy = "allow_divergences=True" if allow else "diagnostic_policy='warn'"
         warnings.warn(
             f"{message} Finite, loadable posterior draws were retained under "
-            "diagnostic_policy='warn'; source guarantees no longer apply.",
+            f"{policy}; source guarantees no longer apply.",
             SAASBOWarning,
             stacklevel=3,
         )
@@ -545,18 +587,21 @@ class SAASBO(Algorithm):
     def _check_mcmc_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         """Handle divergences, poor ESS, and multi-chain R-hat failures."""
 
+        if diagnostics.get("unavailable"):
+            self._handle_mcmc_diagnostic(
+                str(diagnostics["unavailable"]), reason="saasbo.mcmc_diagnostics_unavailable"
+            )
         divergences = diagnostics.get("divergences", {})
         divergence_count = 0
         if isinstance(divergences, Mapping):
             divergence_count = sum(len(value) for value in divergences.values())
         elif isinstance(divergences, (list, tuple)):
             divergence_count = len(divergences)
-        if divergence_count and (
-            self.diagnostic_policy == "warn" or not self.config.allow_divergences
-        ):
+        if divergence_count:
             self._handle_mcmc_diagnostic(
                 f"NUTS reported {divergence_count} divergent transitions.",
                 reason="saasbo.mcmc_divergences",
+                allow=self.config.allow_divergences,
             )
         ess_values = self._diagnostic_values(diagnostics, "n_eff")
         ess_floor = self.config.min_effective_sample_size
@@ -793,13 +838,17 @@ class SAASBO(Algorithm):
                     ):
                         import botorch.optim
 
-                        unit, value = botorch.optim.optimize_acqf(
-                            acq_function=acquisition,
-                            bounds=search_bounds,
-                            q=1,
-                            num_restarts=self.config.num_restarts,
-                            raw_samples=self.config.raw_samples,
-                        )
+                        with translate_backend_warnings(
+                            operation="SAASBO continuous acquisition optimization"
+                        ):
+                            unit, value = botorch.optim.optimize_acqf(
+                                acq_function=acquisition,
+                                bounds=search_bounds,
+                                q=1,
+                                num_restarts=self.config.num_restarts,
+                                raw_samples=self.config.raw_samples,
+                                options={"maxls": 100},
+                            )
                     else:
                         from bayopy.models.Acquisitions import (
                             optimize_acquisition_continuous,
@@ -909,14 +958,9 @@ class SAASBO(Algorithm):
         missing = required - set(state)
         if missing:
             raise SAASBOCheckpointError(f"SAASBO state is missing: {sorted(missing)}.")
-        stored_policy = state.get("diagnostic_policy")
-        if stored_policy is not None and stored_policy != self.diagnostic_policy:
-            raise SAASBOCheckpointError("SAASBO runtime diagnostic policy changed.")
-        stored_jit_compile = state.get("jit_compile")
-        if stored_jit_compile is not None and stored_jit_compile != self.jit_compile:
-            raise SAASBOCheckpointError("SAASBO runtime JIT policy changed.")
-        if "mcmc_num_threads" in state and state["mcmc_num_threads"] != self.mcmc_num_threads:
-            raise SAASBOCheckpointError("SAASBO runtime MCMC thread policy changed.")
+        # Runtime diagnostic/JIT/thread policies do not define the objective
+        # or stored observations. Resume deliberately runs fresh inference
+        # using the current policies rather than restoring a fitted posterior.
         del strict
         X = torch.as_tensor(state["X_train_unit"])
         y = torch.as_tensor(state["y_train"])

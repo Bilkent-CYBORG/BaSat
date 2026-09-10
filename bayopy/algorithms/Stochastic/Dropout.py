@@ -8,7 +8,7 @@ import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import torch
 
@@ -81,6 +81,10 @@ class DropoutConfig:
         Scalar or callable UCB confidence coefficient.
     acquisition_optimizer:
         Optional active-space optimizer callback.
+    initial_points:
+        Number of sampled actions before fitting the active-space GP.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     batch_size, seed:
         Sequential request size and algorithm-owned seed.
     """
@@ -90,6 +94,8 @@ class DropoutConfig:
     random_fill_probability: float = 0.1
     beta: Callable[[int], float] | float = theoretical_beta
     acquisition_optimizer: Any | None = None
+    initial_points: int = 1
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     batch_size: int | None = 1
     q_batch: int | None = None
     seed: int = 1
@@ -137,6 +143,10 @@ class Dropout(Algorithm):
     """
 
     ACQUISITION_POLICY = "UCB in the sampled active coordinates"
+    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = {
+        "initial_points": 1,
+        "initial_points_sampling_method": "paper",
+    }
 
     EXCEPTION_CLASS = DropoutException
     native_batching = False
@@ -194,6 +204,7 @@ class Dropout(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -223,6 +234,12 @@ class Dropout(Algorithm):
         if config.fill_strategy not in {"random", "copy", "mix"}:
             raise AlgorithmConfigurationError("Unknown Dropout fill_strategy.")
         resolve_batch_configuration(batch_size=config.batch_size, q_batch=config.q_batch)
+        if (
+            isinstance(config.initial_points, bool)
+            or not isinstance(config.initial_points, int)
+            or config.initial_points < 1
+        ):
+            raise AlgorithmConfigurationError("initial_points must be a positive integer.")
         probability = config.random_fill_probability
         if not math.isfinite(float(probability)) or not 0.0 <= probability <= 1.0:
             raise AlgorithmConfigurationError("random_fill_probability must lie in [0, 1].")
@@ -560,7 +577,7 @@ class Dropout(Algorithm):
                 candidate_dataset_indices=round_info["candidate_dataset_indices"],
                 round_info=round_info,
             )
-        if self.state.y_train.numel() == 0:
+        if self.state.y_train.numel() < self.config.initial_points:
             if table is None:
                 active_point = self._sample_design(
                     Bounds(

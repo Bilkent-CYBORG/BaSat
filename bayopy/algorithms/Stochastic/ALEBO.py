@@ -1,12 +1,14 @@
 """Adaptive Linear Embedding Bayesian Optimization (ALEBO).
 
-ALEBO uses the exact polytope ``{y: -1 <= B^dagger y <= 1}``; it never
+Continuous ALEBO uses the exact polytope ``{y: -1 <= B^dagger y <= 1}``; it never
 replaces that domain by a box and never clips a substantively infeasible map.
+Finite-row selection uses a separately warned projection extension by default.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -14,13 +16,14 @@ from typing import Any, Literal
 import gpytorch
 import torch
 import torch.nn.functional as F
+from linear_operator.utils.errors import NanError, NotPSDError  # type: ignore[import-untyped]
 
 from bayopy.algorithms.algorithm import (
     Algorithm,
     AlgorithmConfigurationError,
     resolve_batch_configuration,
 )
-from bayopy.algorithms.helper import SourceRecord, to_quality
+from bayopy.algorithms.helper import LastAskRecord, SourceRecord, to_quality
 from bayopy.models.Acquisitions import (
     AcquisitionConfig,
     DiscreteAcquisitionCandidates,
@@ -38,6 +41,7 @@ from .Exception.exception_ALEBO import (
     ALEBOHistoricalDataError,
     ALEBOMetricError,
     ALEBOPolytopeError,
+    ALEBOWarning,
 )
 
 
@@ -127,10 +131,16 @@ class ALEBOConfig:
 
     Parameters
     ----------
+    finite_candidate_mode:
+        "project" scores actual finite rows in compressed coordinates (a warned
+        extension); "exact" requires original embedding geometry. Continuous
+        proposal generation is unchanged.
     embedding_dimension:
         Explicit reduced ``D_model``.
     initial_points, acquisition:
         Initial-design size and EI/UCB acquisition settings.
+    initial_points_sampling_method:
+        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     metric_inference, metric_posterior_samples:
         Laplace or qualified MAP Mahalanobis-metric approximation controls.
     feasibility_tolerance, acquisition_solver:
@@ -142,7 +152,9 @@ class ALEBOConfig:
     """
 
     embedding_dimension: int
+    finite_candidate_mode: Literal["project", "exact"] = field(default="project", kw_only=True)
     initial_points: int | None = None
+    initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
     acquisition: AcquisitionConfig = field(default_factory=lambda: AcquisitionConfig(name="EI"))
     metric_inference: Literal["laplace", "map"] = "laplace"
     metric_posterior_samples: int = 25
@@ -261,6 +273,7 @@ class ALEBO(Algorithm):
             dtype=dtype,
             device=device,
             seed=config.seed,
+            initial_points_sampling_method=config.initial_points_sampling_method,
             plot=plot,
             verbose=verbose,
             verbose_setting=verbose_setting,
@@ -312,6 +325,8 @@ class ALEBO(Algorithm):
 
         if not isinstance(config, ALEBOConfig):
             raise AlgorithmConfigurationError("config must be ALEBOConfig.")
+        if config.finite_candidate_mode not in {"project", "exact"}:
+            raise AlgorithmConfigurationError("finite_candidate_mode must be project or exact.")
         _, q_batch = resolve_batch_configuration(
             batch_size=config.batch_size, q_batch=config.q_batch
         )
@@ -387,13 +402,42 @@ class ALEBO(Algorithm):
             X.clamp(-1.0, 1.0), self.bounds.to(dtype=self.dtype, device=self.device)
         )
 
+    def _perturb_continuous_batch_record(
+        self, record: LastAskRecord, offset: int
+    ) -> LastAskRecord:
+        """Separate repeated optima by a feasible convex move in latent space."""
+
+        if record.model_inputs is None:
+            raise ALEBODataCompatibilityError("ALEBO batch proposal has no latent coordinates.")
+        Y = record.model_inputs.detach().clone()
+        coordinate = offset % self.config.embedding_dimension
+        target = torch.zeros_like(Y)
+        radius = self.state.B_pinv[:, coordinate].abs().max().reciprocal()
+        direction = -1.0 if Y[0, coordinate] > 0 else 1.0
+        target[0, coordinate] = direction * radius * 0.5
+        fraction = min(0.5, 1e-4 * (1 + offset // self.config.embedding_dimension))
+        Y = (1.0 - fraction) * Y + fraction * target
+        actions = self._map_y_to_action(Y)
+        metadata = dict(record.algorithm_metadata)
+        metadata["constraint_residual"] = float(
+            (Y @ self.state.A_ineq.T - self.state.b_ineq).max().item()
+        )
+        return LastAskRecord(
+            actions=actions,
+            model_inputs=Y,
+            round_info_snapshot=record.round_info_snapshot,
+            algorithm_metadata=metadata,
+        )
+
     def _recover_y_if_exact(
         self, actions: torch.Tensor, *, historical: bool = False
     ) -> torch.Tensor:
-        """Use ALEBO's defined y=Bx map and verify B-dagger y equals x."""
+        """Use y=Bx; require reconstruction only for the strict finite policy."""
 
         X = to_symmetric_box(actions, self.bounds.to(dtype=self.dtype, device=self.device))
         Y = X @ self.state.B.T
+        if self.config.finite_candidate_mode == "project":
+            return Y.detach().clone()
         reconstructed = Y @ self.state.B_pinv.T
         valid = torch.isclose(reconstructed, X, rtol=0.0, atol=1e-8).all(dim=-1)
         valid &= self._is_feasible_y(Y)
@@ -403,7 +447,7 @@ class ALEBO(Algorithm):
         return Y.detach().clone()
 
     def _initialize_from_environment_impl(self, data: Any) -> None:
-        """Load history only when every action lies in ALEBO's embedded image."""
+        """Encode visible history, with optional strict embedded-image checks."""
 
         actions = torch.as_tensor(data.actions, dtype=self.dtype, device=self.device)
         if actions.shape[0] == 0:
@@ -441,6 +485,8 @@ class ALEBO(Algorithm):
         valid = torch.isclose(reconstructed, X, rtol=0.0, atol=1e-8).all(
             dim=-1
         ) & self._is_feasible_y(Y)
+        if self.config.finite_candidate_mode == "project":
+            valid = torch.ones_like(valid)
         if not bool(valid.any()):
             raise ALEBODataCompatibilityError(
                 "No finite candidate lies in ALEBO's exact embedded image.",
@@ -604,8 +650,7 @@ class ALEBO(Algorithm):
                 )
 
     def _optimize_constrained_acquisition(self, acquisition: Any) -> tuple[torch.Tensor, float]:
-        """Run configured SciPy local solves and independently check residuals."""
-
+        """Screen feasible starts, refine with derivatives, and retain certified points."""
         try:
             import numpy as np
             from scipy.optimize import LinearConstraint, minimize
@@ -613,41 +658,154 @@ class ALEBO(Algorithm):
             raise ALEBOAcquisitionOptimizationError(
                 "SciPy is required by ALEBO.", algorithm=self
             ) from error
-        starts = self._sample_feasible_Y(self.config.num_restarts, phase="acquisition")
+        pool = self._sample_feasible_Y(
+            max(self.config.raw_feasible_samples, self.config.num_restarts), phase="acquisition"
+        )
+        with torch.no_grad():
+            pool_values = acquisition(pool.unsqueeze(-2)).reshape(-1)
+        finite = (
+            torch.isfinite(pool_values)
+            & torch.isfinite(pool).all(dim=-1)
+            & self._is_feasible_y(pool)
+        )
+        if not bool(finite.any()):
+            raise ALEBOAcquisitionOptimizationError(
+                "ALEBO acquisition has no finite value on its feasible screened points.",
+                algorithm=self,
+            )
+        indices = torch.nonzero(finite, as_tuple=False).reshape(-1)
+        order = torch.argsort(pool_values[indices], descending=True, stable=True)
+        selected = indices[order[: self.config.num_restarts]]
+        starts = pool[selected]
+        best = pool[selected[0] : selected[0] + 1].detach().clone()
+        best_value = float(pool_values[selected[0]])
         A = self.state.A_ineq.detach().cpu().numpy()
         b = self.state.b_ineq.detach().cpu().numpy()
         constraint = LinearConstraint(A, -np.inf, b)
 
         def objective(values: Any) -> float:
-            """Return the negated acquisition value for SciPy minimization."""
-
-            Y = torch.as_tensor(values, dtype=self.dtype, device=self.device).reshape(1, 1, -1)
+            point = torch.as_tensor(values, dtype=self.dtype, device=self.device).reshape(1, 1, -1)
             with torch.no_grad():
-                return -float(acquisition(Y).item())
+                value = -float(acquisition(point).item())
+            return value
 
-        solutions: list[tuple[torch.Tensor, float]] = []
+        class UnavailableGradientError(Exception):
+            """This acquisition provides no derivative with respect to its input."""
+
+        numerical_errors = (FloatingPointError, torch.linalg.LinAlgError, NanError, NotPSDError)
+
+        def objective_with_gradient(values: Any) -> tuple[float, Any]:
+            with torch.enable_grad():
+                point = (
+                    torch.as_tensor(values, dtype=self.dtype, device=self.device)
+                    .reshape(1, 1, -1)
+                    .detach()
+                    .requires_grad_(True)
+                )
+                loss = -acquisition(point).reshape(())
+                if not loss.requires_grad:
+                    raise UnavailableGradientError(
+                        "Acquisition does not provide an analytic gradient."
+                    )
+                raw_gradient = torch.autograd.grad(loss, point, allow_unused=True)[0]
+                if raw_gradient is None:
+                    raise UnavailableGradientError(
+                        "Acquisition is not differentiably connected to its input."
+                    )
+                gradient = raw_gradient.reshape(-1)
+            if not bool(torch.isfinite(loss) & torch.isfinite(gradient).all()):
+                raise FloatingPointError("Non-finite ALEBO acquisition derivative.")
+            return float(loss.detach()), gradient.detach().cpu().double().numpy()
+
         method = "SLSQP" if self.config.acquisition_solver == "slsqp" else "trust-constr"
+        accepted = 0
+        failures: list[dict[str, Any]] = []
         for start in starts:
-            result = minimize(
-                objective,
-                start.detach().cpu().numpy(),
-                method=method,
-                constraints=[constraint],
-                options={"maxiter": 200, "ftol": 1e-6} if method == "SLSQP" else {"maxiter": 200},
-            )
+            x0 = start.detach().cpu().double().numpy()
+            try:
+                objective_with_gradient(x0)
+                has_gradient = True
+            except (*numerical_errors, UnavailableGradientError) as error:
+                has_gradient = False
+                failures.append(
+                    {
+                        "success": False,
+                        "stage": "analytic gradient; using finite differences",
+                        "message": str(error),
+                        "residual": None,
+                    }
+                )
+            try:
+                result = minimize(
+                    objective_with_gradient if has_gradient else objective,
+                    x0,
+                    jac=True if has_gradient else None,
+                    method=method,
+                    constraints=[constraint],
+                    options={"maxiter": 200, "ftol": 1e-9}
+                    if method == "SLSQP"
+                    else {"maxiter": 200},
+                )
+            except (*numerical_errors, UnavailableGradientError) as error:
+                failures.append({"success": False, "message": str(error), "residual": None})
+                continue
             candidate = torch.as_tensor(result.x, dtype=self.dtype, device=self.device).reshape(
                 1, -1
             )
-            residual = float((candidate @ self.state.A_ineq.T - self.state.b_ineq).max().item())
-            if result.success and residual <= self.config.feasibility_tolerance:
-                solutions.append((candidate, -objective(result.x)))
-        if not solutions:
-            raise ALEBOAcquisitionOptimizationError(
-                "Every ALEBO constrained acquisition solve failed feasibility checks.",
-                algorithm=self,
+            residual = float((candidate @ self.state.A_ineq.T - self.state.b_ineq).max())
+            if (
+                not bool(torch.isfinite(candidate).all())
+                or not math.isfinite(residual)
+                or residual > self.config.feasibility_tolerance
+            ):
+                failures.append(
+                    {
+                        "success": bool(result.success),
+                        "stage": "finite-point and polytope certification",
+                        "message": str(result.message),
+                        "residual": residual,
+                    }
+                )
+                continue
+            try:
+                value = -objective(result.x)
+            except (*numerical_errors, UnavailableGradientError) as error:
+                failures.append(
+                    {
+                        "success": False,
+                        "stage": "endpoint acquisition reevaluation",
+                        "message": str(error),
+                        "residual": residual,
+                    }
+                )
+                continue
+            if not math.isfinite(value):
+                failures.append(
+                    {
+                        "success": False,
+                        "stage": "endpoint acquisition reevaluation",
+                        "message": "Non-finite acquisition value.",
+                        "residual": residual,
+                    }
+                )
+                continue
+            accepted += 1
+            if value > best_value:
+                best, best_value = candidate.detach().clone(), value
+            if not result.success:
+                failures.append(
+                    {"success": False, "message": str(result.message), "residual": residual}
+                )
+        if failures:
+            warnings.warn(
+                f"ALEBO constrained refinement diagnostics: {failures}. "
+                f"Returning the best independently feasible finite acquisition point; {accepted} local endpoints were feasible. "
+                "A screened feasible point is retained if refinement cannot improve it.",
+                ALEBOWarning,
+                stacklevel=2,
             )
-        solutions.sort(key=lambda item: item[1], reverse=True)
-        return solutions[0]
+            self.invalidate_source_guarantees("alebo.constrained_acquisition_refinement_warning")
+        return best, best_value
 
     def _initial_design_size(self) -> int:
         """Return the configured or dimension-derived initial-design size."""
