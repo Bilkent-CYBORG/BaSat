@@ -2,7 +2,7 @@
 
 **Bayesian optimization with your own objectives, data, and experiment settings.**
 
-[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms) · [Notebook](docs/bayopy_last_ver_user_guide.ipynb) · [User guide](output/pdf/bayopy_user_guide.pdf)
+[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms)
 
 BayOPy is a Python library for running and comparing Bayesian optimization algorithms. Define an objective, choose an environment and an algorithm, and run an `Experiment`. The same interface supports one algorithm or several, independent trials, early stopping, saved checkpoints, and plots.
 
@@ -14,23 +14,11 @@ BayOPy is a Python library for running and comparing Bayesian optimization algor
 
 BayOPy is under active development. The guides describe algorithm assumptions, numerical diagnostics, and cross-environment adaptations.
 
-## Installation
+## Running this source checkout
 
-Requires **Python 3.11–3.14**. From the root of this checkout, install BayOPy:
+Requires **Python 3.11–3.14** and an environment with BayOPy's runtime dependencies already installed. This repository contains the library source and `uv.lock`, but intentionally omits the packaging manifest (`pyproject.toml`). Consequently, `pip install .`, editable installation, and `uv sync` are not supported from this checkout alone. The lockfile records dependencies; it does not replace the missing manifest.
 
-```bash
-python -m pip install .
-```
-
-This installs the library and its runtime dependencies, including plotting and notebook support. The examples below use only `import bayopy` and Python built-ins.
-
-For an editable installation when developing the library:
-
-```bash
-python -m pip install -e .
-```
-
-These instructions install the code in this checkout, including the API used by the accompanying notebook.
+Run the examples from the repository root using an existing BayOPy environment. For an installable distribution, obtain a packaged build or a complete project containing its packaging metadata. All Python examples below use only `import bayopy` and Python built-ins.
 
 ## Quick start
 
@@ -156,7 +144,7 @@ algorithm = bayopy.TuRBO(
 )
 ```
 
-Pass this algorithm to an `Experiment` as in the quick start. Omitted optional settings use the algorithm's defaults. There are no parameter profiles. Required scientific choices, such as an embedding dimension or a satisficing threshold, depend on the selected method; supported settings also differ between algorithms. The notebook includes expanded configurations and kernel, acquisition, and sampling examples. For configurable action and context kernels, see the [CGP_UCB kernel comparison](overlaf/code/settings_real_kernels.py).
+Pass this algorithm to an `Experiment` as in the quick start. Omitted optional settings use the algorithm's defaults. There are no parameter profiles. Required scientific choices, such as an embedding dimension or a satisficing threshold, depend on the selected method; supported settings also differ between algorithms. The notebook includes expanded configurations and kernel, acquisition, and sampling examples. For configurable action and context kernels, see the CGP_UCB kernel comparison (in the separate full project).
 
 ## Environments and real data
 
@@ -171,7 +159,7 @@ An environment defines how an action is evaluated and what information is availa
 
 Environment-provided information takes precedence over internal algorithm defaults. Algorithms ignore extra inputs they do not need. Where execution is technically possible, missing inputs receive documented defaults and cross-environment adaptations produce warnings. An adaptation does not establish the method's native theoretical guarantees. See the guide's **Algorithm adaptations across environments** appendix for each combination.
 
-For CSV input, use the loader with the appropriate environment family. Run this example from the checkout, which includes the example datasets:
+For CSV input, use the loader with the appropriate environment family. This example requires the wind dataset from the separate full project. Datasets are not included in this source-only repository:
 
 ```python
 import bayopy
@@ -183,7 +171,7 @@ loaded = bayopy.load_dataset(
 print(loaded.preview(rows=3))
 ```
 
-The [notebook](docs/bayopy_last_ver_user_guide.ipynb) shows the required CSV schemas and complete environment construction. It includes four distinct real-data examples: diabetes, wine, wind power, and iris. Dataset sources and transformations are documented in [data/README.md](data/README.md). Example datasets live outside the installed library.
+The notebook (in the separate full project) shows the required CSV schemas and complete environment construction. It includes four distinct real-data examples: diabetes, wine, wind power, and iris. Dataset sources and transformations are documented in data/README.md (in the separate full project). Example datasets live outside the installed library.
 
 ## Early stopping and saved runs
 
@@ -202,23 +190,19 @@ Use `stopping_rule=stopping_rule` in `bayopy.Experiment(...)`. The first applica
 
 Set `output_directory` to retain results and checkpoints. Multiple algorithms and trials receive separate directories under the experiment's output folder. `bayopy.new_run_directory()` creates a fresh location for a new experiment.
 
-To continue a saved experiment, reconstruct it with the same objective, environment, base configuration, output directory, and `resume=True`, then call `run()` with the same trial count. Evaluation limits are **totals**, so continuing from 20 to `max_evaluations=50` allows up to 30 additional evaluations per trial. A completed explicit stopping rule remains stopped. The [complete resume example](overlaf/code/settings_resume.py) demonstrates checkpoint continuation.
+To continue a saved experiment, reconstruct it with the same objective, environment, base configuration, output directory, and `resume=True`, then call `run()` with the same trial count. Evaluation limits are **totals**, so continuing from 20 to `max_evaluations=50` allows up to 30 additional evaluations per trial. A completed explicit stopping rule remains stopped. The complete resume example (in the separate full project) demonstrates checkpoint continuation.
 
-## Documentation
+## Guides and experiment assets
 
-Open the editable notebook from the project root:
+The GitHub repository intentionally tracks only `bayopy/`, `.gitignore`, `LICENSE`, `README.md`, and `uv.lock`.
+
+The full local project also contains the editable notebook, PDF guides, Overleaf source, example datasets, and saved experiment results. These assets are not distributed in this repository. If you have the full project and its installed environment, open its notebook with:
 
 ```bash
 python -m bayopy notebook docs/bayopy_last_ver_user_guide.ipynb
 ```
 
-- [Notebook](docs/bayopy_last_ver_user_guide.ipynb): editable objectives, configurations, real-data experiments, and saved results.
-- [User guide](output/pdf/bayopy_user_guide.pdf): explanations, code, and figures.
-- [Full guide](output/pdf/bayopy_last_ver_user_guide.pdf): includes saved terminal outputs and diagnostics.
-- [Overleaf project](overlaf/README.md): `main1.tex` for the full guide and `main2.tex` for the edition without terminal outputs.
-- [Overleaf ZIP](overlaf.zip): upload into one project and compile either entry file with pdfLaTeX.
-
-Notebook code can be edited and rerun. Its stored figures represent saved experiments; changing code alone does not update those results.
+The guide covers objective definitions, all algorithm configurations, CSV schemas, early stopping, checkpoint continuation, and adaptations across environments. Its stored figures represent saved experiments; changing code alone does not update those results.
 
 ## License
 

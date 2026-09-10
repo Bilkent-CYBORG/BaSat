@@ -1,19 +1,17 @@
+# Track only the library and the selected root files.
+/*
+!/bayopy/
+!/.gitignore
+!/LICENSE
+!/README.md
+!/uv.lock
+
+# Ignore generated files inside the library as well.
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
 .DS_Store
-.vscode/
 .ipynb_checkpoints/
-deneme.ipynb
-.coverage
-coverage*.json
-htmlcov/
-.hypothesis/
-.mypy_cache/
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
-build/
-dist/
-runs/
-results/
