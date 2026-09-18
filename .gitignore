@@ -1,9 +1,10 @@
 # Track only the library and the selected root files.
 /*
-!/bayopy/
+!/basat/
 !/.gitignore
 !/LICENSE
 !/README.md
+!/pyproject.toml
 !/uv.lock
 
 # Ignore generated files inside the library as well.

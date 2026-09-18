@@ -1,10 +1,10 @@
-# BayOPy
+# Basat
 
 **Bayesian optimization with your own objectives, data, and experiment settings.**
 
 [Quick start](#quick-start) · [Compare algorithms](#compare-algorithms)
 
-BayOPy is a Python library for running and comparing Bayesian optimization algorithms. Define an objective, choose an environment and an algorithm, and run an `Experiment`. The same interface supports one algorithm or several, independent trials, early stopping, saved checkpoints, and plots.
+Basat is a Python library for running and comparing Bayesian optimization algorithms. Define an objective, choose an environment and an algorithm, and run an `Experiment`. The same interface supports one algorithm or several, independent trials, early stopping, saved checkpoints, and plots.
 
 - **19 algorithms** across stochastic, contextual, distributional, and adversarial/robust families.
 - **User-defined objectives and CSV data**, with environment-specific observations supplied during optimization.
@@ -12,34 +12,34 @@ BayOPy is a Python library for running and comparing Bayesian optimization algor
 - **Repeatable experiments**, with seed management, per-trial results, and checkpoint continuation.
 - **Built-in plotting**, including comparisons and staggered uncertainty bars across trials.
 
-BayOPy is under active development. The guides describe algorithm assumptions, numerical diagnostics, and cross-environment adaptations.
+Basat is under active development. The guides describe algorithm assumptions, numerical diagnostics, and cross-environment adaptations.
 
 ## Running this source checkout
 
-Requires **Python 3.11–3.14** and an environment with BayOPy's runtime dependencies already installed. This repository contains the library source and `uv.lock`, but intentionally omits the packaging manifest (`pyproject.toml`). Consequently, `pip install .`, editable installation, and `uv sync` are not supported from this checkout alone. The lockfile records dependencies; it does not replace the missing manifest.
+Requires **Python 3.11–3.14** and an environment with Basat's runtime dependencies already installed. This repository contains the library source and `uv.lock`, but intentionally omits the packaging manifest (`pyproject.toml`). Consequently, `pip install .`, editable installation, and `uv sync` are not supported from this checkout alone. The lockfile records dependencies; it does not replace the missing manifest.
 
-Run the examples from the repository root using an existing BayOPy environment. For an installable distribution, obtain a packaged build or a complete project containing its packaging metadata. All Python examples below use only `import bayopy` and Python built-ins.
+Run the examples from the repository root using an existing Basat environment. For an installable distribution, obtain a packaged build or a complete project containing its packaging metadata. All Python examples below use only `import basat` and Python built-ins.
 
 ## Quick start
 
 Save this example as `quickstart.py`:
 
 ```python
-import bayopy
+import basat
 
-seed = bayopy.set_seed(42, threads=1)
-bounds = bayopy.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
+seed = basat.set_seed(42, threads=1)
+bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
 
 
 def objective(values):
     return -sum((x - 0.25) ** 2 for x in values)
 
 
-algorithm = bayopy.make_algorithm("TuRBO", bounds=bounds, seed=seed)
-environment = bayopy.StochasticEnvironment(
+algorithm = basat.make_algorithm("TuRBO", bounds=bounds, seed=seed)
+environment = basat.StochasticEnvironment(
     bounds=bounds, function=objective, seed=seed,
 )
-experiment = bayopy.Experiment(environment=environment, algorithm=algorithm)
+experiment = basat.Experiment(environment=environment, algorithm=algorithm)
 result = experiment.run(max_evaluations=50, plot=True, show=True)
 print(experiment.summary())
 ```
@@ -50,9 +50,9 @@ Run it from your terminal:
 python quickstart.py
 ```
 
-BayOPy selects inputs within the bounds, calls your objective, and updates the algorithm from the returned rewards. This example has a maximum reward of `0` at `[0.25, 0.25]`. The summary reports the observed results, and the figure shows optimization progress.
+Basat selects inputs within the bounds, calls your objective, and updates the algorithm from the returned rewards. This example has a maximum reward of `0` at `[0.25, 0.25]`. The summary reports the observed results, and the figure shows optimization progress.
 
-An objective returns one finite scalar. **BayOPy maximizes reward by default**: return the negative of a loss when you want to minimize it. Replace the function body with your own calculation, model evaluation, or simulator.
+An objective returns one finite scalar. **Basat maximizes reward by default**: return the negative of a loss when you want to minimize it. Replace the function body with your own calculation, model evaluation, or simulator.
 
 `max_evaluations=50` is an example budget, not a library-wide restriction. An evaluation is one objective call; a round can contain several evaluations when using batches.
 
@@ -63,11 +63,11 @@ Pass a list of algorithms or a dictionary of labels to `algorithm`. Each algorit
 This example can be run on its own:
 
 ```python
-import bayopy
+import basat
 
-seed = bayopy.set_seed(42, threads=1)
-bounds = bayopy.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
-run_directory = bayopy.new_run_directory("results/readme/comparison")
+seed = basat.set_seed(42, threads=1)
+bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
+run_directory = basat.new_run_directory("results/readme/comparison")
 
 
 def objective(values):
@@ -75,18 +75,18 @@ def objective(values):
 
 
 algorithms = {
-    "TuRBO / EI": bayopy.make_algorithm(
+    "TuRBO / EI": basat.make_algorithm(
         "TuRBO", bounds=bounds, seed=seed, acquisition="EI",
         initial_points=8, candidate_count=128,
     ),
-    "TuRBO / UCB": bayopy.make_algorithm(
+    "TuRBO / UCB": basat.make_algorithm(
         "TuRBO", bounds=bounds, seed=seed,
-        acquisition=bayopy.AcquisitionConfig(name="UCB", beta=3.0, seed=seed),
+        acquisition=basat.AcquisitionConfig(name="UCB", beta=3.0, seed=seed),
         initial_points=8, candidate_count=128,
     ),
 }
-experiment = bayopy.Experiment(
-    environment=bayopy.StochasticEnvironment(
+experiment = basat.Experiment(
+    environment=basat.StochasticEnvironment(
         bounds=bounds, function=objective, seed=seed,
     ),
     algorithm=algorithms,
@@ -94,14 +94,14 @@ experiment = bayopy.Experiment(
 )
 result = experiment.run(trials=5, max_evaluations=50, plot=False)
 print(experiment.summary())
-figure = bayopy.plot(
+figure = basat.plot(
     experiment,
     kind="incumbent",
     title="TuRBO: EI and UCB",
     xlabel="Objective evaluations",
     ylabel="Best observed reward",
     xlim=(1, 50),
-    save_path=bayopy.join_path(run_directory, "comparison.png"),
+    save_path=basat.join_path(run_directory, "comparison.png"),
     show=True,
 )
 ```
@@ -110,16 +110,26 @@ figure = bayopy.plot(
 
 Repeated-trial plots show means and, by default, vertical bars spanning **mean ± 1.96 sample standard deviations**. These bars describe variability across trials; they are not confidence intervals for the mean. Bar locations are staggered between algorithms. After early stopping, only trials with observations at an evaluation contribute to that point.
 
-For a single run, `trials` defaults to `1`. `plot=True` in `run()` creates a figure; `show=False` prevents automatic display. Use `bayopy.plot()` to customize and save plots, and `bayopy.show(figure)` to display a retained figure explicitly.
+For a single run, `trials` defaults to `1`. `plot=True` in `run()` creates a figure; `show=False` prevents automatic display. Use `basat.plot()` to customize and save plots, and `basat.show(figure)` to display a retained figure explicitly.
+
+For paper-specific metrics, use `basat.PlotSeries`, `basat.PlotPanel`, and
+`basat.plot_panels()`. Matplotlib remains an internal dependency; users need not
+import it. `PlotSeries.from_runs()` transforms each measured run before computing
+means and explicit SD or standard-error bars. For example, `uncertainty="sd",
+ddof=0, error_scale=0.5` means population standard deviation divided by two.
+Unequal-length trajectories must be selected explicitly; missing endpoints are
+never manufactured. `chart.save("./results/comparison.png", dpi=200)` saves a
+returned chart in the user's project. Algorithm colors remain distinct beyond
+the usual 20-color cycle and consistent across panels.
 
 ## Choose algorithms and settings
 
 List the registered algorithm names:
 
 ```python
-import bayopy
+import basat
 
-print(bayopy.algorithm_names())
+print(basat.algorithm_names())
 ```
 
 | Family | Algorithms |
@@ -132,14 +142,14 @@ print(bayopy.algorithm_names())
 Use `make_algorithm()` for construction by name, or instantiate an algorithm with its configuration class. For example, this constructs TuRBO with UCB and `beta=3`:
 
 ```python
-import bayopy
+import basat
 
-bounds = bayopy.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
-algorithm = bayopy.TuRBO(
+bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
+algorithm = basat.TuRBO(
     bounds=bounds,
-    config=bayopy.TuRBOConfig(
+    config=basat.TuRBOConfig(
         seed=42,
-        acquisition=bayopy.AcquisitionConfig(name="UCB", beta=3.0, seed=42),
+        acquisition=basat.AcquisitionConfig(name="UCB", beta=3.0, seed=42),
     ),
 )
 ```
@@ -162,10 +172,10 @@ Environment-provided information takes precedence over internal algorithm defaul
 For CSV input, use the loader with the appropriate environment family. This example requires the wind dataset from the separate full project. Datasets are not included in this source-only repository:
 
 ```python
-import bayopy
+import basat
 
-loaded = bayopy.load_dataset(
-    bayopy.find_path("data/distributional/wind_power_bandit.csv"),
+loaded = basat.load_dataset(
+    basat.find_path("data/distributional/wind_power_bandit.csv"),
     environment="distributional",
 )
 print(loaded.preview(rows=3))
@@ -178,32 +188,42 @@ The notebook (in the separate full project) shows the required CSV schemas and c
 To stop on either an evaluation budget or lack of improvement, pass a stopping rule when constructing an experiment:
 
 ```python
-import bayopy
+import basat
 
-stopping_rule = bayopy.any_of(
-    bayopy.MaximumEvaluationsStoppingRule(50),
-    bayopy.NoImprovementStoppingRule(10, min_rounds=20, min_delta=0.001),
+stopping_rule = basat.any_of(
+    basat.MaximumEvaluationsStoppingRule(50),
+    basat.NoImprovementStoppingRule(10, min_rounds=20, min_delta=0.001),
 )
 ```
 
-Use `stopping_rule=stopping_rule` in `bayopy.Experiment(...)`. The first applicable run limit or stopping condition ends that algorithm's trial. Time limits, target values, round limits, and `all_of()` composition are also available; see the notebook's **Early Stopping** section.
+Use `stopping_rule=stopping_rule` in `basat.Experiment(...)`. The first applicable run limit or stopping condition ends that algorithm's trial. Time limits, target values, round limits, and `all_of()` composition are also available; see the notebook's **Early Stopping** section.
 
-Set `output_directory` to retain results and checkpoints. Multiple algorithms and trials receive separate directories under the experiment's output folder. `bayopy.new_run_directory()` creates a fresh location for a new experiment.
+Set `output_directory` to retain results and checkpoints. Multiple algorithms and trials receive separate directories under the experiment's output folder. `basat.new_run_directory()` creates a fresh location for a new experiment.
 
 To continue a saved experiment, reconstruct it with the same objective, environment, base configuration, output directory, and `resume=True`, then call `run()` with the same trial count. Evaluation limits are **totals**, so continuing from 20 to `max_evaluations=50` allows up to 30 additional evaluations per trial. A completed explicit stopping rule remains stopped. The complete resume example (in the separate full project) demonstrates checkpoint continuation.
 
+The default `checkpoint_policy="transactional"` preserves evaluated feedback
+before handing it to the learner. An explicit `checkpoint_policy="periodic"`
+saves at `save_every` rounds and on a normal `run()` return. It can reduce disk
+overhead for replayable offline datasets, but a crash may lose up to that many
+unsaved rounds and repeat their evaluations. It is not an exactly-once policy
+for costly or externally stateful objectives. Changing the persistence cadence
+does not change GP training steps or permit incompatible scientific settings.
+
 ## Guides and experiment assets
 
-The GitHub repository intentionally tracks only `bayopy/`, `.gitignore`, `LICENSE`, `README.md`, and `uv.lock`.
+The GitHub repository intentionally tracks only `basat/`, `.gitignore`, `LICENSE`, `README.md`, and `uv.lock`.
 
 The full local project also contains the editable notebook, PDF guides, Overleaf source, example datasets, and saved experiment results. These assets are not distributed in this repository. If you have the full project and its installed environment, open its notebook with:
 
 ```bash
-python -m bayopy notebook docs/bayopy_last_ver_user_guide.ipynb
+python -m basat notebook docs/basat_user_guide.ipynb
 ```
 
 The guide covers objective definitions, all algorithm configurations, CSV schemas, early stopping, checkpoint continuation, and adaptations across environments. Its stored figures represent saved experiments; changing code alone does not update those results.
 
 ## License
 
-BayOPy is distributed under the [Apache License 2.0](LICENSE).
+Basat is distributed under the [Apache License 2.0](LICENSE). Source-derived
+additive-GP numerical routines retain their upstream Dragonfly MIT and PyMC
+Apache notices beside the implementation.
