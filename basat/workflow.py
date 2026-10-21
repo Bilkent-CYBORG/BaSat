@@ -25,6 +25,66 @@ import torch
 _seed = 1
 
 
+class NumericalFunction:
+    """Evaluate a user callback with an explicitly chosen numerical backend.
+
+    Parameters
+    ----------
+    function : callable
+        Callback ``function(x, xp)``. ``x`` is a copied backend array and
+        ``xp`` is the backend namespace. The callback defines the objective;
+        Basat supplies neither a benchmark nor hidden benchmark information.
+    backend : {"numpy"}, optional
+        Arithmetic backend, currently NumPy only. Float32/float64 inputs keep
+        their precision; outputs are not coerced or normalized by the wrapper.
+
+    Examples
+    --------
+    >>> import basat
+    >>> def objective(x, xp):
+    ...     return -xp.sum((x - 0.25) ** 2)
+    >>> function = basat.NumericalFunction(objective, backend="numpy")
+    >>> float(function(basat.array([0.25, 0.25])))
+    -0.0
+
+    Notes
+    -----
+    Tensor inputs are detached and copied to CPU. The adapter is intended for
+    black-box evaluations, not automatic differentiation. Environment history
+    still uses the environment's storage dtype. Opt into
+    ``StochasticEnvironment(dtype="float64", evaluation_dtype="proposal")`` when the callable
+    must honor source algorithms' per-proposal mixed precision.
+    """
+
+    def __init__(self, function: Any, *, backend: str = "numpy") -> None:
+        if not callable(function):
+            raise TypeError("function must be a callable accepting (x, xp).")
+        if backend != "numpy":
+            raise ValueError("NumericalFunction currently supports backend='numpy' only.")
+        self._function = function
+        self._backend = backend
+
+    @property
+    def function(self) -> Any:
+        """User-defined callback, kept separate from optimizer state."""
+        return self._function
+
+    @property
+    def backend(self) -> str:
+        """Explicit arithmetic backend name."""
+        return self._backend
+
+    def __call__(self, x: Any) -> Any:
+        """Pass a copied, precision-preserving array and namespace to the callback."""
+        if isinstance(x, torch.Tensor):
+            values = x.detach().cpu().numpy().copy()
+        else:
+            values = np.array(x, copy=True)
+        if not np.issubdtype(values.dtype, np.number):
+            raise TypeError("NumericalFunction inputs must be numeric.")
+        return self.function(values, np)
+
+
 class RandomStream:
     """Independent, serializable random stream for user experiment protocols.
 
@@ -149,6 +209,65 @@ class ArtifactStore:
     def read_json(self, name: str) -> Any:
         """Read ordinary JSON data."""
         return json.loads(Path(self.path(name)).read_text(encoding="utf-8"))
+
+    def download_json(
+        self, name: str, *, url: str, sha256: str, max_bytes: int = 64 * 1024 * 1024,
+        allow_nonfinite: bool = False,
+    ) -> Any:
+        """Read a checksum-pinned JSON artifact, downloading it only if absent.
+
+        The explicit HTTP(S) URL and 64-character SHA-256 identify immutable
+        reference data. Existing files are verified and never overwritten on
+        mismatch. A missing artifact is size-limited, verified and parsed as
+        ordinary JSON before atomic persistence in this caller-owned store.
+        No decoder imports or executes classes named by a JSON document.
+
+        Non-finite numbers are rejected by default. Set ``allow_nonfinite=True``
+        only for external reference artifacts whose published JSON contains
+        ``NaN`` or infinities (including overflowing number literals). This
+        preserves the checksum-pinned original bytes; it does not certify those
+        values as valid scientific data. Callers must separately validate the
+        fields they use. This option does not change :meth:`write_json`.
+
+        Examples
+        --------
+        >>> reference = store.download_json("reference.json", url=pinned_url,
+        ...                                  sha256=expected_sha256)  # doctest: +SKIP
+        """
+        if (not isinstance(url, str) or not url.startswith(("https://", "http://"))
+                or not isinstance(sha256, str) or len(sha256) != 64
+                or any(c not in "0123456789abcdefABCDEF" for c in sha256)):
+            raise ValueError("JSON downloads require an HTTP(S) URL and a full SHA-256 checksum.")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer.")
+        if not isinstance(allow_nonfinite, bool):
+            raise ValueError("allow_nonfinite must be a boolean.")
+        target = Path(self.path(name))
+        missing = not target.exists()
+        if missing:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                if not response.geturl().startswith(("https://", "http://")):
+                    raise ValueError("JSON download redirected outside HTTP(S).")
+                content = response.read(max_bytes + 1)
+        else:
+            with target.open("rb") as stream:
+                content = stream.read(max_bytes + 1)
+        if len(content) > max_bytes:
+            raise ValueError("JSON artifact exceeds max_bytes.")
+        if hashlib.sha256(content).hexdigest() != sha256.lower():
+            raise ValueError(f"JSON checksum does not match: {target}")
+        def invalid_constant(value: str) -> Any:
+            raise ValueError(f"Non-finite JSON constant is not permitted: {value}")
+        if allow_nonfinite:
+            value = json.loads(content)
+        else:
+            value = json.loads(content, parse_constant=invalid_constant)
+            # Also reject finite JSON number spellings that overflow the parser's
+            # float (for example 1e999); parse_constant only catches NaN/Infinity.
+            json.dumps(value, allow_nan=False)
+        if missing:
+            self._write(name, content)
+        return value
 
     def sha256(self, name: str) -> str:
         """Return a file's SHA-256 checksum without changing the artifact.

@@ -871,8 +871,77 @@ class PG(Algorithm):
         self._last_acquisition_value = self.state.last_score
         self.state.last_continuous_optimizer_restarts = report["restarts"] or None
         self._record_last_ask(actions=selected, model_inputs=selected, round_info=round_info,
-                              algorithm_metadata={"released_source_protocol": True, **report})
+                              algorithm_metadata={"released_source_protocol": True, **report,
+                                                  "evaluation_dtype": report["source_physical_action_dtype"]})
         return selected
+
+    @property
+    def _supports_shared_trial_streams(self) -> bool:
+        """Whether an experiment may hand off the released proposal streams."""
+        return isinstance(self.gp, ReleasedGoodActionModel)
+
+    def _export_random_streams(self) -> dict[str, Any]:
+        """Copy released proposal streams at a completed experiment boundary.
+
+        This private orchestration hook neither samples nor includes model or
+        objective state. Ordinary independent algorithm runs do not use it.
+        """
+        if not self._supports_shared_trial_streams:
+            raise NotImplementedError("Shared trial streams require cai_2021_released mode.")
+        assert isinstance(self.gp, ReleasedGoodActionModel)
+        if self.last_ask is not None or self.gp.pending_unit is not None:
+            raise ValueError("Cannot export trial streams while a proposal awaits feedback.")
+        name, keys, position, has_gaussian, cached_gaussian = self.gp.rng.get_state()
+        return {
+            "numpy": {"kind": name, "keys": keys.tolist(), "position": int(position),  # type: ignore[attr-defined]  # NumPy stub mis-types the MT19937 legacy tuple.
+                      "has_gauss": int(has_gaussian), "cached_gaussian": float(cached_gaussian)},
+            "torch": self.gp.torch_state.detach().cpu().clone(),
+        }
+
+    def _import_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Validate and atomically hand off released streams without a draw."""
+        if not self._supports_shared_trial_streams:
+            raise NotImplementedError("Shared trial streams require cai_2021_released mode.")
+        assert isinstance(self.gp, ReleasedGoodActionModel)
+        if self.last_ask is not None or self.gp.pending_unit is not None:
+            raise ValueError("Cannot replace trial streams while a proposal awaits feedback.")
+        try:
+            if not isinstance(state, Mapping) or set(state) != {"numpy", "torch"}:
+                raise ValueError("Expected exactly numpy and torch random streams.")
+            numpy_state = state["numpy"]
+            if not isinstance(numpy_state, Mapping):
+                raise ValueError("Expected an MT19937 state mapping.")
+            keys_value = numpy_state["keys"]
+            if isinstance(keys_value, torch.Tensor):
+                keys_value = keys_value.detach().cpu().numpy()
+            keys = np.asarray(keys_value)
+            position = numpy_state["position"]
+            has_gauss = numpy_state["has_gauss"]
+            cached = numpy_state["cached_gaussian"]
+            if (numpy_state["kind"] != "MT19937" or keys.shape != (624,)
+                    or not np.issubdtype(keys.dtype, np.integer)
+                    or np.any((keys < 0) | (keys > 2**32 - 1))
+                    or isinstance(position, bool) or not isinstance(position, int)
+                    or not 0 <= position <= 624
+                    or isinstance(has_gauss, bool) or not isinstance(has_gauss, int)
+                    or has_gauss not in (0, 1)
+                    or isinstance(cached, bool) or not isinstance(cached, (int, float))
+                    or not np.isfinite(cached)):
+                raise ValueError("Invalid MT19937 state.")
+            restored_numpy = np.random.RandomState(0)
+            restored_numpy.set_state(("MT19937", keys.astype(np.uint32), position,
+                                      has_gauss, float(cached)))
+            torch_value = torch.as_tensor(state["torch"], device="cpu")
+            if (torch_value.ndim != 1 or torch_value.is_floating_point()
+                    or torch_value.dtype == torch.bool
+                    or bool(((torch_value < 0) | (torch_value > 255)).any())):
+                raise ValueError("Torch RNG state must be a one-dimensional byte sequence.")
+            restored_torch = torch.Generator(device="cpu")
+            restored_torch.set_state(torch_value.to(dtype=torch.uint8).contiguous())
+        except (KeyError, TypeError, ValueError, RuntimeError, OverflowError) as error:
+            raise ValueError(f"Invalid shared trial random streams: {error}") from error
+        self.gp.rng = restored_numpy
+        self.gp.torch_state = restored_torch.get_state().clone()
 
     def _tell_impl(
         self,

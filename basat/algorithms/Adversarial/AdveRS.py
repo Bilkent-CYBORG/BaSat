@@ -12,6 +12,7 @@ import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from numbers import Real
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -20,6 +21,7 @@ from sklearn.metrics.pairwise import euclidean_distances
 
 from basat.models.Acquisitions import DiscreteAcquisitionCandidates
 from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
+from basat.models.FixedKernelGaussianProcess import FixedKernelGaussianProcess
 from basat.models.Kernels import KernelConfig
 from basat.models.PolynomialFeatureGaussianProcess import PolynomialFeatureGaussianProcess
 from basat.models.utils import Bounds
@@ -101,6 +103,7 @@ _INNER_REFINEMENTS = 5
 _CANDIDATE_REFINEMENTS = 10
 _GP_RETRY_SEED_OFFSET = 104_729
 _GP_RETAINED_HYPERPARAMETERS_REASON = "advers.gp_mle_retained_hyperparameters"
+_SOURCE_PROTOCOL_VERSIONS = {"advers_2025": 1, "advers_2026_camera_ready": 2}
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +158,12 @@ class AdveRSConfig:
         uses an exact finite polynomial basis with QR conditioning; it requires
         a fixed polynomial kernel, zero mean, unstandardized outcomes and
         ``fit_maxiter=0``. It is not a low-rank approximation.
+        ``"fixed_gpy"`` explicitly uses fixed full CPU float64 conditioning
+        with GPy-compatible LAPACK/marginal arithmetic and finite candidates;
+        it requires explicit ``gp_config`` and ``fit_maxiter=0``.
+    gp_training_regularization:
+        Nonnegative training-only diagonal for ``"fixed_gpy"``, distinct from
+        observation noise and conditional jitter. Other backends require zero.
     source_protocol:
         ``"native"`` retains the paper equations. ``"advers_2025"`` explicitly
         reproduces the released finite runner: standard deviation for the
@@ -162,6 +171,11 @@ class AdveRSConfig:
         RS2/RSG, and exact source ties. This inconsistent confidence rule does
         not inherit the paper's guarantees. Historical initialization with more
         than ``initial_points`` rows is treated as post-feedback state.
+        ``"advers_2026_camera_ready"`` follows revision ``6de58579``: standard
+        deviation at every round, Euclidean RS1/RSG distances, squared RS2
+        distances, and the updated random fallback when every point satisfies
+        the aspiration. ``beta`` is the squared confidence multiplier in both
+        source protocols, so source ``beta=1`` corresponds to this ``beta=1``.
     batch_size:
         Requested proposal count. AdveRS version 1 requires ``1``.
     seed:
@@ -184,9 +198,10 @@ class AdveRSConfig:
     fit_maxiter: int = 100
     kernel: KernelConfig = field(default_factory=KernelConfig)
     gp_config: GaussianProcessConfig | None = None
-    gp_backend: Literal["standard", "polynomial_features"] = "standard"
+    gp_backend: Literal["standard", "polynomial_features", "fixed_gpy"] = "standard"
+    gp_training_regularization: float = 0.0
     finite_tie_break: Literal["nominal", "first"] = "nominal"
-    source_protocol: Literal["native", "advers_2025"] = "native"
+    source_protocol: Literal["native", "advers_2025", "advers_2026_camera_ready"] = "native"
     batch_size: int | None = 1
     q_batch: int | None = None
     seed: int = 1
@@ -262,6 +277,7 @@ class AdveRS(Algorithm):
         **Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS,
         "gp_config": None,
         "gp_backend": "standard",
+        "gp_training_regularization": 0.0,
         "finite_tie_break": "nominal",
         "source_protocol": "native",
     }
@@ -339,17 +355,18 @@ class AdveRS(Algorithm):
         )
         model_class = (PolynomialFeatureGaussianProcess
                        if config.gp_backend == "polynomial_features" else GaussianProcess)
-        self.gp = model_class(
-            replace(config.gp_config, dtype=self.dtype, device=self.device)
+        gp_config = (replace(config.gp_config, dtype=self.dtype, device=self.device)
             if config.gp_config is not None
-            else GaussianProcessConfig(kernel=config.kernel, dtype=self.dtype, device=self.device),
-            input_dimension=self.action_dimension,
-        )
+            else GaussianProcessConfig(kernel=config.kernel, dtype=self.dtype, device=self.device))
+        self.gp = (FixedKernelGaussianProcess(gp_config, input_dimension=self.action_dimension,
+            conditioning="full", arithmetic="gpy", training_regularization=config.gp_training_regularization)
+            if config.gp_backend == "fixed_gpy" else model_class(gp_config, input_dimension=self.action_dimension))
         self.state = self._empty_state()
         self._source_rng = RandomStream(self.seed % 2**32)
-        if config.source_protocol == "advers_2025":
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             if self.dtype != torch.float64 or self.device.type != "cpu":
                 raise AlgorithmConfigurationError("The released AdveRS protocol requires CPU float64.")
+        if config.source_protocol == "advers_2025":
             self.invalidate_source_guarantees("basat.advers.released_2025_variance_confidence")
             warnings.warn(
                 "Basat AdveRS released-source protocol uses posterior variance as confidence "
@@ -378,9 +395,9 @@ class AdveRS(Algorithm):
 
         if not isinstance(config, AdveRSConfig):
             raise AlgorithmConfigurationError("config must be AdveRSConfig.")
-        if config.source_protocol not in {"native", "advers_2025"}:
+        if config.source_protocol not in {"native", *_SOURCE_PROTOCOL_VERSIONS}:
             raise AlgorithmConfigurationError("Unknown AdveRS source_protocol.")
-        if config.source_protocol == "advers_2025" and (
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS and (
             config.decision_model != "ucb" or config.perturbation_domain.radius is not None
             or config.perturbation_domain.norm != "l2"
         ):
@@ -389,14 +406,21 @@ class AdveRS(Algorithm):
             )
         if config.gp_config is not None and not isinstance(config.gp_config, GaussianProcessConfig):
             raise AlgorithmConfigurationError("gp_config must be GaussianProcessConfig or None.")
-        if config.gp_backend not in {"standard", "polynomial_features"}:
+        if config.gp_backend not in {"standard", "polynomial_features", "fixed_gpy"}:
             raise AlgorithmConfigurationError("Unknown gp_backend.")
+        regularization = config.gp_training_regularization
+        if isinstance(regularization, bool) or not isinstance(regularization, Real) or not math.isfinite(float(regularization)) or regularization < 0:
+            raise AlgorithmConfigurationError("gp_training_regularization must be finite and nonnegative.")
+        if config.gp_backend != "fixed_gpy" and regularization:
+            raise AlgorithmConfigurationError("Explicit GP regularization requires gp_backend='fixed_gpy'.")
+        if config.gp_backend == "fixed_gpy" and (config.fit_maxiter != 0 or config.gp_config is None):
+            raise AlgorithmConfigurationError("fixed_gpy requires explicit gp_config and fit_maxiter=0.")
         if config.gp_backend == "polynomial_features" and config.fit_maxiter != 0:
             raise AlgorithmConfigurationError("Polynomial features require fit_maxiter=0.")
         batch_size, q_batch = resolve_batch_configuration(
             batch_size=config.batch_size, q_batch=config.q_batch
         )
-        if config.source_protocol == "advers_2025" and batch_size != 1:
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS and batch_size != 1:
             raise AlgorithmConfigurationError("The released AdveRS protocol is sequential (batch_size=1).")
         if q_batch is not None and q_batch > 1:
             raise AlgorithmConfigurationError(
@@ -750,10 +774,11 @@ class AdveRS(Algorithm):
     def _distance(self, center: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
         """Measure configured perturbation distances in physical coordinates."""
 
-        if self.config.source_protocol == "advers_2025":
+        if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             distances = euclidean_distances(
                 points.detach().numpy(), center.detach().numpy().reshape(1, -1),
-                squared=self.config.variant != "RS1",
+                squared=(self.config.variant == "RS2" or (
+                    self.config.source_protocol == "advers_2025" and self.config.variant == "RSG")),
             ).reshape(-1)
             return torch.as_tensor(distances, dtype=self.dtype, device=self.device)
         difference = points - center
@@ -983,12 +1008,18 @@ class AdveRS(Algorithm):
 
         An external LCB attacker can use this method without duplicating the
         confidence formula or receiving any hidden objective evaluations.
-        Source mode uses standard deviation through ``initial_points`` training
-        rows, then variance; native mode always uses standard deviation.
+        The 2025 source protocol uses standard deviation through
+        ``initial_points`` training rows, then variance. Native and camera-ready
+        source protocols always use standard deviation.
         """
+        # Restoring a pending ask restores observations, not a fitted model.
+        self._fit_model()
         points = torch.as_tensor(points, dtype=self.dtype, device=self.device)
-        mean, std = self.gp.predict(points.unsqueeze(-2))
-        mean, std = mean.squeeze(-1), std.squeeze(-1)
+        if self.config.gp_backend == "fixed_gpy":
+            mean, std = self.gp.predict(points.unsqueeze(0) if points.ndim == 1 else points)
+        else:
+            mean, std = self.gp.predict(points.unsqueeze(-2))
+            mean, std = mean.squeeze(-1), std.squeeze(-1)
         if (self.config.source_protocol == "advers_2025"
                 and len(self.state.y_train) > self.config.initial_points):
             std = std.square()
@@ -997,14 +1028,14 @@ class AdveRS(Algorithm):
 
     def get_source_random_state(self) -> dict[str, Any]:
         """Return the source tie RNG in :class:`basat.RandomStream` JSON format."""
-        if self.config.source_protocol != "advers_2025":
-            raise AlgorithmConfigurationError("Source RNG requires source_protocol='advers_2025'.")
+        if self.config.source_protocol not in _SOURCE_PROTOCOL_VERSIONS:
+            raise AlgorithmConfigurationError("Source RNG requires a released AdveRS source_protocol.")
         return self._source_rng.get_state()
 
     def set_source_random_state(self, state: Mapping[str, Any]) -> None:
         """Restore or share an MT19937 source stream without consuming a draw."""
-        if self.config.source_protocol != "advers_2025":
-            raise AlgorithmConfigurationError("Source RNG requires source_protocol='advers_2025'.")
+        if self.config.source_protocol not in _SOURCE_PROTOCOL_VERSIONS:
+            raise AlgorithmConfigurationError("Source RNG requires a released AdveRS source_protocol.")
         self._source_rng.set_state(dict(state))
 
     def _source_finite_selection(
@@ -1015,10 +1046,13 @@ class AdveRS(Algorithm):
         points = candidates.detach().numpy()
         safe, unsafe = np.flatnonzero(values >= self.config.aspiration), np.flatnonzero(
             values < self.config.aspiration)
-        if len(safe) == 0 or (self.config.variant == "RS2" and len(unsafe) == 0):
+        if (len(safe) == 0 or (len(unsafe) == 0 and (
+                self.config.variant == "RS2"
+                or self.config.source_protocol == "advers_2026_camera_ready"))):
             position = int(self._source_rng.choice(len(candidates)))
-            score = (-float("inf") if self.config.variant == "RS2" and len(safe) == 0
-                     else float("inf"))
+            score = (-float("inf") if (
+                (self.config.variant == "RS2" and len(safe) == 0)
+                or (self.config.variant != "RS2" and len(unsafe) == 0)) else float("inf"))
             return candidates[position].clone(), score, candidates[position].clone(), float(values[position])
         if len(unsafe) == 0:
             raise AdveRSInnerSolverError(
@@ -1026,7 +1060,9 @@ class AdveRS(Algorithm):
                 "Use source_protocol='native' for the paper-defined nonnegative fragility.", algorithm=self,
             )
         distances = euclidean_distances(points[safe], points[unsafe],
-                                        squared=self.config.variant != "RS1")
+                                        squared=(self.config.variant == "RS2" or (
+                                            self.config.source_protocol == "advers_2025"
+                                            and self.config.variant == "RSG")))
         if self.config.variant == "RS2":
             scores = np.min(distances, axis=1)
             local = int(np.argmax(scores))
@@ -1318,7 +1354,7 @@ class AdveRS(Algorithm):
         worst_points: list[torch.Tensor] = []
         nominal: list[float] = []
         candidate_iterator: Iterable[torch.Tensor]
-        if self.config.source_protocol == "advers_2025":
+        if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             if dataset_indices is None:
                 raise AdveRSInnerSolverError(
                     "The released AdveRS protocol requires explicit finite candidate rows.", algorithm=self)
@@ -1465,6 +1501,8 @@ class AdveRS(Algorithm):
         evaluated even after an external perturbation.
         """
 
+        if self.config.gp_backend == "fixed_gpy" and "candidate_actions" not in round_info:
+            raise AlgorithmConfigurationError("fixed_gpy requires an explicit finite candidate_actions table.")
         candidates, indices = self._candidate_table(round_info)
         if self.state.y_train.numel() < self.config.initial_points:
             position = 0 if indices is None else int(torch.argmin(indices).item())
@@ -1620,7 +1658,7 @@ class AdveRS(Algorithm):
         return {
             "variant": self.config.variant,
             "source_protocol": self.config.source_protocol,
-            "source_protocol_version": 1 if self.config.source_protocol == "advers_2025" else None,
+            "source_protocol_version": _SOURCE_PROTOCOL_VERSIONS.get(self.config.source_protocol),
             "decision_model": self.config.decision_model,
             "last_optimistic_score": self.state.optimistic_scores[-1]
             if self.state.optimistic_scores
@@ -1655,7 +1693,7 @@ class AdveRS(Algorithm):
             "aspiration": self.config.aspiration,
             "p": self.config.p,
             "source_protocol": self.config.source_protocol,
-            "source_protocol_version": 1 if self.config.source_protocol == "advers_2025" else None,
+            "source_protocol_version": _SOURCE_PROTOCOL_VERSIONS.get(self.config.source_protocol),
             "source_rng": self._source_rng.get_state(),
             "gp": self.gp.state_dict(),
             "state": {name: getattr(self.state, name) for name in self.state.__dataclass_fields__},
@@ -1666,10 +1704,10 @@ class AdveRS(Algorithm):
 
         del strict
         if (state.get("source_protocol", "native") != self.config.source_protocol
-                or (self.config.source_protocol == "advers_2025"
-                    and state.get("source_protocol_version") != 1)):
+                or (self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS
+                    and state.get("source_protocol_version") != _SOURCE_PROTOCOL_VERSIONS[self.config.source_protocol])):
             raise AdveRSCheckpointError("Stored source protocol/version is incompatible.", algorithm=self)
-        if self.config.source_protocol == "advers_2025":
+        if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             validator = RandomStream(0)
             validator.set_state(state.get("source_rng"))
         if (
@@ -1714,8 +1752,9 @@ class AdveRS(Algorithm):
                 self.gp.load_state_dict(dict(state["gp"]))
             else:
                 self.gp.reset()
-            if self.config.source_protocol == "advers_2025":
+            if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
                 self._source_rng.set_state(state["source_rng"])
+            if self.config.source_protocol == "advers_2025":
                 self.invalidate_source_guarantees("basat.advers.released_2025_variance_confidence")
         except Exception as error:
             raise AdveRSCheckpointError(

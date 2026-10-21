@@ -230,7 +230,9 @@ class DistributionalEnvironment(Environment):
         total = probability.sum()
         if not bool(torch.isclose(total, torch.ones_like(total), rtol=0.0, atol=1e-6)):
             raise EnvironmentDataError(f"{name} must sum to one within 1e-6.")
-        return probability / total
+        # A released-code protocol may preserve an already-valid PMF's exact
+        # arithmetic. This is never enabled by ordinary environments.
+        return probability if getattr(self, "_source_exact_probabilities", False) else probability / total
 
     def _resolve_reference_distribution(self) -> torch.Tensor:
         """Resolve the learner-visible reference probability vector."""
@@ -306,6 +308,9 @@ class DistributionalEnvironment(Environment):
             raise EnvironmentProtocolError("Call before_action() before a distributional step().")
         if self.source_mode == "data":
             self._assert_action_available(action)
+        scheduled = getattr(self, "_source_scheduled_evaluation", None)
+        if scheduled is not None:
+            return self._evaluate_source_scheduled(action, **scheduled)
         true_distribution = self._resolve_sampling_distribution(action)
         context_index, context = self._sample_context(true_distribution)
         if self.source_mode == "function":
@@ -353,6 +358,50 @@ class DistributionalEnvironment(Environment):
             metadata={"source_mode": self.source_mode},
             audit=audit,
         )
+
+    def _step_source_scheduled(
+        self, action: Any, *, context_index: int, noise: float,
+        expected_observation: float, plan_digest: str,
+    ) -> dict[str, Any]:
+        """Execute a protocol-owned observation without drawing another random value.
+
+        This private hook is used only by the released RoBOS coordinator. Truth
+        and the scheduling identity are retained in audit data, never feedback.
+        The ordinary environment sampling path is unchanged.
+        """
+        import math
+        if (self.source_mode != "data" or not self.add_noise_to_data
+                or self.noise_fn is not None or self.data_row_selection != "first"
+                or not self.allow_repeated_actions):
+            raise EnvironmentProtocolError("Scheduled distributional observations require a repeatable finite dataset.")
+        if (isinstance(context_index, bool) or not isinstance(context_index, int)
+                or not 0 <= context_index < len(self.context_support)
+                or not math.isfinite(noise) or not math.isfinite(expected_observation)):
+            raise EnvironmentProtocolError("Invalid scheduled distributional observation.")
+        if getattr(self, "_source_scheduled_evaluation", None) is not None:
+            raise EnvironmentProtocolError("A scheduled observation is already active.")
+        self._source_scheduled_evaluation = dict(context_index=context_index, noise=noise,
+            expected_observation=expected_observation, plan_digest=plan_digest)
+        try:
+            return super().step(action)
+        finally:
+            self._source_scheduled_evaluation = None
+
+    def _evaluate_source_scheduled(self, action: torch.Tensor, *, context_index: int,
+                                   noise: float, expected_observation: float,
+                                   plan_digest: str) -> _Evaluation:
+        context = self.context_support[context_index].detach().clone()
+        stored, variance, row = self.lookup_dataset_observation(action=action, context=context)
+        noise_tensor = torch.tensor(noise, dtype=self.dtype, device=self.device)
+        extra = torch.tensor(self.noise_std**2, dtype=self.dtype, device=self.device)
+        variance = extra if variance is None else variance + extra
+        return _Evaluation(action=action, evaluated_action=action, context=context,
+            observation=stored + noise_tensor, observation_noise_variance=variance,
+            dataset_index=row, metadata={"source_mode": "data", "evaluation_protocol": "robos_2023"},
+            audit={"stored_observation": stored, "realized_noise": noise_tensor,
+                "true_sampling_distribution": self._resolve_sampling_distribution(action),
+                "realized_context_index": context_index,
+                "expected_observation": expected_observation, "source_plan_digest": plan_digest})
 
     def _after_step(self) -> None:
         """Clear round-specific public distribution information after evaluation."""

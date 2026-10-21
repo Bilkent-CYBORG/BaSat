@@ -13,6 +13,7 @@ import warnings
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from numbers import Real
 from typing import Any, ClassVar, Literal
 
 import gpytorch
@@ -22,6 +23,7 @@ from sklearn.metrics.pairwise import euclidean_distances
 
 from basat.models.Acquisitions import DiscreteAcquisitionCandidates
 from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
+from basat.models.FixedKernelGaussianProcess import FixedKernelGaussianProcess
 from basat.models.Kernels import KernelConfig
 from basat.models.PolynomialFeatureGaussianProcess import PolynomialFeatureGaussianProcess
 from basat.models.utils import Bounds
@@ -95,6 +97,7 @@ class MultiStartSolver:
 
 RobustInnerSolverSpec = MultiStartSolver
 RobustOuterSolverSpec = MultiStartSolver
+_SOURCE_PROTOCOL_VERSIONS = {"advers_2025": 1, "advers_2026_camera_ready": 2}
 
 
 # Feasibility is certified independently of the optimizer's termination
@@ -187,12 +190,23 @@ class StableOPTConfig:
         uses exact finite polynomial features and QR conditioning. The latter
         requires fixed polynomial parameters, zero mean, unstandardized
         outcomes and ``fit_maxiter=0``; it does not approximate the kernel.
+        ``"fixed_gpy"`` opts into fixed full CPU float64 conditioning with
+        GPy-compatible LAPACK/marginal arithmetic and finite candidates only;
+        it requires explicit ``gp_config`` and ``fit_maxiter=0``.
+    gp_training_regularization:
+        Explicit nonnegative training-only diagonal for ``"fixed_gpy"``,
+        distinct from observation noise and conditional jitter. Other backends
+        require zero.
     source_protocol:
         ``"native"`` retains StableOPT equations. ``"advers_2025"`` reproduces
         the released finite AdveRS RO comparator: center queries, exact random
         optima, initial standard-deviation confidence width, then posterior
         variance width. This is not the published StableOPT guarantee. History
         beyond ``initial_points`` rows is treated as post-feedback state.
+        ``"advers_2026_camera_ready"`` follows revision ``6de58579`` with
+        standard deviation at every round, source MT19937 ties, and the same
+        center-query rule. ``beta`` is the squared confidence multiplier, so
+        source ``beta=1`` corresponds to this ``beta=1``.
     batch_size:
         Requested proposal count. StableOPT version 1 requires ``1``.
     seed:
@@ -213,10 +227,11 @@ class StableOPTConfig:
     fit_maxiter: int = 100
     kernel: KernelConfig = field(default_factory=KernelConfig)
     gp_config: GaussianProcessConfig | None = None
-    gp_backend: Literal["standard", "polynomial_features"] = "standard"
+    gp_backend: Literal["standard", "polynomial_features", "fixed_gpy"] = "standard"
+    gp_training_regularization: float = 0.0
     query_policy: Literal["pessimistic", "center"] = "pessimistic"
     finite_tie_break: Literal["first", "random"] = "first"
-    source_protocol: Literal["native", "advers_2025"] = "native"
+    source_protocol: Literal["native", "advers_2025", "advers_2026_camera_ready"] = "native"
     batch_size: int | None = 1
     q_batch: int | None = None
     seed: int = 1
@@ -288,6 +303,7 @@ class StableOPT(Algorithm):
         **Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS,
         "gp_config": None,
         "gp_backend": "standard",
+        "gp_training_regularization": 0.0,
         "query_policy": "pessimistic",
         "finite_tie_break": "first",
         "source_protocol": "native",
@@ -364,17 +380,17 @@ class StableOPT(Algorithm):
         )
         model_class = (PolynomialFeatureGaussianProcess
                        if config.gp_backend == "polynomial_features" else GaussianProcess)
-        self.gp = model_class(
-            replace(config.gp_config, dtype=self.dtype, device=self.device)
+        gp_config = (replace(config.gp_config, dtype=self.dtype, device=self.device)
             if config.gp_config is not None
             else GaussianProcessConfig(
                 kernel=config.kernel,
                 dtype=self.dtype,
                 device=self.device,
                 fit_method="mle",
-            ),
-            input_dimension=self.action_dimension,
-        )
+            ))
+        self.gp = (FixedKernelGaussianProcess(gp_config, input_dimension=self.action_dimension,
+            conditioning="full", arithmetic="gpy", training_regularization=config.gp_training_regularization)
+            if config.gp_backend == "fixed_gpy" else model_class(gp_config, input_dimension=self.action_dimension))
         self.state = self._empty_state()
         self._posterior_marginal_cache: dict[str, Any] | None = None
         self._recommendation_cache: tuple[torch.Tensor | None, float | None] | None = None
@@ -384,9 +400,10 @@ class StableOPT(Algorithm):
         if config.query_policy == "center":
             self.invalidate_source_guarantees("basat.stableopt.external_center_query")
         self._source_rng = RandomStream(self.seed % 2**32)
-        if config.source_protocol == "advers_2025":
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             if self.dtype != torch.float64 or self.device.type != "cpu":
                 raise AlgorithmConfigurationError("The released AdveRS protocol requires CPU float64.")
+        if config.source_protocol == "advers_2025":
             self.invalidate_source_guarantees("basat.advers.released_2025_variance_confidence")
             warnings.warn(
                 "Basat StableOPT released AdveRS comparator uses center queries and posterior "
@@ -401,23 +418,30 @@ class StableOPT(Algorithm):
 
         if not isinstance(config, StableOPTConfig):
             raise AlgorithmConfigurationError("config must be StableOPTConfig.")
-        if config.source_protocol not in {"native", "advers_2025"}:
+        if config.source_protocol not in {"native", *_SOURCE_PROTOCOL_VERSIONS}:
             raise AlgorithmConfigurationError("Unknown StableOPT source_protocol.")
-        if config.source_protocol == "advers_2025" and (
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS and (
             config.query_policy != "center" or config.distance.norm != "l2"
         ):
             raise AlgorithmConfigurationError(
                 "The released AdveRS RO protocol requires center queries and Euclidean geometry.")
         if config.gp_config is not None and not isinstance(config.gp_config, GaussianProcessConfig):
             raise AlgorithmConfigurationError("gp_config must be GaussianProcessConfig or None.")
-        if config.gp_backend not in {"standard", "polynomial_features"}:
+        if config.gp_backend not in {"standard", "polynomial_features", "fixed_gpy"}:
             raise AlgorithmConfigurationError("Unknown gp_backend.")
+        regularization = config.gp_training_regularization
+        if isinstance(regularization, bool) or not isinstance(regularization, Real) or not math.isfinite(float(regularization)) or regularization < 0:
+            raise AlgorithmConfigurationError("gp_training_regularization must be finite and nonnegative.")
+        if config.gp_backend != "fixed_gpy" and regularization:
+            raise AlgorithmConfigurationError("Explicit GP regularization requires gp_backend='fixed_gpy'.")
+        if config.gp_backend == "fixed_gpy" and (config.fit_maxiter != 0 or config.gp_config is None):
+            raise AlgorithmConfigurationError("fixed_gpy requires explicit gp_config and fit_maxiter=0.")
         if config.gp_backend == "polynomial_features" and config.fit_maxiter != 0:
             raise AlgorithmConfigurationError("Polynomial features require fit_maxiter=0.")
         batch_size, q_batch = resolve_batch_configuration(
             batch_size=config.batch_size, q_batch=config.q_batch
         )
-        if config.source_protocol == "advers_2025" and batch_size != 1:
+        if config.source_protocol in _SOURCE_PROTOCOL_VERSIONS and batch_size != 1:
             raise AlgorithmConfigurationError("The released AdveRS protocol is sequential (batch_size=1).")
         if q_batch is not None and q_batch > 1:
             raise AlgorithmConfigurationError(
@@ -870,7 +894,7 @@ class StableOPT(Algorithm):
         if finite.numel() == 0:
             raise ValueError("No finite objective value is available.")
         target = values[finite].max() if maximize else values[finite].min()
-        if dataset_indices is not None and self.config.source_protocol == "advers_2025":
+        if dataset_indices is not None and self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             tied = finite[values[finite] == target]
             return int(self._source_rng.choice(tied.detach().cpu().numpy()))
         if dataset_indices is not None and self.config.finite_tie_break == "random":
@@ -1282,20 +1306,24 @@ class StableOPT(Algorithm):
 
         The source protocol intentionally uses initial standard deviation then
         variance, according to the number of learner-visible training rows.
+        The camera-ready source protocol always uses standard deviation.
         No benchmark values or adversary's hidden data are accessed.
         """
+        # A restored pending proposal need not call ask() again. Reconstruct
+        # the posterior from saved observations before the external attacker.
+        self._fit_model()
         return self._confidence(torch.as_tensor(points, dtype=self.dtype, device=self.device))
 
     def get_source_random_state(self) -> dict[str, Any]:
         """Return source exact-tie RNG using the public RandomStream JSON contract."""
-        if self.config.source_protocol != "advers_2025":
-            raise AlgorithmConfigurationError("Source RNG requires source_protocol='advers_2025'.")
+        if self.config.source_protocol not in _SOURCE_PROTOCOL_VERSIONS:
+            raise AlgorithmConfigurationError("Source RNG requires a released AdveRS source_protocol.")
         return self._source_rng.get_state()
 
     def set_source_random_state(self, state: Mapping[str, Any]) -> None:
         """Restore or share an MT19937 source tie stream without consuming a draw."""
-        if self.config.source_protocol != "advers_2025":
-            raise AlgorithmConfigurationError("Source RNG requires source_protocol='advers_2025'.")
+        if self.config.source_protocol not in _SOURCE_PROTOCOL_VERSIONS:
+            raise AlgorithmConfigurationError("Source RNG requires a released AdveRS source_protocol.")
         self._source_rng.set_state(dict(state))
 
     def _confidence_gradient(
@@ -1567,7 +1595,7 @@ class StableOPT(Algorithm):
         """
 
         centers = candidates
-        if self.config.source_protocol == "advers_2025" and (
+        if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS and (
             candidates is None or dataset_indices is None
         ):
             raise StableOPTOuterSolverError(
@@ -1592,7 +1620,7 @@ class StableOPT(Algorithm):
             ucb, _ = self._confidence(candidates)
             cached = getattr(self, "_finite_neighborhood_cache", None)
             if cached is None or not torch.equal(candidates, cached[0]):
-                if self.config.source_protocol == "advers_2025":
+                if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
                     squared = euclidean_distances(candidates.detach().numpy(), squared=True)
                     feasible = torch.as_tensor(squared <= self.config.perturbation_radius**2)
                 else:
@@ -1826,6 +1854,8 @@ class StableOPT(Algorithm):
         transactionally without recomputing the decision.
         """
 
+        if self.config.gp_backend == "fixed_gpy" and "candidate_actions" not in round_info:
+            raise AlgorithmConfigurationError("fixed_gpy requires an explicit finite candidate_actions table.")
         if self.state.y_train.numel() < self.config.initial_points:
             query, _ = self._initial_action(round_info)
             center = query.detach().clone()
@@ -1975,7 +2005,7 @@ class StableOPT(Algorithm):
         return {
             "robust_centers": len(self.state.robust_centers),
             "source_protocol": self.config.source_protocol,
-            "source_protocol_version": 1 if self.config.source_protocol == "advers_2025" else None,
+            "source_protocol_version": _SOURCE_PROTOCOL_VERSIONS.get(self.config.source_protocol),
             "last_robust_ucb": self.state.robust_ucb_values[-1]
             if self.state.robust_ucb_values
             else None,
@@ -2007,11 +2037,11 @@ class StableOPT(Algorithm):
     def _state_dict_impl(self) -> Mapping[str, Any]:
         """Serialize mutable proposal, observation, and audit progress."""
 
-        return {
+        result = {
             "perturbation_radius": self.config.perturbation_radius,
             "distance_norm": self.config.distance.norm,
             "source_protocol": self.config.source_protocol,
-            "source_protocol_version": 1 if self.config.source_protocol == "advers_2025" else None,
+            "source_protocol_version": _SOURCE_PROTOCOL_VERSIONS.get(self.config.source_protocol),
             "source_rng": self._source_rng.get_state(),
             "state": {
                 "X_query_train": self.state.X_query_train,
@@ -2026,16 +2056,19 @@ class StableOPT(Algorithm):
                 "robust_lcb_values": self.state.robust_lcb_values,
             },
         }
+        if self.config.gp_backend == "fixed_gpy":
+            result["gp"] = self.gp.state_dict()
+        return result
 
     def _validate_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
         """Validate checkpoint geometry and required StableOPT state sections."""
 
         del strict
         if (state.get("source_protocol", "native") != self.config.source_protocol
-                or (self.config.source_protocol == "advers_2025"
-                    and state.get("source_protocol_version") != 1)):
+                or (self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS
+                    and state.get("source_protocol_version") != _SOURCE_PROTOCOL_VERSIONS[self.config.source_protocol])):
             raise StableOPTCheckpointError("Stored source protocol/version is incompatible.", algorithm=self)
-        if self.config.source_protocol == "advers_2025":
+        if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
             validator = RandomStream(0)
             validator.set_state(state.get("source_rng"))
         if (
@@ -2047,6 +2080,8 @@ class StableOPT(Algorithm):
             )
         if not isinstance(state.get("state"), Mapping):
             raise StableOPTCheckpointError("StableOPT state is incomplete.", algorithm=self)
+        if self.config.gp_backend == "fixed_gpy" and not isinstance(state.get("gp"), Mapping):
+            raise StableOPTCheckpointError("The fixed_gpy checkpoint has no fixed GP state.", algorithm=self)
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
         """Restore validated traces and reset the GP for a fresh fit."""
@@ -2085,13 +2120,17 @@ class StableOPT(Algorithm):
                 robust_ucb_values=[float(x) for x in raw["robust_ucb_values"]],
                 robust_lcb_values=[float(x) for x in raw["robust_lcb_values"]],
             )
-            self.gp.reset()
+            if self.config.gp_backend == "fixed_gpy":
+                self.gp.load_state_dict(dict(state["gp"]))
+            else:
+                self.gp.reset()
             self._posterior_marginal_cache = None
             self._recommendation_cache = None
             self._inner_unit_design_cache = None
             self._last_outer_pruning_certificate = {}
-            if self.config.source_protocol == "advers_2025":
+            if self.config.source_protocol in _SOURCE_PROTOCOL_VERSIONS:
                 self._source_rng.set_state(state["source_rng"])
+            if self.config.source_protocol == "advers_2025":
                 self.invalidate_source_guarantees("basat.advers.released_2025_variance_confidence")
         except Exception as error:
             raise StableOPTCheckpointError(

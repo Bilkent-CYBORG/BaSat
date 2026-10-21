@@ -1,145 +1,92 @@
-"""Adaptive Group Variable Selection (AG-VS).
+"""AG-VS following the AISTATS 2027 anonymous reference implementation.
 
-This implementation follows the local AG-VS manuscript's index-based tree
-state. Node training data and score records are separate global-index sets;
-inactive coordinates are filled from the best stored-posterior point before
-each acquisition batch. In particular, Eq. (8) is an unscaled mean absolute
-posterior gap--it is not a percentage and has no denominator normalization.
+Observed responses govern scores, inactive-coordinate completion and restart
+patience. Fitted posterior records are kept separately for recommendation.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field, replace
-from typing import Any, ClassVar, Literal
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields, replace
+from typing import Any, Literal
 
+import numpy as np
 import torch
 
-from basat.environments.environment import EnvironmentData
-from basat.models.Acquisitions import (
-    AcquisitionConfig,
-    DiscreteAcquisitionCandidates,
-    build_acquisition,
-    optimize_acquisition_continuous,
-    optimize_acquisition_discrete,
-)
-from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
-from basat.models.Kernels import KernelConfig
-from basat.models.utils import Bounds, normalize
+from basat.models.Acquisitions import AcquisitionConfig, DiscreteAcquisitionCandidates
+from basat.models.utils import Bounds
 
 from ..algorithm import Algorithm, resolve_batch_configuration
-from ..helper import ExceptionDiagnosticIssue, SourceRecord, to_quality
+from ..helper import SourceRecord, to_quality
+from ._agvs_source import SourceBOGP, classical_ei, latin_hypercube, propose_bo
+from ._agvs_turbo import (
+    SourceTurboGP,
+    TurboProposalState,
+    propose_turbo,
+    update_turbo,
+)
 from .Exception.exception_AG_VS import (
     AG_VSException,
     AGVSAnchorError,
     AGVSCheckpointError,
     AGVSDataCompatibilityError,
-    AGVSMergeError,
     AGVSNodeError,
-    AGVSSplitError,
 )
-from .TuRBO import TuRBO, TuRBOConfig
+from .TuRBO import TuRBOConfig
 
 
 @dataclass(frozen=True, slots=True)
 class AG_VSConfig:
-    """Configuration for the AG-VS procedure in the local manuscript.
+    """Reference AG-VS settings, with Basat's independent/joint batch controls.
 
-    ``batch_size`` is the manuscript batch size ``B`` and independently ranks
-    points with the configured acquisition. ``q_batch`` is Basat's optional
-    joint-acquisition extension (for example EI becomes qEI). Exactly one is
-    active; the default is sequential ``batch_size=1, q_batch=None``.
+    Supply ``effective_dimension < split_groups <= D``. An omitted
+    ``initial_points`` resolves to ``max(2 * split_groups, D + 1)``; an omitted
+    ``stagnation_patience`` resolves to ``3 * split_groups``. Set
+    ``stagnation_enabled=False`` to disable restarts. ``paper`` initialization
+    is one complete Latin hypercube served through successive asks.
 
-    Parameters
-    ----------
-    effective_dimension:
-        Target retained coordinate count ``d_eff``.
-    sequence_length, split_groups, initial_points:
-        Acquisition batches per visit, maximum split groups, and initial
-        full-coordinate design size.
-    initial_points_sampling_method:
-        ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
-    acquisition:
-        EI or UCB acquisition used by ``inner_optimizer="bo"``. TuRBO uses
-        joint predictive Thompson draws from its separate proposal GP.
-    inner_optimizer, inner_turbo_config:
-        ``"bo"`` preserves the original node-GP acquisition. ``"turbo"``
-        maintains one independent TuRBO proposal optimizer per leaf; its GP
-        does not replace the AG-VS scoring GP. The optional TuRBO configuration
-        controls GP training, candidate generation and trust-region settings.
-        It must use TS, the same ordinary batch size as AG-VS, ``q_batch=None``
-        and ``initial_points=batch_size``. A collapsed trust region therefore
-        uses one ordinary full restart batch inside the existing visit budget,
-        not extra initialization on every visit: AG-VS owns the global design
-        and visit budget. If omitted, the default uses ``best_observation``
-        as its trust-region center and all other TuRBO default settings.
-        Each leaf uses the configured inner seed (or outer seed) plus its
-        stable node ID. New coordinate sets get fresh proposal state.
-        Finite candidate tables must have unique projections onto the current
-        active coordinates so returned TuRBO points identify full rows uniquely.
-    stopping_threshold, stopping_delta:
-        Optional ``tau`` and ``delta_stop`` parameters for Eq. (9).
-    stagnation_patience:
-        Optional ``N_bad`` complete-visit count; ``None`` disables reinitialization.
-    gp_fit_method, gp_maxiter:
-        Node-local isotropic Matérn-5/2 GP fit method and optimizer budget.
-    acquisition_restarts, acquisition_raw_samples:
-        Continuous acquisition optimizer budgets.
-    batch_size, q_batch:
-        Mutually exclusive independent and joint batch controls.
-    seed:
-        Non-negative algorithm-owned random seed.
+    The reference BO uses EI with xi=1e-4 on 1024 scrambled Sobol candidates.
+    ``gp_maxiter=None`` preserves sklearn's optimizer budget; for TuRBO it
+    resolves to 50 training steps. Legacy continuous-acquisition budget fields
+    remain accepted for configuration compatibility but do not affect this
+    finite-candidate reference acquisition. Posterior stopping is disabled in
+    the supplied source, so active stopping configurations are rejected.
     """
 
     effective_dimension: int
-    sequence_length: int = 3
-    split_groups: int = 2
-    initial_points: int = 5
+    split_groups: int | None = None
+    sequence_length: int = 2
+    initial_points: int | None = None
     initial_points_sampling_method: Literal["paper", "sobol", "uniform"] = "paper"
-    acquisition: AcquisitionConfig = field(default_factory=lambda: AcquisitionConfig(name="UCB"))
+    acquisition: AcquisitionConfig = field(
+        default_factory=lambda: AcquisitionConfig(name="EI", xi=1e-4, mc_samples=256)
+    )
     inner_optimizer: Literal["bo", "turbo"] = "bo"
     inner_turbo_config: TuRBOConfig | None = None
+    noise_variance: float = 1e-4
+    learn_noise: bool = False
+    abs_mode: bool = True
+    stagnation_patience: int | None = None
+    stagnation_enabled: bool = True
+    merge_enabled: bool = True
+    turbo_max_evals: int = 50
+    turbo_min_cuda: int = 1024
     stopping_threshold: float | None = None
     stopping_delta: float | None = None
-    stagnation_patience: int | None = None
     gp_fit_method: Literal["mle", "map"] = "mle"
-    gp_maxiter: int = 50
+    gp_maxiter: int | None = None
     acquisition_restarts: int = 10
-    acquisition_raw_samples: int = 128
-    batch_size: int | None = 1
+    acquisition_raw_samples: int = 1024
+    batch_size: int | None = 3
     q_batch: int | None = None
     seed: int = 1
 
 
 @dataclass(slots=True)
 class AGVSNode:
-    """One coordinate-subset node in the AG-VS tree.
-
-    ``training_rows`` is :math:`V_N`; ``score_history_rows`` is
-    :math:`I_N`. ``posterior_mean_history`` and
-    ``previous_benchmark_history`` are immutable records made when score rows
-    were acquired. The current GP is queried afresh when Eq. (8) is updated.
-
-    Attributes
-    ----------
-    node_id, depth, parent_id, child_ids:
-        Stable tree identity and adjacency.
-    active_indices, anchor:
-        Active coordinates and the most recent pre-batch completion point.
-    training_rows, local_X, local_y, model:
-        Global ``V_N`` indices and their fitted node-local GP representation.
-    score_history_rows, posterior_mean_history, posterior_std_history:
-        Global ``I_N`` indices and immutable fitted records from their batches.
-    previous_benchmark_history:
-        Immutable pre-batch references ``M_i^-`` aligned with ``I_N``.
-    score, score_mass, pre_split_score, pre_split_mass:
-        Current and frozen evidence-weighted score state.
-    excluded, merge_disabled, cohort_evaluated, newly_retained:
-        Algorithm 6 transition flags.
-    archived, merge_completed:
-        Replacement and one-merge-only bookkeeping flags.
-    """
+    """Coordinate group with separate training and historical score indices."""
 
     node_id: int
     depth: int
@@ -150,7 +97,7 @@ class AGVSNode:
     training_rows: list[int]
     local_X: torch.Tensor
     local_y: torch.Tensor
-    model: GaussianProcess | None
+    model: Any
     score_history_rows: list[int]
     posterior_mean_history: list[float]
     posterior_std_history: list[float]
@@ -165,34 +112,15 @@ class AGVSNode:
     newly_retained: bool
     archived: bool
     merge_completed: bool
-    proposal_optimizer: TuRBO | None = None
+    retained_merged: bool = False
+    fitted_rows: tuple[int, ...] | None = None
+    proposal_optimizer: Any = None
+    warm_model_state: Any = None
 
 
 @dataclass(slots=True)
 class AGVSState:
-    """Index-based AG-VS observations and search progress for continuation.
-
-    Attributes
-    ----------
-    nodes, active_leaf_ids, root_id:
-        Current coordinate tree and active frontier.
-    global_actions, global_observations:
-        Preserved full raw history indexed globally.
-    global_posterior_means, global_posterior_stds:
-        Immutable fitted posterior records aligned with the raw history.
-    benchmark_actions, benchmark_means:
-        Best stored-posterior point and value after each processed batch.
-    current_leaf_id, current_path, remaining_sequence_steps:
-        Frozen traversal and remaining batches in the active visit.
-    visit_start_best, visit_evaluations:
-        Stagnation reference and evaluation count for the active visit.
-    next_node_id, batch_count, bad_visits:
-        Stable identity, global batch, and stagnation counters.
-    tree_epoch, restart_count:
-        Data-preserving reinitialization counters.
-    stopped, stopping_probability, stopping_action, stopping_mean:
-        Eq. (9) stopping state and returned fitted point.
-    """
+    """Tree, immutable observations and the frozen in-progress visit."""
 
     nodes: dict[int, AGVSNode]
     active_leaf_ids: list[int]
@@ -213,1081 +141,637 @@ class AGVSState:
     bad_visits: int
     tree_epoch: int
     restart_count: int
-    stopped: bool
-    stopping_probability: float | None
-    stopping_action: torch.Tensor | None
-    stopping_mean: float | None
+    stopped: bool = False
+    stopping_probability: float | None = None
+    stopping_action: torch.Tensor | None = None
+    stopping_mean: float | None = None
 
 
 class AG_VS(Algorithm):
-    """Tree-structured adaptive group variable selection from the manuscript.
-
-    Examples
-    --------
-    >>> import basat
-    >>> bounds = basat.Bounds(lower=[-1.0] * 6, upper=[1.0] * 6)
-    >>> algorithm = basat.AG_VS(
-    ...     bounds=bounds,
-    ...     config=basat.AG_VSConfig(effective_dimension=2, initial_points=5, seed=7),
-    ... )
-    """
-
-    ACQUISITION_POLICY = "active-group BO acquisition or persistent leaf TuRBO predictive TS"
-    CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = {
-        **Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS,
-        "inner_optimizer": "bo",
-        "inner_turbo_config": None,
-    }
+    """Adaptive group variable selection using the released source logic."""
 
     EXCEPTION_CLASS = AG_VSException
     native_batching = True
     native_environments = frozenset({"stochastic"})
+    ACQUISITION_POLICY = "reference EI candidate ranking or isotropic TuRBO predictive TS"
+    SOURCE_BEHAVIOR_VERSION = "aistats2027-observed-v1"
+    SOURCE_TURBO_NUMERICS_VERSION = 3
     SOURCE = SourceRecord(
         paper_title="Adaptive Group Variable Selection for High-Dimensional Bayesian Optimization",
         paper_year=2027,
         paper_url=None,
         repository_url=None,
         repository_status="local",
-        notes="Implementation governed by the local AG-VS manuscript.",
+        notes="Aligned with AISTATS2027_Anonymous_Code.zip, including observed-response scores.",
     )
 
     def __init__(
-        self,
-        *,
-        bounds: Bounds,
-        config: AG_VSConfig,
-        maximize: bool = True,
-        dtype: torch.dtype | str = torch.float64,
-        device: torch.device | str = "cpu",
-        plot: bool = False,
-        verbose: bool = False,
-        verbose_setting: bool = False,
+        self, *, bounds: Bounds, config: AG_VSConfig, maximize: bool = True,
+        dtype: torch.dtype | str = torch.float64, device: torch.device | str = "cpu",
+        plot: bool = False, verbose: bool = False, verbose_setting: bool = False,
         verbose_iter_by_iter: bool = False,
     ) -> None:
-        """Initialize a full-coordinate retained root and empty global history."""
-
-        self.config = config
         self._validate_config(bounds, config)
+        if config.inner_optimizer == "turbo" and torch.device(device).type not in {"cpu", "cuda"}:
+            raise AGVSNodeError("The source AG-VS TuRBO backend supports CPU or CUDA devices.")
+        self.config = replace(
+            config,
+            initial_points=(config.initial_points if config.initial_points is not None
+                            else max(2 * config.split_groups, bounds.dimension + 1)),
+            stagnation_patience=(config.stagnation_patience if config.stagnation_patience is not None
+                                 else 3 * config.split_groups),
+        )
         super().__init__(
-            bounds=bounds,
-            batch_size=config.batch_size,
-            q_batch=config.q_batch,
-            maximize=maximize,
-            dtype=dtype,
-            device=device,
-            seed=config.seed,
+            bounds=bounds, batch_size=config.batch_size, q_batch=config.q_batch,
+            maximize=maximize, dtype=dtype, device=device, seed=config.seed,
             initial_points_sampling_method=config.initial_points_sampling_method,
-            plot=plot,
-            verbose=verbose,
-            verbose_setting=verbose_setting,
+            plot=plot, verbose=verbose, verbose_setting=verbose_setting,
             verbose_iter_by_iter=verbose_iter_by_iter,
         )
-        if self.q_batch is not None and self.q_batch > 1:
-            self.invalidate_source_guarantees("basat.joint_q_acquisition")
-        if self.config.inner_optimizer == "turbo":
-            self.invalidate_source_guarantees("agvs.turbo_inner_optimizer_extension")
-        self.state = self._fresh_state()
+        self._reset_impl()
 
     @staticmethod
     def _validate_config(bounds: Bounds, config: AG_VSConfig) -> None:
-        """Validate dimensions, batching, GP budgets, stopping, and restarts."""
-
         try:
             resolve_batch_configuration(batch_size=config.batch_size, q_batch=config.q_batch)
         except ValueError as error:
             raise AGVSNodeError(str(error)) from error
-        if config.inner_optimizer not in {"bo", "turbo"}:
-            raise AGVSNodeError("inner_optimizer must be 'bo' or 'turbo'.")
-        if config.inner_optimizer == "bo" and config.inner_turbo_config is not None:
-            raise AGVSNodeError("inner_turbo_config applies only to inner_optimizer='turbo'.")
-        if config.inner_optimizer == "turbo":
-            if config.q_batch is not None:
-                raise AGVSNodeError("AG-VS TuRBO uses ordinary batch_size; q_batch must be None.")
-            inner = config.inner_turbo_config
-            if inner is not None:
-                if not isinstance(inner, TuRBOConfig):
-                    raise AGVSNodeError("inner_turbo_config must be a TuRBOConfig or None.")
-                if (
-                    inner.batch_size != config.batch_size
-                    or inner.q_batch is not None
-                    or inner.acquisition != "TS"
-                    or inner.initial_points != config.batch_size
-                ):
-                    raise AGVSNodeError(
-                        "inner_turbo_config requires matching batch_size, q_batch=None, "
-                        "acquisition='TS' and initial_points=batch_size; "
-                        "AG-VS owns the global initialization and visit budget."
-                    )
-                TuRBO._validate_config(inner, bounds.dimension)
-        if (
-            isinstance(config.effective_dimension, bool)
-            or not isinstance(config.effective_dimension, int)
-            or not 1 <= config.effective_dimension <= bounds.dimension
-        ):
-            raise AGVSNodeError("effective_dimension must lie in [1, D_env].")
         for name, value, minimum in (
-            ("sequence_length", config.sequence_length, 1),
+            ("effective_dimension", config.effective_dimension, 1),
             ("split_groups", config.split_groups, 2),
-            ("initial_points", config.initial_points, 1),
-            ("gp_maxiter", config.gp_maxiter, 1),
-            ("acquisition_restarts", config.acquisition_restarts, 1),
-            ("acquisition_raw_samples", config.acquisition_raw_samples, 1),
+            ("sequence_length", config.sequence_length, 1),
             ("seed", config.seed, 0),
+            ("turbo_max_evals", config.turbo_max_evals, 2),
+            ("turbo_min_cuda", config.turbo_min_cuda, 0),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-                raise AGVSNodeError(f"{name} must be an integer >= {minimum}.")
-        if config.stagnation_patience is not None and (
-            isinstance(config.stagnation_patience, bool)
-            or not isinstance(config.stagnation_patience, int)
-            or config.stagnation_patience < 1
-        ):
-            raise AGVSNodeError("stagnation_patience must be None or a positive integer.")
-        if config.gp_fit_method not in {"mle", "map"}:
-            raise AGVSNodeError("gp_fit_method must be 'mle' or 'map'.")
-        stopping_enabled = (
-            config.stopping_threshold is not None or config.stopping_delta is not None
-        )
-        if stopping_enabled and (
-            config.stopping_threshold is None
-            or config.stopping_delta is None
-            or not math.isfinite(config.stopping_threshold)
-            or not 0 < config.stopping_delta < 1
-        ):
+                raise AGVSNodeError(f"{name} must be an explicitly supplied integer >= {minimum}.")
+        if not config.effective_dimension < config.split_groups <= bounds.dimension:
+            raise AGVSNodeError("Require effective_dimension < split_groups <= D_env.")
+        if config.effective_dimension >= bounds.dimension:
+            raise AGVSNodeError("effective_dimension must be smaller than D_env.")
+        for name in ("initial_points", "stagnation_patience", "gp_maxiter"):
+            value = getattr(config, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise AGVSNodeError(f"{name} must be None or a positive integer.")
+        if config.inner_optimizer not in {"bo", "turbo"}:
+            raise AGVSNodeError("inner_optimizer must be 'bo' or 'turbo'.")
+        if config.inner_turbo_config is not None:
             raise AGVSNodeError(
-                "stopping_threshold and stopping_delta in (0, 1) are required together."
+                "inner_turbo_config uses incompatible standalone TuRBO semantics; "
+                "use AG-VS noise_variance, learn_noise, gp_maxiter and turbo_max_evals."
             )
+        if config.acquisition.name.upper() != "EI" or config.acquisition.xi != 1e-4:
+            raise AGVSNodeError("Source AG-VS requires EI with xi=1e-4.")
+        if config.gp_fit_method != "mle":
+            raise AGVSNodeError("Source AG-VS requires marginal-likelihood GP fitting.")
+        if config.stopping_threshold is not None or config.stopping_delta is not None:
+            raise AGVSNodeError("Posterior stopping is disabled in the supplied AG-VS source.")
+        if not math.isfinite(config.noise_variance) or config.noise_variance < 0:
+            raise AGVSNodeError("noise_variance must be finite and non-negative.")
+        for name in ("abs_mode", "learn_noise", "stagnation_enabled", "merge_enabled"):
+            if not isinstance(getattr(config, name), bool):
+                raise AGVSNodeError(f"{name} must be a boolean.")
+        batch = config.batch_size if config.batch_size is not None else config.q_batch
+        if config.turbo_max_evals <= batch:
+            raise AGVSNodeError("turbo_max_evals must exceed the configured point batch size.")
 
-    def _configuration_diagnostic_issues(
-        self, environment: Any
-    ) -> tuple[ExceptionDiagnosticIssue, ...]:
-        """Qualify the optional joint-q extension while accepting paper batch size B."""
-
-        del environment
-        if self.q_batch is None or self.q_batch <= 1:
-            return ()
-        return (
-            ExceptionDiagnosticIssue(
-                severity="warning",
-                code="batch.joint_q_extension",
-                message=(
-                    "AG-VS q_batch uses Basat's joint q-acquisition extension; "
-                    "the manuscript specifies a generic batch acquisition routine."
-                ),
-                details={"q_batch": self.q_batch, "affects_source_guarantees": True},
-            ),
-        )
-
-    def _empty_node(
-        self,
-        *,
-        node_id: int,
-        depth: int,
-        parent_id: int | None,
-        active_indices: torch.Tensor,
-        anchor: torch.Tensor | None = None,
-        training_rows: list[int] | None = None,
-        excluded: bool = False,
-        merge_disabled: bool = False,
-        newly_retained: bool = False,
-    ) -> AGVSNode:
-        """Create an unfitted node with manuscript ``+inf`` first-visit priority."""
-
-        active = torch.as_tensor(active_indices, dtype=torch.long, device=self.device).reshape(-1)
-        if (
-            active.numel() == 0
-            or torch.unique(active).numel() != active.numel()
-            or (active < 0).any()
-            or (active >= self.action_dimension).any()
-        ):
-            raise AGVSNodeError("A node must contain unique in-range active coordinates.")
-        dimension = int(active.numel())
-        return AGVSNode(
-            node_id=node_id,
-            depth=depth,
-            parent_id=parent_id,
-            child_ids=[],
-            active_indices=active.detach().clone(),
-            anchor=None if anchor is None else anchor.detach().clone(),
-            training_rows=list(training_rows or []),
-            local_X=torch.empty((0, dimension), dtype=self.dtype, device=self.device),
-            local_y=torch.empty((0,), dtype=self.dtype, device=self.device),
-            model=None,
-            score_history_rows=[],
-            posterior_mean_history=[],
-            posterior_std_history=[],
-            previous_benchmark_history=[],
-            score=float("inf"),
-            score_mass=0,
-            pre_split_score=None,
-            pre_split_mass=0,
-            excluded=excluded,
-            merge_disabled=merge_disabled,
-            cohort_evaluated=False,
-            newly_retained=newly_retained,
-            archived=False,
-            merge_completed=False,
-        )
-
-    def _fresh_state(self) -> AGVSState:
-        """Create the initially retained full-dimensional root."""
-
-        root_indices = torch.arange(self.action_dimension, dtype=torch.long, device=self.device)
-        root = self._empty_node(
-            node_id=0,
-            depth=0,
-            parent_id=None,
-            active_indices=root_indices,
-            newly_retained=True,
-        )
-        return AGVSState(
-            nodes={0: root},
-            active_leaf_ids=[0],
-            root_id=0,
-            global_actions=torch.empty(
-                (0, self.action_dimension), dtype=self.dtype, device=self.device
-            ),
-            global_observations=torch.empty((0,), dtype=self.dtype, device=self.device),
-            global_posterior_means=torch.empty((0,), dtype=self.dtype, device=self.device),
-            global_posterior_stds=torch.empty((0,), dtype=self.dtype, device=self.device),
-            benchmark_actions=torch.empty(
-                (0, self.action_dimension), dtype=self.dtype, device=self.device
-            ),
-            benchmark_means=torch.empty((0,), dtype=self.dtype, device=self.device),
-            current_leaf_id=None,
-            current_path=[],
-            remaining_sequence_steps=0,
-            visit_start_best=None,
-            visit_evaluations=0,
-            next_node_id=1,
-            batch_count=0,
-            bad_visits=0,
-            tree_epoch=0,
-            restart_count=0,
-            stopped=False,
-            stopping_probability=None,
-            stopping_action=None,
-            stopping_mean=None,
-        )
-
-    def _initialize_from_environment_impl(self, data: Any) -> None:
-        """Create the retained root from learner-visible historical observations."""
-
-        evaluated_actions = getattr(data, "evaluated_actions", None)
-        action_source = data.actions if evaluated_actions is None else evaluated_actions
-        actions = torch.as_tensor(action_source, dtype=self.dtype, device=self.device).clone()
-        observations = (
-            torch.as_tensor(data.observations, dtype=self.dtype, device=self.device)
-            .reshape(-1)
-            .clone()
-        )
-        self.state.global_actions = actions
-        self.state.global_observations = observations
-        root = self.state.nodes[self.state.root_id]
-        root.training_rows = list(range(actions.shape[0]))
-        if actions.shape[0] == 0:
-            return
-        self._fit_node_gp(root)
-        means, stds = self._predict_node(root, actions)
-        self.state.global_posterior_means = means
-        self.state.global_posterior_stds = stds
-        self._append_current_benchmark()
-
-    @staticmethod
-    def _node_kernel() -> KernelConfig:
-        """Return the reference isotropic Matérn-5/2 covariance configuration."""
-
-        return KernelConfig(
-            name="matern52",
-            ard_num_dims=None,
-            active_dims=None,
-            use_outputscale=True,
-        )
-
-    def _new_node_gp(self, dimension: int) -> GaussianProcess:
-        """Construct an unfitted GP in a node's active coordinate system."""
-
-        return GaussianProcess(
-            GaussianProcessConfig(
-                kernel=self._node_kernel(),
-                mean="zero",
-                noise_mode="fixed",
-                noise_variance=0.01,
-                fit_method=self.config.gp_fit_method,
-                dtype=self.dtype,
-                device=self.device,
-            ),
-            input_dimension=dimension,
-        )
-
-    def _fit_node_gp(self, node: AGVSNode) -> None:
-        """Fit ``G_N`` on the indexed rows in ``V_N``, projected to ``A_N``."""
-
-        if not node.training_rows:
-            node.local_X = torch.empty(
-                (0, node.active_indices.numel()), dtype=self.dtype, device=self.device
-            )
-            node.local_y = torch.empty((0,), dtype=self.dtype, device=self.device)
-            node.model = None
-            return
-        rows = torch.as_tensor(node.training_rows, dtype=torch.long, device=self.device)
-        if (rows < 0).any() or (rows >= self.state.global_actions.shape[0]).any():
-            raise AGVSNodeError(f"Node {node.node_id} contains an invalid training index.")
-        node.local_X = self.state.global_actions[rows][:, node.active_indices].clone()
-        node.local_y = to_quality(
-            self.state.global_observations[rows], maximize=self.maximize
-        ).clone()
-        gp = self._new_node_gp(int(node.active_indices.numel()))
-        try:
-            gp.set_data(node.local_X, node.local_y)
-            if gp.model is not None:
-                covariance = getattr(gp.model, "covar_module", None)
-                if covariance is not None:
-                    base = getattr(covariance, "base_kernel", covariance)
-                    if hasattr(base, "lengthscale"):
-                        base.initialize(lengthscale=1.0)
-                    if hasattr(covariance, "outputscale"):
-                        covariance.initialize(outputscale=1.0)
-            gp.fit(maxiter=self.config.gp_maxiter)
-        except Exception as error:
-            raise AGVSNodeError(f"Node {node.node_id} GP fitting failed: {error}") from error
-        node.model = gp
-
-    def _new_proposal_optimizer(self, node: AGVSNode) -> TuRBO:
-        """Construct a leaf-owned proposer without objective or scoring-GP access."""
-
-        configured = self.config.inner_turbo_config
-        if configured is None:
-            configured = TuRBOConfig(
-                batch_size=self.batch_size,
-                q_batch=None,
-                initial_points=self.batch_size,
-                acquisition="TS",
-                noisy_center="best_observation",
-                seed=self.seed,
-            )
-        configured = replace(configured, seed=configured.seed + node.node_id)
-        lower, upper = self._bounds_on_algorithm_device()
-        optimizer = TuRBO(
-            bounds=Bounds(lower[node.active_indices], upper[node.active_indices]),
-            config=configured,
-            maximize=self.maximize,
-            dtype=self.dtype,
-            device=self.device,
-            plot=False,
-            verbose=False,
-        )
-        optimizer.configure_sampling_methods(
-            initial=configured.initial_points_sampling_method,
-            acquisition=self.acquisition_sampling_method,
-        )
-        return optimizer
-
-    def _leaf_proposal_optimizer(self, node: AGVSNode) -> TuRBO:
-        """Reuse one proposer across visits, initializing only a new coordinate set."""
-
-        if node.proposal_optimizer is None:
-            optimizer = self._new_proposal_optimizer(node)
-            rows = torch.as_tensor(node.training_rows, dtype=torch.long, device=self.device)
-            optimizer.initialize_from_environment(
-                EnvironmentData(
-                    actions=self.state.global_actions[rows][:, node.active_indices],
-                    observations=self.state.global_observations[rows],
-                )
-            )
-            node.proposal_optimizer = optimizer
-        return node.proposal_optimizer
-
-    def _select_turbo_points(
-        self,
-        node: AGVSNode,
-        round_info: Mapping[str, Any],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float | None]:
-        """Ask the separate leaf GP for joint predictive Thompson proposals."""
-
-        inner_info: dict[str, Any] = {}
-        actions = indices = None
-        if "candidate_actions" in round_info:
-            actions = torch.as_tensor(
-                round_info["candidate_actions"], dtype=self.dtype, device=self.device
-            )
-            indices = torch.as_tensor(
-                round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device
-            )
-            projected = actions[:, node.active_indices]
-            if torch.unique(projected, dim=0).shape[0] != projected.shape[0]:
-                raise AGVSDataCompatibilityError(
-                    "AG-VS TuRBO finite candidates must have unique active-coordinate projections."
-                )
-            inner_info = {"candidate_actions": projected, "candidate_dataset_indices": indices}
-        optimizer = self._leaf_proposal_optimizer(node)
-        active = optimizer.ask(round_info=inner_info).reshape(self.request_size, -1)
-        if actions is None or indices is None:
-            return self._fill_active_coordinates(node, active), active, None, None
-        matches = (actions[:, node.active_indices][None, :, :] == active[:, None, :]).all(dim=-1)
-        if not bool((matches.sum(dim=1) == 1).all()):
-            raise AGVSDataCompatibilityError("Inner TuRBO selected an unidentifiable finite row.")
-        positions = matches.long().argmax(dim=1)
-        return actions[positions], active, indices[positions], None
+    @property
+    def request_size(self) -> int:
+        """Serve an exact initialization remainder and keep pending shapes stable."""
+        pending = getattr(self, "last_ask", None)
+        if pending is not None:
+            return pending.batch_size
+        loading = getattr(self, "_loading_request_size", None)
+        if loading is not None:
+            return loading
+        requested = super().request_size
+        state = getattr(self, "state", None)
+        if state is not None and state.global_actions.shape[0] < self.config.initial_points:
+            requested = min(requested, self.config.initial_points - state.global_actions.shape[0])
+        return requested
 
     @property
     def source_iteration_complete(self) -> bool:
-        """Whether the global initial design or an entire AG-VS visit is finished.
-
-        A pending batch is never a boundary. During a visit all ``sequence_length``
-        ordinary batches must finish; a fresh, unstarted algorithm is also at
-        a boundary so a zero-budget experiment does not request initialization.
-        """
-
         count = self.state.global_actions.shape[0]
-        return (
-            self.last_ask is None
-            and self.state.current_leaf_id is None
-            and (count == 0 or count >= self.config.initial_points)
+        return (self.last_ask is None and self.state.current_leaf_id is None
+                and (count == 0 or count >= self.config.initial_points))
+
+    def _empty_node(
+        self, *, node_id: int, depth: int, parent_id: int | None,
+        active_indices: torch.Tensor, anchor: torch.Tensor | None = None,
+        training_rows: list[int] | None = None, excluded: bool = False,
+        merge_disabled: bool = False, newly_retained: bool = False,
+    ) -> AGVSNode:
+        active = torch.as_tensor(active_indices, dtype=torch.long, device=self.device).reshape(-1)
+        if (not active.numel() or active.unique().numel() != active.numel()
+                or bool((active < 0).any()) or bool((active >= self.action_dimension).any())):
+            raise AGVSNodeError("Node coordinates must be unique and in range.")
+        return AGVSNode(
+            node_id=node_id, depth=depth, parent_id=parent_id, child_ids=[],
+            active_indices=active.clone(), anchor=None if anchor is None else anchor.clone(),
+            training_rows=list(training_rows or []),
+            local_X=torch.empty((0, active.numel()), dtype=self.dtype, device=self.device),
+            local_y=torch.empty(0, dtype=self.dtype, device=self.device), model=None,
+            score_history_rows=[], posterior_mean_history=[], posterior_std_history=[],
+            previous_benchmark_history=[], score=float("inf"), score_mass=0,
+            pre_split_score=None, pre_split_mass=0, excluded=excluded,
+            merge_disabled=merge_disabled, cohort_evaluated=False,
+            newly_retained=newly_retained, archived=False, merge_completed=False,
         )
 
-    def _predict_node(
-        self, node: AGVSNode, full_actions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict at full actions after projecting them into node coordinates."""
+    def _fresh_state(self) -> AGVSState:
+        root = self._empty_node(
+            node_id=0, depth=0, parent_id=None,
+            active_indices=torch.arange(self.action_dimension, device=self.device),
+            newly_retained=True, merge_disabled=not self.config.merge_enabled,
+        )
+        empty = torch.empty(0, dtype=self.dtype, device=self.device)
+        actions = torch.empty((0, self.action_dimension), dtype=self.dtype, device=self.device)
+        return AGVSState(
+            nodes={0: root}, active_leaf_ids=[0], root_id=0,
+            global_actions=actions.clone(), global_observations=empty.clone(),
+            global_posterior_means=empty.clone(), global_posterior_stds=empty.clone(),
+            benchmark_actions=actions.clone(), benchmark_means=empty.clone(),
+            current_leaf_id=None, current_path=[], remaining_sequence_steps=0,
+            visit_start_best=None, visit_evaluations=0, next_node_id=1,
+            batch_count=0, bad_visits=0, tree_epoch=0, restart_count=0,
+        )
 
+    def _initialize_from_environment_impl(self, data: Any) -> None:
+        source = getattr(data, "evaluated_actions", None)
+        source = data.actions if source is None else source
+        self.state.global_actions = torch.as_tensor(source, dtype=self.dtype, device=self.device).clone()
+        self.state.global_observations = torch.as_tensor(
+            data.observations, dtype=self.dtype, device=self.device
+        ).reshape(-1).clone()
+        count = self.state.global_actions.shape[0]
+        self.state.global_posterior_means = torch.full((count,), float("nan"), dtype=self.dtype, device=self.device)
+        self.state.global_posterior_stds = torch.full_like(self.state.global_posterior_means, float("nan"))
+        root = self.state.nodes[0]
+        root.training_rows = list(range(count))
+        if count >= self.config.initial_points:
+            self._fit_node_gp(root)
+
+    def _bounds_numpy(self, node: AGVSNode | None = None) -> np.ndarray:
+        lower, upper = self._bounds_on_algorithm_device()
+        if node is not None:
+            lower, upper = lower[node.active_indices], upper[node.active_indices]
+        return torch.stack((lower, upper), dim=1).detach().cpu().numpy()
+
+    def _new_node_gp(self, dimension: int, node: AGVSNode | None = None) -> Any:
+        options = dict(noise_variance=self.config.noise_variance, learn_noise=self.config.learn_noise,
+                       maxiter=self.config.gp_maxiter, device=self.device, dtype=self.dtype)
+        if self.config.inner_optimizer == "bo":
+            return SourceBOGP(**options)
+        if node is None:
+            raise AGVSNodeError("TuRBO GP construction requires node bounds.")
+        return SourceTurboGP(bounds=self._bounds_numpy(node), min_cuda=self.config.turbo_min_cuda, **options)
+
+    def _restore_model(self, state: Mapping[str, Any] | None) -> Any:
+        if state is None:
+            return None
+        cls = SourceTurboGP if self.config.inner_optimizer == "turbo" else SourceBOGP
+        return cls.from_state_dict(state, device=self.device, dtype=self.dtype)
+
+    def _fit_node_gp(self, node: AGVSNode) -> None:
+        signature = tuple(node.training_rows)
+        if node.model is not None and node.fitted_rows == signature:
+            return
+        rows = torch.tensor(node.training_rows, dtype=torch.long, device=self.device)
+        node.local_X = self.state.global_actions[rows][:, node.active_indices].clone()
+        node.local_y = to_quality(self.state.global_observations[rows], maximize=self.maximize).clone()
+        node.model = None
+        node.fitted_rows = None
+        if not len(rows):
+            return
+        try:
+            model = self._new_node_gp(int(node.active_indices.numel()), node)
+            warm = self._restore_model(node.warm_model_state)
+            model.fit(node.local_X, node.local_y, warm_model=warm)
+        except Exception as error:
+            self._last_gp_fit_error = str(error)
+            return
+        node.model = model
+        node.fitted_rows = signature
+        node.warm_model_state = None
+        self._last_gp_fit_error = None
+        if node.active_indices.numel() == self.action_dimension:
+            self._last_full_dim_gp_state = deepcopy(model.state_dict())
+        self._update_posterior_records(node)
+
+    def _predict_node(self, node: AGVSNode, full_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if node.model is None:
-            raise AGVSNodeError(f"Node {node.node_id} has no fitted GP.")
+            raise AGVSNodeError("The node has no fitted GP.")
         means, stds = node.model.predict(full_actions[:, node.active_indices])
-        return means.reshape(-1).detach().clone(), stds.reshape(-1).detach().clone()
+        return (torch.as_tensor(means, dtype=self.dtype, device=self.device).reshape(-1),
+                torch.as_tensor(stds, dtype=self.dtype, device=self.device).reshape(-1))
+
+    def _posterior_key(self, action: torch.Tensor) -> tuple[int, ...]:
+        bounds = self._bounds_numpy()
+        normalized = (action.detach().cpu().numpy() - bounds[:, 0]) / np.maximum(bounds[:, 1] - bounds[:, 0], 1.0)
+        return tuple(np.rint(normalized / 1e-10).astype(np.int64).tolist())
+
+    def _update_posterior_records(self, node: AGVSNode) -> None:
+        rows = node.training_rows
+        means, stds = self._predict_node(node, self.state.global_actions[rows])
+        for row, mean, std in zip(rows, means.tolist(), stds.tolist(), strict=True):
+            if not math.isfinite(mean):
+                continue
+            key = self._posterior_key(self.state.global_actions[row])
+            previous = self._posterior_records.get(key)
+            if previous is None or mean > previous["mean"]:
+                self._posterior_records[key] = {"row": row, "mean": mean, "std": std}
+            old = self.state.global_posterior_means[row]
+            if not bool(torch.isfinite(old)) or mean > float(old):
+                self.state.global_posterior_means[row] = mean
+                self.state.global_posterior_stds[row] = std
 
     def _current_best_benchmark(self) -> tuple[torch.Tensor | None, float | None]:
-        """Return the point with largest immutable stored posterior mean ``G_l``."""
-
-        means = self.state.global_posterior_means
-        if means.numel() and torch.isfinite(means).any():
-            eligible = torch.where(
-                torch.isfinite(means), means, torch.full_like(means, float("-inf"))
-            )
-            index = int(torch.argmax(eligible).item())
-            return self.state.global_actions[index].clone(), float(means[index].item())
-        if self.state.global_observations.numel() == 0:
-            return None, None
         quality = to_quality(self.state.global_observations, maximize=self.maximize)
-        index = int(torch.argmax(quality).item())
-        return self.state.global_actions[index].clone(), float(quality[index].item())
+        finite = torch.isfinite(quality)
+        if not bool(finite.any()):
+            return None, None
+        values = torch.where(finite, quality, torch.full_like(quality, float("-inf")))
+        index = int(values.argmax())
+        return self.state.global_actions[index].clone(), float(values[index])
 
     def _append_current_benchmark(self) -> None:
-        """Append the current best stored-posterior point to the batch history."""
-
         action, mean = self._current_best_benchmark()
-        if action is None or mean is None:
-            return
-        self.state.benchmark_actions = torch.cat(
-            (self.state.benchmark_actions, action.unsqueeze(0)), dim=0
-        )
-        self.state.benchmark_means = torch.cat(
-            (
-                self.state.benchmark_means,
-                torch.tensor([mean], dtype=self.dtype, device=self.device),
-            ),
-            dim=0,
-        )
+        if action is not None:
+            self.state.benchmark_actions = torch.cat((self.state.benchmark_actions, action[None]), dim=0)
+            self.state.benchmark_means = torch.cat((self.state.benchmark_means, torch.tensor([mean], dtype=self.dtype, device=self.device)))
+
+    def _set_anchor_from_current_best(self, node: AGVSNode) -> float | None:
+        action, value = self._current_best_benchmark()
+        if action is None:
+            bounds = self._bounds_numpy()
+            action = torch.as_tensor(self.numpy_generator.uniform(bounds[:, 0], bounds[:, 1]), dtype=self.dtype, device=self.device)
+        node.anchor = action.clone()
+        return value
 
     def _inactive_indices(self, node: AGVSNode) -> torch.Tensor:
-        """Return environment coordinates outside the node's active set."""
-
         mask = torch.ones(self.action_dimension, dtype=torch.bool, device=self.device)
         mask[node.active_indices] = False
         return torch.arange(self.action_dimension, device=self.device)[mask]
 
-    def _set_anchor_from_current_best(self, node: AGVSNode) -> float | None:
-        """Snapshot the best point available before the current acquisition batch."""
-
-        action, mean = self._current_best_benchmark()
-        if action is None:
-            lower, upper = self._bounds_on_algorithm_device()
-            action = (lower + upper) / 2
-        node.anchor = action.detach().clone()
-        return mean
-
     def _fill_active_coordinates(self, node: AGVSNode, active_points: torch.Tensor) -> torch.Tensor:
-        """Fill inactive coordinates from the node's current pre-batch best point."""
-
         points = torch.as_tensor(active_points, dtype=self.dtype, device=self.device)
         vector = points.ndim == 1
-        if vector:
-            points = points.unsqueeze(0)
-        if points.ndim != 2 or points.shape[1] != node.active_indices.numel():
-            raise AGVSAnchorError("Active points do not match the node coordinate dimension.")
+        points = points.reshape(-1, node.active_indices.numel())
         if node.anchor is None:
-            raise AGVSAnchorError(f"Node {node.node_id} has no pre-batch best-point anchor.")
-        result = node.anchor.unsqueeze(0).expand(points.shape[0], -1).clone()
-        result[:, node.active_indices] = points
-        return result[0] if vector else result
+            raise AGVSAnchorError("No pre-batch observed-incumbent anchor is available.")
+        full = node.anchor[None].expand(len(points), -1).clone()
+        full[:, node.active_indices] = points
+        return full[0] if vector else full
 
     def _path_to_root(self, node_id: int) -> list[int]:
-        """Return the root-to-node path."""
-
-        path: list[int] = []
-        current: int | None = node_id
-        while current is not None:
-            path.append(current)
-            current = self.state.nodes[current].parent_id
-        return list(reversed(path))
+        path = []
+        while node_id is not None:
+            path.append(node_id)
+            node_id = self.state.nodes[node_id].parent_id
+        return path[::-1]
 
     @staticmethod
     def _score_order_key(node: AGVSNode) -> tuple[float, int]:
-        """Order larger scores first with the manuscript's local-index tie break."""
-
-        score = node.score if not math.isnan(node.score) else float("-inf")
-        return (-score, node.node_id)
+        return (-node.score if not math.isnan(node.score) else float("inf"), node.node_id)
 
     def _traverse(self) -> tuple[AGVSNode, list[int]]:
-        """Follow highest-scoring children from the root to an active leaf."""
+        pending: dict[int, bool] = {}
 
+        def refresh(node_id: int) -> bool:
+            node = self.state.nodes[node_id]
+            children = [idx for idx in node.child_ids if not self.state.nodes[idx].archived]
+            child_pending = [refresh(idx) for idx in children]
+            pending[node_id] = any(child_pending) if children else not node.cohort_evaluated
+            return pending[node_id]
+
+        refresh(self.state.root_id)
         node = self.state.nodes[self.state.root_id]
         path = [node.node_id]
-        active = set(self.state.active_leaf_ids)
-        while node.node_id not in active:
-            children = [
-                self.state.nodes[index]
-                for index in node.child_ids
-                if index in self.state.nodes and not self.state.nodes[index].archived
-            ]
-            if not children:
-                raise AGVSNodeError(f"Internal node {node.node_id} has no traversable child.")
-            node = sorted(children, key=self._score_order_key)[0]
+        while node.child_ids:
+            children = [self.state.nodes[idx] for idx in node.child_ids if not self.state.nodes[idx].archived]
+            first = [child for child in children if pending[child.node_id]]
+            node = min(first or children, key=self._score_order_key)
             path.append(node.node_id)
-        if node.archived:
-            raise AGVSNodeError("AG-VS traversal reached an archived leaf.")
         return node, path
 
     def _leaf_score(self, node: AGVSNode) -> float:
-        """Compute unnormalized Eq. (8): mean ``|mu_current(x_i) - M_i^-|``."""
-
-        if not node.score_history_rows:
+        rows = node.score_history_rows
+        if not rows:
             return float("inf")
-        if len(node.score_history_rows) != len(node.previous_benchmark_history):
-            raise AGVSNodeError(f"Node {node.node_id} score records are not aligned.")
-        if node.model is None:
-            raise AGVSNodeError(f"Node {node.node_id} cannot score without a fitted GP.")
-        rows = torch.as_tensor(node.score_history_rows, dtype=torch.long, device=self.device)
-        current_means, _ = self._predict_node(node, self.state.global_actions[rows])
-        previous = torch.tensor(
-            node.previous_benchmark_history, dtype=self.dtype, device=self.device
-        )
-        return float((current_means - previous).abs().mean().item())
+        values = to_quality(self.state.global_observations[rows], maximize=self.maximize)
+        references = torch.tensor(node.previous_benchmark_history, dtype=self.dtype, device=self.device)
+        difference = values - references
+        if self.config.abs_mode:
+            difference = difference.abs()
+        valid = torch.isfinite(difference)
+        return float(difference[valid].mean()) if bool(valid.any()) else float("inf")
 
     def _refresh_leaf_score(self, node: AGVSNode) -> None:
-        """Refresh a leaf's direct score and direct evidence mass."""
-
         node.score = self._leaf_score(node)
-        node.score_mass = len(node.score_history_rows)
+
+    def _update_parent_score(self, parent: AGVSNode) -> None:
+        pairs = [(parent.pre_split_score, parent.pre_split_mass)]
+        pairs.extend((self.state.nodes[idx].score, self.state.nodes[idx].score_mass)
+                     for idx in parent.child_ids if not self.state.nodes[idx].archived)
+        valid = [(value, mass) for value, mass in pairs
+                 if mass > 0 and value is not None and math.isfinite(value)]
+        total = sum(mass for _, mass in valid)
+        parent.score = sum(value * mass for value, mass in valid) / total if total else float("inf")
+
+    def _propagate(self, node_id: int | None) -> None:
+        while node_id is not None:
+            node = self.state.nodes[node_id]
+            if node.child_ids:
+                self._update_parent_score(node)
+            node_id = node.parent_id
 
     def _update_scores_bottom_up(self, path: list[int]) -> None:
-        """Apply Algorithm 2's mass-weighted score propagation."""
-
-        if not path:
-            raise AGVSNodeError("A completed visit requires a non-empty root-to-leaf path.")
-        leaf = self.state.nodes[path[-1]]
-        self._refresh_leaf_score(leaf)
-        for node_id in reversed(path[:-1]):
-            parent = self.state.nodes[node_id]
-            weighted_sum = 0.0
-            total_mass = 0
-            if parent.pre_split_mass > 0 and parent.pre_split_score is not None:
-                weighted_sum += parent.pre_split_mass * parent.pre_split_score
-                total_mass += parent.pre_split_mass
-            for child_id in parent.child_ids:
-                child = self.state.nodes[child_id]
-                if child.archived or child.score_mass <= 0:
-                    continue
-                weighted_sum += child.score_mass * child.score
-                total_mass += child.score_mass
-            if total_mass > 0:
-                parent.score = weighted_sum / total_mass
-                parent.score_mass = total_mass
-            else:
-                parent.score = float("inf")
-                parent.score_mass = 0
+        self._refresh_leaf_score(self.state.nodes[path[-1]])
+        for node_id in path[-2::-1]:
+            self._update_parent_score(self.state.nodes[node_id])
 
     def _split(self, node: AGVSNode) -> list[int]:
-        """Apply Algorithm 3, including smaller groups before remainder groups."""
-
-        dimension = int(node.active_indices.numel())
-        if node.child_ids or dimension <= 1:
+        dimension = node.active_indices.numel()
+        if dimension < 2 or node.child_ids:
             return []
-        count = min(self.config.split_groups, dimension)
-        if count < 2:
-            return []
-        order = torch.randperm(dimension, device=self.device, generator=self.generator)
-        ordered = node.active_indices[order]
-        quotient, remainder = divmod(dimension, count)
-        sizes = [quotient + (1 if index >= count - remainder else 0) for index in range(count)]
-        groups: list[torch.Tensor] = []
-        cursor = 0
-        for size in sizes:
-            groups.append(ordered[cursor : cursor + size].clone())
-            cursor += size
-        flattened = torch.cat(groups)
-        if cursor != dimension or torch.unique(flattened).numel() != dimension:
-            raise AGVSSplitError("AG-VS split groups are not a disjoint partition.")
-
-        node.pre_split_score = node.score
-        node.pre_split_mass = node.score_mass
-        children: list[int] = []
+        ordered = self.numpy_generator.permutation(node.active_indices.detach().cpu().numpy()).tolist()
+        target = self.config.split_groups
+        if dimension <= target:
+            groups = [[value] for value in ordered]
+        else:
+            base, _remainder = divmod(dimension, target)
+            groups = [ordered[index * base:(index + 1) * base] for index in range(target)]
+            for index, value in enumerate(ordered[base * target:]):
+                groups[target - 1 - index].append(value)
+        node.pre_split_score, node.pre_split_mass = node.score, node.score_mass
+        children = []
         for group in groups:
-            child_id = self.state.next_node_id
+            node_id = self.state.next_node_id
             self.state.next_node_id += 1
             child = self._empty_node(
-                node_id=child_id,
-                depth=node.depth + 1,
-                parent_id=node.node_id,
-                active_indices=group,
-                training_rows=node.training_rows,
-                excluded=node.excluded,
+                node_id=node_id, depth=node.depth + 1, parent_id=node.node_id,
+                active_indices=torch.tensor(group, device=self.device),
+                training_rows=node.training_rows, excluded=node.excluded,
                 merge_disabled=node.merge_disabled,
-                newly_retained=False,
             )
-            self.state.nodes[child_id] = child
-            node.child_ids.append(child_id)
-            children.append(child_id)
+            self.state.nodes[node_id] = child
+            children.append(node_id)
+        node.child_ids = children
         node.merge_completed = False
-        # This node is now internal. Children inherit raw AG-VS rows, not a
-        # trust region or proposal model defined over a different coordinate set.
         node.proposal_optimizer = None
-        self.state.active_leaf_ids = [
-            leaf_id for leaf_id in self.state.active_leaf_ids if leaf_id != node.node_id
-        ] + children
+        self.state.active_leaf_ids = [idx for idx in self.state.active_leaf_ids if idx != node.node_id] + children
+        self._propagate(node.node_id)
         return children
 
     def _merge(self, parent: AGVSNode) -> int | None:
-        """Apply Algorithm 4 after every merge-enabled sibling's first visit."""
-
         if parent.merge_completed:
             return None
-        siblings = [
-            self.state.nodes[index]
-            for index in parent.child_ids
-            if not self.state.nodes[index].archived
-        ]
-        if len(siblings) < 2 or not all(node.cohort_evaluated for node in siblings):
+        siblings = [self.state.nodes[idx] for idx in parent.child_ids if not self.state.nodes[idx].archived]
+        if not siblings or not all(node.cohort_evaluated for node in siblings):
             return None
-        if any(node.merge_disabled for node in siblings):
+        parent.merge_completed = True
+        if parent.merge_disabled:
             return None
-        ordered = sorted(siblings, key=self._score_order_key)
-        retained = ordered[: min(self.config.effective_dimension, len(ordered))]
+        if any(not math.isfinite(node.score) for node in siblings):
+            parent.merge_completed = False
+            return None
+        retained = sorted(siblings, key=self._score_order_key)[:self.config.effective_dimension]
         retained_ids = {node.node_id for node in retained}
-        active = torch.unique(torch.cat([node.active_indices for node in retained]), sorted=True)
-        if active.numel() == 0:
-            raise AGVSMergeError("AG-VS merge produced an empty active set.")
-        training_rows = sorted({row for node in retained for row in node.training_rows})
-        merged_id = self.state.next_node_id
+        active = sorted({int(value) for node in retained for value in node.active_indices.tolist()})
+        training = (list(range(len(self.state.global_actions))) if len(active) == self.config.effective_dimension
+                    else sorted({row for node in retained for row in node.training_rows}))
+        node_id = self.state.next_node_id
         self.state.next_node_id += 1
         merged = self._empty_node(
-            node_id=merged_id,
-            depth=parent.depth + 1,
-            parent_id=parent.node_id,
-            active_indices=active,
-            training_rows=training_rows,
-            newly_retained=True,
+            node_id=node_id, depth=parent.depth + 1, parent_id=parent.node_id,
+            active_indices=torch.tensor(active, device=self.device), training_rows=training,
+            newly_retained=True, merge_disabled=len(active) <= self.config.effective_dimension,
         )
-        self.state.nodes[merged_id] = merged
-
-        outside: list[int] = []
+        merged.retained_merged = True
+        self.state.nodes[node_id] = merged
+        outside = []
         for sibling in siblings:
             if sibling.node_id in retained_ids:
                 sibling.archived = True
                 sibling.proposal_optimizer = None
             else:
-                sibling.excluded = True
-                sibling.merge_disabled = True
+                sibling.excluded = sibling.merge_disabled = True
                 outside.append(sibling.node_id)
-        parent.child_ids = [*outside, merged_id]
-        parent.merge_completed = True
-        self.state.active_leaf_ids = [
-            leaf_id for leaf_id in self.state.active_leaf_ids if leaf_id not in retained_ids
-        ]
-        if merged_id not in self.state.active_leaf_ids:
-            self.state.active_leaf_ids.append(merged_id)
-        return merged_id
+        parent.child_ids = [*outside, node_id]
+        self.state.active_leaf_ids = [idx for idx in self.state.active_leaf_ids if idx not in retained_ids] + [node_id]
+        self._propagate(parent.node_id)
+        return node_id
 
-    def _posterior_stopping_decision(self, mean: float, std: float) -> bool:
-        """Evaluate Eq. (9), including its exact zero-variance convention."""
-
-        threshold = self.config.stopping_threshold
-        delta = self.config.stopping_delta
-        if threshold is None or delta is None:
-            return False
-        if std <= 0:
-            probability = float(mean < threshold)
-        else:
-            z = torch.tensor((threshold - mean) / std, dtype=self.dtype, device=self.device)
-            probability = float(torch.distributions.Normal(0.0, 1.0).cdf(z).item())
-        self.state.stopping_probability = probability
-        return probability <= delta
-
-    def _prepare_discrete_candidates_impl(
-        self,
-        *,
-        candidate_actions: torch.Tensor,
-        candidate_dataset_indices: torch.Tensor,
-        round_info: Mapping[str, Any],
-    ) -> DiscreteAcquisitionCandidates:
-        """Project exact finite rows to the selected node's active coordinates."""
-
-        del round_info
-        if self.state.current_leaf_id is None:
-            raise AGVSNodeError("No AG-VS leaf is active for candidate projection.")
-        node = self.state.nodes[self.state.current_leaf_id]
-        return DiscreteAcquisitionCandidates(
-            environment_actions=candidate_actions,
-            model_inputs=candidate_actions[:, node.active_indices],
-            dataset_indices=candidate_dataset_indices,
-        )
-
-    def _initial_design(
-        self, round_info: Mapping[str, Any]
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Return a deterministic full-coordinate initial-design batch."""
-
-        if "candidate_actions" in round_info:
-            candidates = torch.as_tensor(
-                round_info["candidate_actions"], dtype=self.dtype, device=self.device
-            )
-            indices = torch.as_tensor(
-                round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device
-            )
-            chosen: list[int] = []
-            reference = self.state.global_actions
-            for _ in range(self.request_size):
-                available = torch.ones(candidates.shape[0], dtype=torch.bool, device=self.device)
-                if chosen:
-                    available[torch.tensor(chosen, dtype=torch.long, device=self.device)] = False
-                pool = torch.nonzero(available, as_tuple=False).reshape(-1)
-                if reference.shape[0] or chosen:
-                    prior = reference
-                    if chosen:
-                        prior = torch.cat((prior, candidates[chosen]), dim=0)
-                    distances = torch.cdist(candidates[pool], prior).min(dim=1).values
-                    best_distance = distances.max()
-                    tied = pool[distances == best_distance]
-                else:
-                    tied = pool
-                tied_indices = indices[tied]
-                chosen.append(int(tied[torch.argmin(tied_indices)].item()))
-            positions = torch.tensor(chosen, dtype=torch.long, device=self.device)
-            return candidates[positions], indices[positions]
-        lower, upper = self._bounds_on_algorithm_device()
-        return (
-            self._sample_design(
-                Bounds(lower, upper),
-                self.request_size,
-                phase="initial",
-                seed=self.config.seed + self.iteration,
-            ),
-            None,
-        )
-
-    def _select_active_points(
-        self, node: AGVSNode, round_info: Mapping[str, Any]
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float | None]:
-        """Optimize the configured acquisition in ``A_N`` for one batch."""
-
-        self._set_anchor_from_current_best(node)
-        if self.config.inner_optimizer == "turbo":
-            return self._select_turbo_points(node, round_info)
-        if "candidate_actions" in round_info:
-            actions = torch.as_tensor(
-                round_info["candidate_actions"], dtype=self.dtype, device=self.device
-            )
-            indices = torch.as_tensor(
-                round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device
-            )
-            table = self.prepare_discrete_candidates(
-                candidate_actions=actions,
-                candidate_dataset_indices=indices,
-                round_info=round_info,
-            )
-            if node.model is None:
-                order = torch.argsort(table.dataset_indices, stable=True)[: self.request_size]
-                return (
-                    table.environment_actions[order],
-                    table.model_inputs[order],
-                    table.dataset_indices[order],
-                    None,
-                )
-            acquisition = build_acquisition(
-                model=node.model,
-                config=self.config.acquisition,
-                batch_size=self.batch_size,
-                q_batch=self.q_batch,
-                best_f=float(node.local_y.max().item()),
-            )
-            try:
-                result = optimize_acquisition_discrete(
-                    acquisition=acquisition,
-                    candidates=table,
-                    batch_size=self.batch_size,
-                    q_batch=self.q_batch,
-                )
-            except Exception as error:
-                raise AGVSDataCompatibilityError(
-                    f"AG-VS finite acquisition failed: {error}"
-                ) from error
-            return (
-                result.environment_actions,
-                result.model_inputs,
-                result.dataset_indices,
-                float(result.acquisition_values.sum().item()),
-            )
-
-        lower, upper = self._bounds_on_algorithm_device()
-        active_bounds = torch.stack((lower[node.active_indices], upper[node.active_indices]))
-        if node.model is None:
-            active = self._sample_design(
-                Bounds(active_bounds[0], active_bounds[1]),
-                self.request_size,
-                phase="acquisition",
-                seed=self.config.seed + 982451653 * (self.iteration + 1),
-                paper_method="uniform",
-            )
-            value = None
-        else:
-            acquisition = build_acquisition(
-                model=node.model,
-                config=self.config.acquisition,
-                batch_size=self.batch_size,
-                q_batch=self.q_batch,
-                best_f=float(node.local_y.max().item()),
-            )
-            active, acquisition_value = optimize_acquisition_continuous(
-                acquisition=acquisition,
-                bounds=active_bounds,
-                batch_size=self.batch_size,
-                q_batch=self.q_batch,
-                num_restarts=self.config.acquisition_restarts,
-                raw_samples=self.config.acquisition_raw_samples,
-                sampling_method=self.acquisition_sampling_method,
-                sampling_generator=self.generator,
-                sampling_seed=self.config.seed + self.iteration,
-            )
-            value = float(acquisition_value.reshape(-1).sum().item())
-        full = self._fill_active_coordinates(node, active)
-        return full, active, None, value
-
-    def _start_visit(self) -> AGVSNode:
-        """Traverse once and freeze the selected leaf for ``t_seq`` batches."""
-
-        leaf, path = self._traverse()
-        self.state.current_leaf_id = leaf.node_id
-        self.state.current_path = path
-        self.state.remaining_sequence_steps = self.config.sequence_length
-        _, self.state.visit_start_best = self._current_best_benchmark()
-        self.state.visit_evaluations = 0
-        self._fit_node_gp(leaf)
-        return leaf
-
-    def _ask_impl(self, *, round_info: Mapping[str, Any]) -> torch.Tensor:
-        """Return a manuscript batch in the current visit's coordinate subset."""
-
-        if self.state.stopped:
-            raise AGVSNodeError("AG-VS posterior stopping condition has already fired.")
-        if self.state.global_actions.shape[0] < self.config.initial_points:
-            actions, indices = self._initial_design(round_info)
-            root = self.state.nodes[self.state.root_id]
-            self.model_input_dimension = self.action_dimension
-            self._record_last_ask(
-                actions=actions,
-                model_inputs=actions,
-                round_info=round_info,
-                algorithm_metadata={
-                    "node_id": root.node_id,
-                    "active_indices": root.active_indices,
-                    "dataset_indices": indices,
-                    "initial_design": True,
-                },
-            )
-            return actions[0] if self.request_size == 1 else actions
-
-        node = (
-            self._start_visit()
-            if self.state.current_leaf_id is None
-            else self.state.nodes[self.state.current_leaf_id]
-        )
-        _, pre_batch_reference = self._current_best_benchmark()
-        actions, active, indices, value = self._select_active_points(node, round_info)
-        self.model_input_dimension = int(node.active_indices.numel())
-        self._last_acquisition_value = value
-        self._record_last_ask(
-            actions=actions,
-            model_inputs=active,
-            round_info=round_info,
-            algorithm_metadata={
-                "node_id": node.node_id,
-                "active_indices": node.active_indices,
-                "dataset_indices": indices,
-                "initial_design": False,
-                "pre_batch_reference": pre_batch_reference,
-                "sequence_step": self.config.sequence_length - self.state.remaining_sequence_steps,
-            },
-        )
-        return actions[0] if self.request_size == 1 else actions
-
-    def _append_global_posterior(self, means: torch.Tensor, stds: torch.Tensor) -> None:
-        """Append immutable fitted posterior records for one observed batch."""
-
-        self.state.global_posterior_means = torch.cat(
-            (self.state.global_posterior_means, means.reshape(-1)), dim=0
-        )
-        self.state.global_posterior_stds = torch.cat(
-            (self.state.global_posterior_stds, stds.reshape(-1)), dim=0
-        )
-
-    def _unique_pair_rows(self) -> list[int]:
-        """Keep the earliest index for each exact ``(x, y)`` pair."""
-
-        unique: list[int] = []
-        for index in range(self.state.global_actions.shape[0]):
-            duplicate = any(
-                torch.equal(self.state.global_actions[index], self.state.global_actions[earlier])
-                and bool(
-                    self.state.global_observations[index] == self.state.global_observations[earlier]
-                )
-                for earlier in unique
-            )
-            if not duplicate:
-                unique.append(index)
-        return unique
+    def _unique_pair_rows(self, rows: list[int] | None = None) -> list[int]:
+        result = []
+        for row in sorted(set(range(len(self.state.global_actions)) if rows is None else rows)):
+            if not any(
+                bool((self.state.global_actions[row] - self.state.global_actions[earlier]).abs().le(1e-10).all())
+                and abs(float(self.state.global_observations[row] - self.state.global_observations[earlier])) <= 1e-10
+                for earlier in result
+            ):
+                result.append(row)
+        return result
 
     def _reinitialize(self) -> int:
-        """Apply Algorithm 5 without discarding raw or posterior history."""
-
-        root_id = self.state.next_node_id
-        self.state.next_node_id += 1
+        rows = sorted({row for idx in self.state.active_leaf_ids
+                       if self.state.nodes[idx].parent_id is not None
+                       for row in self.state.nodes[idx].training_rows})
+        if not rows:
+            return self.state.root_id
         root = self._empty_node(
-            node_id=root_id,
-            depth=0,
-            parent_id=None,
-            active_indices=torch.arange(
-                self.action_dimension, dtype=torch.long, device=self.device
-            ),
-            training_rows=self._unique_pair_rows(),
-            newly_retained=True,
+            node_id=0, depth=0, parent_id=None,
+            active_indices=torch.arange(self.action_dimension, device=self.device),
+            training_rows=self._unique_pair_rows(rows), newly_retained=True,
+            merge_disabled=not self.config.merge_enabled,
         )
-        self.state.nodes = {root_id: root}
-        self.state.root_id = root_id
-        self.state.active_leaf_ids = [root_id]
-        self.state.current_leaf_id = None
-        self.state.current_path = []
-        self.state.remaining_sequence_steps = 0
-        self.state.visit_start_best = None
-        self.state.visit_evaluations = 0
+        root.warm_model_state = deepcopy(self._last_full_dim_gp_state)
+        self.state.nodes = {0: root}
+        self.state.root_id = 0
+        self.state.active_leaf_ids = [0]
+        self.state.next_node_id = 1
         self.state.bad_visits = 0
         self.state.tree_epoch += 1
         self.state.restart_count += 1
-        self._fit_node_gp(root)
-        return root_id
+        return 0
 
     def _complete_visit(self, node: AGVSNode) -> None:
-        """Update scores, stagnation, and the split/merge transition."""
-
         node.cohort_evaluated = True
         self._update_scores_bottom_up(self.state.current_path)
+        merged = None
+        if node.parent_id is not None:
+            merged = self._merge(self.state.nodes[node.parent_id])
         _, best_after = self._current_best_benchmark()
-        improved = (
-            best_after is not None
-            and self.state.visit_start_best is not None
-            and best_after > self.state.visit_start_best
-        )
-        self.state.bad_visits = 0 if improved else self.state.bad_visits + 1
-        patience = self.config.stagnation_patience
-        if patience is not None and self.state.bad_visits >= patience:
-            self._reinitialize()
+        if self.config.stagnation_enabled:
+            improved = (best_after is not None and self.state.visit_start_best is not None
+                        and best_after > self.state.visit_start_best)
+            self.state.bad_visits = 0 if improved else self.state.bad_visits + 1
+            children_exist = any(self.state.nodes[idx].parent_id is not None for idx in self.state.active_leaf_ids)
+            if self.state.bad_visits >= self.config.stagnation_patience and children_exist:
+                self._reinitialize()
+                return
+        else:
+            self.state.bad_visits = 0
+        if merged is not None:
             return
-
         if node.newly_retained:
             node.newly_retained = False
             if node.active_indices.numel() > self.config.effective_dimension:
                 self._split(node)
-            return
-        if node.parent_id is not None:
-            parent = self.state.nodes[node.parent_id]
-            if self._merge(parent) is not None:
-                return
-        if node.excluded and node.active_indices.numel() > 1:
-            node.merge_disabled = True
-            self._split(node)
+        elif (node.excluded or not self.config.merge_enabled) and node.active_indices.numel() > 1:
+            if node.parent_id is None or self.state.nodes[node.parent_id].merge_completed:
+                self._split(node)
 
-    def _tell_impl(
-        self,
-        *,
-        action: torch.Tensor,
-        feedback: Mapping[str, Any],
+    def _initial_design(self, round_info: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if "candidate_actions" in round_info:
+            self.invalidate_source_guarantees("agvs.finite_candidate_extension")
+            actions = torch.as_tensor(round_info["candidate_actions"], dtype=self.dtype, device=self.device)
+            indices = torch.as_tensor(round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device)
+            order = torch.argsort(indices, stable=True)[:self.request_size]
+            return actions[order], indices[order]
+        if self._initial_design_points is None:
+            count = self.config.initial_points - len(self.state.global_actions)
+            bounds = self._bounds_numpy()
+            if self.initial_points_sampling_method == "paper":
+                design = latin_hypercube(bounds, count, self.numpy_generator)
+            elif self.initial_points_sampling_method == "uniform":
+                design = self.numpy_generator.uniform(bounds[:, 0], bounds[:, 1], size=(count, self.action_dimension))
+            else:
+                seed = int(self.numpy_generator.integers(0, 500000))
+                unit = torch.quasirandom.SobolEngine(self.action_dimension, scramble=True, seed=seed).draw(count).double().numpy()
+                design = bounds[:, 0] + unit * (bounds[:, 1] - bounds[:, 0])
+            self._initial_design_points = torch.as_tensor(design, dtype=self.dtype, device=self.device)
+            self._initial_design_cursor = 0
+        start = self._initial_design_cursor
+        return self._initial_design_points[start:start + self.request_size].clone(), None
+
+    def _prepare_discrete_candidates_impl(
+        self, *, candidate_actions: torch.Tensor, candidate_dataset_indices: torch.Tensor,
         round_info: Mapping[str, Any],
-    ) -> None:
-        """Append one observed batch and advance only complete visits structurally."""
+    ) -> DiscreteAcquisitionCandidates:
+        del round_info
+        node = self.state.nodes[self.state.current_leaf_id or self.state.root_id]
+        return DiscreteAcquisitionCandidates(candidate_actions, candidate_actions[:, node.active_indices], candidate_dataset_indices)
 
+    def _select_active_points(self, node: AGVSNode, round_info: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, float | None]:
+        self._set_anchor_from_current_best(node)
+        self._fit_node_gp(node)
+        bounds = self._bounds_numpy(node)
+        if "candidate_actions" in round_info:
+            self.invalidate_source_guarantees("agvs.finite_candidate_extension")
+            if self.config.inner_optimizer == "turbo" or self.q_batch is not None:
+                raise AGVSDataCompatibilityError("Finite AG-VS tables support independent BO EI only.")
+            actions = torch.as_tensor(round_info["candidate_actions"], dtype=self.dtype, device=self.device)
+            indices = torch.as_tensor(round_info["candidate_dataset_indices"], dtype=torch.long, device=self.device)
+            active = actions[:, node.active_indices]
+            if node.model is None:
+                order = torch.argsort(indices, stable=True)[:self.request_size]
+                value = None
+            else:
+                scores = classical_ei(node.model, active.detach().cpu().numpy())
+                order = torch.as_tensor(np.argsort(scores)[-self.request_size:], dtype=torch.long, device=self.device)
+                value = float(np.asarray(scores)[order.cpu().numpy()].sum())
+            return actions[order], active[order], indices[order], value
+        if node.model is None:
+            if self.config.inner_optimizer == "turbo" and node.training_rows:
+                raise AGVSNodeError(
+                    "AG-VS TuRBO could not fit the shared node GP: "
+                    + str(self._last_gp_fit_error)
+                )
+            active, values = self.numpy_generator.uniform(bounds[:, 0], bounds[:, 1], size=(self.request_size, len(bounds))), np.zeros(self.request_size)
+        elif self.config.inner_optimizer == "turbo":
+            if node.proposal_optimizer is None:
+                node.proposal_optimizer = TurboProposalState()
+            active, values = propose_turbo(
+                node.model, bounds, self.request_size, self._source_turbo_rng,
+                self._proposal_torch_generator(node), self._sobol_engines, node.proposal_optimizer,
+                max_evals=self.config.turbo_max_evals,
+            )
+        else:
+            active, values = propose_bo(
+                node.model, bounds, self.request_size, self.numpy_generator,
+                joint=self.q_batch is not None, mc_samples=256, xi=1e-4,
+            )
+        active_tensor = torch.as_tensor(active, dtype=self.dtype, device=self.device)
+        return self._fill_active_coordinates(node, active_tensor), active_tensor, None, float(np.asarray(values).sum())
+
+    def _proposal_torch_generator(self, node: AGVSNode) -> torch.Generator:
+        """Match predictive sampling to the source's CPU/CUDA candidate device."""
+        candidate_count = min(100 * int(node.active_indices.numel()), 5000)
+        if self.device.type == "cpu" or candidate_count < self.config.turbo_min_cuda:
+            return self._source_torch_generator
+        key = str(self.device)
+        if key not in self._source_cuda_generators:
+            self._source_cuda_generators[key] = torch.Generator(device=self.device).manual_seed(self.seed)
+        return self._source_cuda_generators[key]
+
+    def _start_visit(self) -> AGVSNode:
+        node, path = self._traverse()
+        if node.retained_merged and not node.excluded and node.active_indices.numel() == self.config.effective_dimension:
+            node.training_rows = list(range(len(self.state.global_actions)))
+        self.state.current_leaf_id, self.state.current_path = node.node_id, path
+        self.state.remaining_sequence_steps = self.config.sequence_length
+        _, self.state.visit_start_best = self._current_best_benchmark()
+        self.state.visit_evaluations = 0
+        return node
+
+    def _ask_impl(self, *, round_info: Mapping[str, Any]) -> torch.Tensor:
+        initial = len(self.state.global_actions) < self.config.initial_points
+        if initial:
+            node = self.state.nodes[self.state.root_id]
+            actions, indices = self._initial_design(round_info)
+            active, value, reference = actions, None, None
+        else:
+            node = self._start_visit() if self.state.current_leaf_id is None else self.state.nodes[self.state.current_leaf_id]
+            _, reference = self._current_best_benchmark()
+            actions, active, indices, value = self._select_active_points(node, round_info)
+        self.model_input_dimension = int(node.active_indices.numel())
+        self._last_acquisition_value = value
+        metadata = {"node_id": node.node_id, "active_indices": node.active_indices,
+                    "dataset_indices": indices, "initial_design": initial,
+                    "pre_batch_reference": reference}
+        if not initial and self.config.inner_optimizer == "turbo":
+            metadata["turbo_old_best"] = float(node.local_y.max()) if node.local_y.numel() else float("-inf")
+        self._record_last_ask(actions=actions, model_inputs=active, round_info=round_info, algorithm_metadata=metadata)
+        return actions[0] if self.request_size == 1 else actions
+
+    def _tell_impl(self, *, action: torch.Tensor, feedback: Mapping[str, Any], round_info: Mapping[str, Any]) -> None:
         del action, round_info
         assert self.last_ask is not None
         metadata = self.last_ask.algorithm_metadata
         node = self.state.nodes[int(metadata["node_id"])]
-        observations = torch.as_tensor(
-            feedback["observation"], dtype=self.dtype, device=self.device
-        ).reshape(-1)
-        evaluated = torch.as_tensor(
-            feedback["evaluated_action"], dtype=self.dtype, device=self.device
-        )
-        if (
-            not bool(metadata.get("initial_design", False))
-            and self.config.inner_optimizer == "turbo"
-        ):
-            optimizer = node.proposal_optimizer
-            if optimizer is None or optimizer.last_ask is None:
-                raise AGVSNodeError("The active leaf has no pending TuRBO proposal.")
-            inner_feedback = {
-                "observation": observations,
-                "evaluated_action": evaluated[:, node.active_indices],
-            }
-            if "observation_noise_variance" in feedback:
-                inner_feedback["observation_noise_variance"] = feedback[
-                    "observation_noise_variance"
-                ]
-            optimizer.tell(action=optimizer.last_ask.actions, feedback=inner_feedback)
-        row_start = self.state.global_actions.shape[0]
-        new_rows = list(range(row_start, row_start + evaluated.shape[0]))
+        observations = torch.as_tensor(feedback["observation"], dtype=self.dtype, device=self.device).reshape(-1)
+        evaluated = torch.as_tensor(feedback["evaluated_action"], dtype=self.dtype, device=self.device)
+        start = len(self.state.global_actions)
+        rows = list(range(start, start + len(observations)))
         self.state.global_actions = torch.cat((self.state.global_actions, evaluated), dim=0)
-        self.state.global_observations = torch.cat(
-            (self.state.global_observations, observations), dim=0
-        )
-        node.training_rows.extend(new_rows)
-        self._fit_node_gp(node)
-        means, stds = self._predict_node(node, evaluated)
-        self._append_global_posterior(means, stds)
+        self.state.global_observations = torch.cat((self.state.global_observations, observations))
+        empty = torch.full_like(observations, float("nan"))
+        self.state.global_posterior_means = torch.cat((self.state.global_posterior_means, empty))
+        self.state.global_posterior_stds = torch.cat((self.state.global_posterior_stds, empty.clone()))
         self.state.batch_count += 1
-
-        if bool(metadata.get("initial_design", False)):
+        if metadata["initial_design"]:
+            node.training_rows.extend(rows)
+            self._initial_design_cursor += len(rows)
+            if len(self.state.global_actions) >= self.config.initial_points:
+                self._fit_node_gp(node)
             self._append_current_benchmark()
             return
-
-        reference = metadata.get("pre_batch_reference")
-        if reference is None or not math.isfinite(float(reference)):
-            raise AGVSNodeError("A scored AG-VS batch requires a finite pre-batch reference.")
-        node.score_history_rows.extend(new_rows)
-        node.posterior_mean_history.extend(float(value) for value in means.tolist())
-        node.posterior_std_history.extend(float(value) for value in stds.tolist())
-        node.previous_benchmark_history.extend([float(reference)] * len(new_rows))
-        self._refresh_leaf_score(node)
+        reference = float(metadata["pre_batch_reference"])
+        for node_id in self.state.current_path:
+            ancestor = self.state.nodes[node_id]
+            ancestor.training_rows.extend(row for row in rows if row not in ancestor.training_rows)
+            ancestor.score_history_rows.extend(rows)
+            ancestor.previous_benchmark_history.extend([reference] * len(rows))
+            ancestor.score_mass += len(rows)
+        if self.config.inner_optimizer == "turbo" and node.proposal_optimizer is not None:
+            quality = to_quality(observations, maximize=self.maximize).cpu().numpy()
+            update_turbo(node.proposal_optimizer, metadata["turbo_old_best"], quality,
+                         int(node.active_indices.numel()), self.batch_size or self.q_batch)
         self._append_current_benchmark()
-        self.state.visit_evaluations += len(new_rows)
-
-        for position, (mean, std) in enumerate(zip(means.tolist(), stds.tolist(), strict=True)):
-            if self._posterior_stopping_decision(float(mean), float(std)):
-                self.state.stopped = True
-                self.state.stopping_action = evaluated[position].clone()
-                self.state.stopping_mean = float(mean)
-                break
-
-        # Algorithm 6 returns immediately when Eq. (9) succeeds. In
-        # particular, it does not perform a visit-level tree or stagnation
-        # transition even when this happened in the visit's final batch.
-        if self.state.stopped:
-            return
+        self.state.visit_evaluations += len(rows)
         self.state.remaining_sequence_steps -= 1
         if self.state.remaining_sequence_steps <= 0:
             self._complete_visit(node)
@@ -1298,382 +782,186 @@ class AG_VS(Algorithm):
             self.state.visit_evaluations = 0
 
     def _recommendation_impl(self) -> tuple[torch.Tensor | None, float | None]:
-        """Return the stopping point or current best stored-posterior point."""
-
-        if self.state.stopping_action is not None and self.state.stopping_mean is not None:
-            value = self.state.stopping_mean if self.maximize else -self.state.stopping_mean
-            return self.state.stopping_action.clone(), value
-        action, mean = self._current_best_benchmark()
-        if mean is None:
-            return None, None
-        return action, mean if self.maximize else -mean
+        if self._posterior_records:
+            record = max(self._posterior_records.values(), key=lambda value: value["mean"])
+            return self.state.global_actions[record["row"]].clone(), record["mean"] if self.maximize else -record["mean"]
+        action, _ = self._current_best_benchmark()
+        return action, float("nan") if action is not None else None
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
-        """Report tree, visit, score, batching, restart, and stopping state."""
-
         return {
-            "node_count": len(self.state.nodes),
+            "source_behavior_version": self.SOURCE_BEHAVIOR_VERSION,
+            "source_turbo_numerics_version": (
+                self.SOURCE_TURBO_NUMERICS_VERSION if self.config.inner_optimizer == "turbo" else None
+            ),
+            "node_count": len(self.state.nodes), "root_id": self.state.root_id,
             "active_leaf_ids": tuple(self.state.active_leaf_ids),
-            "root_id": self.state.root_id,
-            "tree_epoch": self.state.tree_epoch,
-            "restart_count": self.state.restart_count,
-            "bad_visits": self.state.bad_visits,
             "current_leaf_id": self.state.current_leaf_id,
             "remaining_sequence_steps": self.state.remaining_sequence_steps,
-            "visit_evaluations": self.state.visit_evaluations,
-            "batch_mode": self.batch_mode_name,
-            "batch_count": self.state.batch_count,
-            "stopped": self.state.stopped,
-            "stopping_probability": self.state.stopping_probability,
-            "effective_dimension": self.config.effective_dimension,
-            "score_formula": "mean_abs_current_posterior_minus_pre_batch_best",
-            "score_normalized": False,
-            "gp_kernel": "ScaleKernel(MaternKernel(nu=2.5, ARD=False))",
-            "use_ard": False,
-            "split_source": "seeded_random_permutation",
-            "inner_optimizer": self.config.inner_optimizer,
-            "source_iteration_complete": self.source_iteration_complete,
-            "proposal_state_policy": "per-leaf; fresh after split, merge or reinitialization",
-            "proposal_acquisition": "joint predictive TS"
-            if self.config.inner_optimizer == "turbo"
-            else self.config.acquisition.name,
-            "leaf_proposal_states": {
-                key: {
-                    "seed": node.proposal_optimizer.seed,
-                    "training_rows": int(node.proposal_optimizer.y_train.numel()),
-                    "local_start": node.proposal_optimizer.local_start,
-                    "trust_region_length": node.proposal_optimizer.state.length,
-                    "success_count": node.proposal_optimizer.state.success_count,
-                    "failure_count": node.proposal_optimizer.state.failure_count,
-                    "restart_count": node.proposal_optimizer.state.restart_count,
-                    "pending_feedback": node.proposal_optimizer.last_ask is not None,
-                }
-                for key, node in self.state.nodes.items()
-                if node.proposal_optimizer is not None
-            },
+            "tree_epoch": self.state.tree_epoch, "restart_count": self.state.restart_count,
+            "bad_visits": self.state.bad_visits, "batch_count": self.state.batch_count,
+            "node_scores": {key: node.score for key, node in self.state.nodes.items()},
+            "node_score_masses": {key: node.score_mass for key, node in self.state.nodes.items()},
+            "node_active_indices": {key: node.active_indices.clone() for key, node in self.state.nodes.items()},
+            "last_gp_fit_error": self._last_gp_fit_error,
+            "stopped": False, "stopping_probability": None,
         }
 
-    @staticmethod
-    def _node_state(node: AGVSNode) -> dict[str, Any]:
-        """Serialize one node's observations and tree progress."""
-
-        return {
-            "node_id": node.node_id,
-            "depth": node.depth,
-            "parent_id": node.parent_id,
-            "child_ids": tuple(node.child_ids),
-            "active_indices": node.active_indices,
-            "anchor": node.anchor,
-            "training_rows": tuple(node.training_rows),
-            "local_X": node.local_X,
-            "local_y": node.local_y,
-            "score_history_rows": tuple(node.score_history_rows),
-            "posterior_mean_history": tuple(node.posterior_mean_history),
-            "posterior_std_history": tuple(node.posterior_std_history),
-            "previous_benchmark_history": tuple(node.previous_benchmark_history),
-            "score": node.score,
-            "score_mass": node.score_mass,
-            "pre_split_score": node.pre_split_score,
-            "pre_split_mass": node.pre_split_mass,
-            "excluded": node.excluded,
-            "merge_disabled": node.merge_disabled,
-            "cohort_evaluated": node.cohort_evaluated,
-            "newly_retained": node.newly_retained,
-            "archived": node.archived,
-            "merge_completed": node.merge_completed,
-            "proposal_optimizer": None
-            if node.proposal_optimizer is None
-            else node.proposal_optimizer.state_dict(),
-        }
+    def _node_state(self, node: AGVSNode) -> dict[str, Any]:
+        result = {item.name: deepcopy(getattr(node, item.name)) for item in fields(node)
+                  if item.name not in {"model", "proposal_optimizer"}}
+        result["model"] = None if node.model is None else node.model.state_dict()
+        result["proposal_optimizer"] = None if node.proposal_optimizer is None else node.proposal_optimizer.state_dict()
+        return result
 
     def _state_dict_impl(self) -> Mapping[str, Any]:
-        """Serialize the tree and every raw, posterior, visit, and restart record."""
-
-        return {
-            "config": asdict(self.config),
-            "source_turbo_numerics_version": (
-                3
-                if self.config.inner_optimizer == "turbo"
-                and self.config.inner_turbo_config is not None
-                and self.config.inner_turbo_config.source_protocol == "mcts_vs_2022"
-                else None
+        result = {item.name: deepcopy(getattr(self.state, item.name)) for item in fields(self.state) if item.name != "nodes"}
+        result.update(
+            source_behavior_version=self.SOURCE_BEHAVIOR_VERSION, config=asdict(self.config),
+            source_turbo_numerics_version=(
+                self.SOURCE_TURBO_NUMERICS_VERSION if self.config.inner_optimizer == "turbo" else None
             ),
-            "nodes": {key: self._node_state(node) for key, node in self.state.nodes.items()},
-            "active_leaf_ids": tuple(self.state.active_leaf_ids),
-            "root_id": self.state.root_id,
-            "global_actions": self.state.global_actions,
-            "global_observations": self.state.global_observations,
-            "global_posterior_means": self.state.global_posterior_means,
-            "global_posterior_stds": self.state.global_posterior_stds,
-            "benchmark_actions": self.state.benchmark_actions,
-            "benchmark_means": self.state.benchmark_means,
-            "current_leaf_id": self.state.current_leaf_id,
-            "current_path": tuple(self.state.current_path),
-            "remaining_sequence_steps": self.state.remaining_sequence_steps,
-            "visit_start_best": self.state.visit_start_best,
-            "visit_evaluations": self.state.visit_evaluations,
-            "next_node_id": self.state.next_node_id,
-            "batch_count": self.state.batch_count,
-            "bad_visits": self.state.bad_visits,
-            "tree_epoch": self.state.tree_epoch,
-            "restart_count": self.state.restart_count,
-            "stopped": self.state.stopped,
-            "stopping_probability": self.state.stopping_probability,
-            "stopping_action": self.state.stopping_action,
-            "stopping_mean": self.state.stopping_mean,
-        }
+            nodes={key: self._node_state(node) for key, node in self.state.nodes.items()},
+            numpy_generator_state=deepcopy(self.numpy_generator.bit_generator.state),
+            source_turbo_rng_state=deepcopy(self._source_turbo_rng.get_state()),
+            source_torch_generator_state=self._source_torch_generator.get_state().clone(),
+            source_cuda_generator_states={key: generator.get_state().cpu().clone()
+                                          for key, generator in self._source_cuda_generators.items()},
+            initial_design_points=self._initial_design_points, initial_design_cursor=self._initial_design_cursor,
+            posterior_records=deepcopy(self._posterior_records),
+            last_full_dim_gp_state=deepcopy(self._last_full_dim_gp_state),
+            last_gp_fit_error=self._last_gp_fit_error,
+            sobol_engines={dimension: {"seed": engine.seed, "num_generated": engine.num_generated}
+                           for dimension, engine in self._sobol_engines.items()},
+        )
+        return result
 
     def _validate_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
-        """Validate checkpoint configuration and all global row alignment."""
-
-        required = {
-            "config",
-            "nodes",
-            "active_leaf_ids",
-            "root_id",
-            "global_actions",
-            "global_observations",
-            "global_posterior_means",
-            "global_posterior_stds",
-            "benchmark_actions",
-            "benchmark_means",
-            "current_leaf_id",
-            "current_path",
-            "remaining_sequence_steps",
-            "visit_start_best",
-            "visit_evaluations",
-            "next_node_id",
-            "batch_count",
-            "bad_visits",
-            "tree_epoch",
-            "restart_count",
-            "stopped",
-            "stopping_probability",
-            "stopping_action",
-            "stopping_mean",
+        del strict
+        if state.get("source_behavior_version") != self.SOURCE_BEHAVIOR_VERSION:
+            raise AGVSCheckpointError("AG-VS checkpoint predates source alignment; start a fresh trajectory.")
+        self._validate_turbo_numerics_version(state)
+        required = {item.name for item in fields(AGVSState)} | {
+            "numpy_generator_state", "source_turbo_rng_state", "source_torch_generator_state", "initial_design_points",
+            "initial_design_cursor", "posterior_records", "last_full_dim_gp_state", "sobol_engines",
         }
         missing = required - set(state)
         if missing:
-            raise AGVSCheckpointError(f"AG-VS state is missing: {sorted(missing)}.")
-        if (
-            self.config.inner_optimizer == "turbo"
-            and self.config.inner_turbo_config is not None
-            and self.config.inner_turbo_config.source_protocol == "mcts_vs_2022"
-            and state.get("source_turbo_numerics_version") != 3
-        ):
-            raise AGVSCheckpointError(
-                "Source TuRBO checkpoint does not match explicit Lanczos sampling protocol v3; "
-                "preserve the old trajectory and use a fresh output directory."
-            )
-        del strict
+            raise AGVSCheckpointError(f"AG-VS state is missing {sorted(missing)}.")
         actions = torch.as_tensor(state["global_actions"])
-        observations = torch.as_tensor(state["global_observations"])
-        means = torch.as_tensor(state["global_posterior_means"])
-        stds = torch.as_tensor(state["global_posterior_stds"])
+        count = len(actions)
         if actions.ndim != 2 or actions.shape[1] != self.action_dimension:
-            raise AGVSCheckpointError("Stored AG-VS actions have an invalid shape.")
-        count = actions.shape[0]
-        if any(value.ndim != 1 or value.shape[0] != count for value in (observations, means, stds)):
-            raise AGVSCheckpointError("Stored AG-VS global records are not row-aligned.")
-        benchmark_actions = torch.as_tensor(state["benchmark_actions"])
-        benchmark_means = torch.as_tensor(state["benchmark_means"])
-        if (
-            benchmark_actions.ndim != 2
-            or benchmark_actions.shape[1] != self.action_dimension
-            or benchmark_means.ndim != 1
-            or benchmark_means.shape[0] != benchmark_actions.shape[0]
-        ):
-            raise AGVSCheckpointError("Stored AG-VS benchmark records are not aligned.")
+            raise AGVSCheckpointError("Invalid global action shape.")
+        for name in ("global_observations", "global_posterior_means", "global_posterior_stds"):
+            if torch.as_tensor(state[name]).shape != (count,):
+                raise AGVSCheckpointError("Global observation/posterior records are not aligned.")
         nodes = state["nodes"]
-        if not isinstance(nodes, Mapping):
-            raise AGVSCheckpointError("Stored AG-VS nodes must be a mapping.")
-        node_ids = {int(key) for key in nodes}
-        if int(state["root_id"]) not in node_ids:
-            raise AGVSCheckpointError("Stored AG-VS tree has no valid root.")
-        for value in nodes.values():
-            proposal = value.get("proposal_optimizer")
-            if proposal is None:
-                if (
-                    self.config.inner_optimizer == "turbo"
-                    and not value["child_ids"]
-                    and not value["archived"]
-                    and value["score_history_rows"]
-                ):
-                    raise AGVSCheckpointError("A visited TuRBO leaf lacks its proposal state.")
-                continue
-            if self.config.inner_optimizer != "turbo" or value["child_ids"] or value["archived"]:
-                raise AGVSCheckpointError(
-                    "TuRBO proposal state belongs only to current TuRBO leaves."
-                )
-            try:
-                active = torch.as_tensor(
-                    value["active_indices"], dtype=torch.long, device=self.device
-                )
-                rows = torch.as_tensor(value["training_rows"], dtype=torch.long, device=self.device)
-                if rows.ndim != 1 or (rows < 0).any() or (rows >= count).any():
-                    raise ValueError("invalid training rows")
-                node = self._empty_node(
-                    node_id=int(value["node_id"]),
-                    depth=int(value["depth"]),
-                    parent_id=value["parent_id"],
-                    active_indices=active,
-                )
-                optimizer = self._new_proposal_optimizer(node)
-                optimizer.load_state_dict(proposal)
-                expected_actions = actions.to(dtype=self.dtype, device=self.device)[rows][:, active]
-                expected_values = observations.to(dtype=self.dtype, device=self.device)[rows]
-                expected_unit = normalize(expected_actions, optimizer.bounds)
-                if (
-                    not torch.equal(optimizer.X_train_unit, expected_unit)
-                    or not torch.equal(optimizer.y_train, expected_values)
-                    or not torch.equal(optimizer._observed_actions, expected_actions)
-                    or not torch.equal(optimizer._observed_values, expected_values)
-                    or optimizer.evaluations != len(value["score_history_rows"])
-                ):
-                    raise ValueError(
-                        "proposal history differs from the leaf's raw indexed observations"
-                    )
-            except Exception as error:
-                raise AGVSCheckpointError(f"Invalid AG-VS leaf proposal state: {error}") from error
+        if not isinstance(nodes, Mapping) or state["root_id"] not in nodes:
+            raise AGVSCheckpointError("AG-VS tree has no root.")
+        for key, node in nodes.items():
+            if node["node_id"] != key:
+                raise AGVSCheckpointError("Node key and identity disagree.")
+            active = torch.as_tensor(node["active_indices"])
+            if (active.ndim != 1 or not active.numel() or active.unique().numel() != active.numel()
+                    or bool((active < 0).any()) or bool((active >= self.action_dimension).any())):
+                raise AGVSCheckpointError("Invalid checkpoint node coordinates.")
+            for name in ("training_rows", "score_history_rows"):
+                rows = node[name]
+                if len(rows) != len(set(rows)) or any(not 0 <= row < count for row in rows):
+                    raise AGVSCheckpointError("Invalid checkpoint node row indices.")
+            if len(node["score_history_rows"]) != len(node["previous_benchmark_history"]) or node["score_mass"] != len(node["score_history_rows"]):
+                raise AGVSCheckpointError("Historical score evidence is not aligned.")
+            if any(child not in nodes or nodes[child]["parent_id"] != key for child in node["child_ids"]):
+                raise AGVSCheckpointError("Invalid tree adjacency.")
+            if node["model"] is not None:
+                self._restore_model(node["model"])
+        try:
+            temporary = np.random.default_rng()
+            temporary.bit_generator.state = deepcopy(state["numpy_generator_state"])
+            np.random.RandomState().set_state(state["source_turbo_rng_state"])
+            torch.Generator(device="cpu").set_state(torch.as_tensor(state["source_torch_generator_state"], dtype=torch.uint8).cpu())
+            for key, value in state.get("source_cuda_generator_states", {}).items():
+                if self.device.type != "cuda" or key != str(self.device):
+                    raise ValueError("A CUDA random stream belongs to a different device.")
+                torch.Generator(device=self.device).set_state(torch.as_tensor(value, dtype=torch.uint8).cpu())
+        except Exception as error:
+            raise AGVSCheckpointError("Invalid source RNG state.") from error
 
     def load_state_dict(self, state: Mapping[str, Any], *, strict: bool = True) -> None:
-        """Validate coupled parent/leaf pending proposals before changing state."""
+        implementation = state.get("algorithm_state", {})
+        if implementation.get("source_behavior_version") != self.SOURCE_BEHAVIOR_VERSION:
+            raise AGVSCheckpointError("AG-VS checkpoint predates source alignment; start a fresh trajectory.")
+        self._validate_turbo_numerics_version(implementation)
+        pending = state.get("last_ask")
+        self._loading_request_size = len(pending["actions"]) if pending is not None else None
+        try:
+            super().load_state_dict(state, strict=strict)
+        finally:
+            self._loading_request_size = None
 
-        implementation = state.get("algorithm_state")
-        if self.config.inner_optimizer == "turbo" and isinstance(implementation, Mapping):
-            nodes = implementation.get("nodes")
-            if isinstance(nodes, Mapping):
-                pending_leaf = []
-                for key, node in nodes.items():
-                    proposal = node.get("proposal_optimizer") if isinstance(node, Mapping) else None
-                    if isinstance(proposal, Mapping) and proposal.get("last_ask") is not None:
-                        pending_leaf.append((int(key), node, proposal["last_ask"]))
-                outer = state.get("last_ask")
-                scored_pending = isinstance(outer, Mapping) and not outer.get(
-                    "algorithm_metadata", {}
-                ).get("initial_design", False)
-                if not scored_pending:
-                    if pending_leaf:
-                        raise AGVSCheckpointError(
-                            "A leaf proposal is pending without a parent acquisition batch."
-                        )
-                else:
-                    try:
-                        if len(pending_leaf) != 1:
-                            raise ValueError("expected exactly one pending leaf")
-                        key, node, proposal = pending_leaf[0]
-                        assert isinstance(outer, Mapping)
-                        metadata = outer["algorithm_metadata"]
-                        active = torch.as_tensor(node["active_indices"], dtype=torch.long)
-                        full = torch.as_tensor(outer["actions"], dtype=self.dtype)
-                        projected = torch.as_tensor(proposal["actions"], dtype=self.dtype)
-                        if (
-                            key != metadata["node_id"]
-                            or key != implementation["current_leaf_id"]
-                            or full.shape != (self.request_size, self.action_dimension)
-                            or projected.shape != (self.request_size, active.numel())
-                            or not torch.equal(full[:, active], projected)
-                        ):
-                            raise ValueError("parent and leaf proposals disagree")
-                    except Exception as error:
-                        raise AGVSCheckpointError(
-                            f"Invalid pending AG-VS/TuRBO batch: {error}"
-                        ) from error
-        super().load_state_dict(state, strict=strict)
+    def _validate_turbo_numerics_version(self, state: Mapping[str, Any]) -> None:
+        if (self.config.inner_optimizer == "turbo"
+                and state.get("source_turbo_numerics_version") != self.SOURCE_TURBO_NUMERICS_VERSION):
+            raise AGVSCheckpointError(
+                "AG-VS TuRBO checkpoint uses an older numerical policy; "
+                f"start a fresh trajectory with source numerical version {self.SOURCE_TURBO_NUMERICS_VERSION}."
+            )
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
-        """Restore validated nodes, local GPs, global records, and visit state."""
-
         del strict
-        nodes: dict[int, AGVSNode] = {}
+        values = {item.name: deepcopy(state[item.name]) for item in fields(AGVSState) if item.name != "nodes"}
+        for key, value in values.items():
+            if isinstance(value, torch.Tensor):
+                values[key] = value.to(dtype=self.dtype, device=self.device).clone()
+        nodes = {}
         for key, value in state["nodes"].items():
-            active = torch.as_tensor(value["active_indices"], dtype=torch.long, device=self.device)
-            node = self._empty_node(
-                node_id=int(value["node_id"]),
-                depth=int(value["depth"]),
-                parent_id=value["parent_id"],
-                active_indices=active,
-                anchor=(
-                    None
-                    if value["anchor"] is None
-                    else torch.as_tensor(value["anchor"], dtype=self.dtype, device=self.device)
-                ),
-                training_rows=list(value["training_rows"]),
-                excluded=bool(value["excluded"]),
-                merge_disabled=bool(value["merge_disabled"]),
-                newly_retained=bool(value["newly_retained"]),
-            )
-            node.child_ids = list(value["child_ids"])
-            node.local_X = torch.as_tensor(
-                value["local_X"], dtype=self.dtype, device=self.device
-            ).clone()
-            node.local_y = torch.as_tensor(
-                value["local_y"], dtype=self.dtype, device=self.device
-            ).clone()
-            node.score_history_rows = list(value["score_history_rows"])
-            node.posterior_mean_history = list(value["posterior_mean_history"])
-            node.posterior_std_history = list(value["posterior_std_history"])
-            node.previous_benchmark_history = list(value["previous_benchmark_history"])
-            node.score = float(value["score"])
-            node.score_mass = int(value["score_mass"])
-            node.pre_split_score = value["pre_split_score"]
-            node.pre_split_mass = int(value["pre_split_mass"])
-            node.cohort_evaluated = bool(value["cohort_evaluated"])
-            node.archived = bool(value["archived"])
-            node.merge_completed = bool(value["merge_completed"])
-            if value.get("proposal_optimizer") is not None:
-                node.proposal_optimizer = self._new_proposal_optimizer(node)
-                node.proposal_optimizer.load_state_dict(value["proposal_optimizer"])
-            nodes[int(key)] = node
-
-        def tensor(name: str) -> torch.Tensor:
-            """Restore one floating state tensor on the algorithm device."""
-
-            return torch.as_tensor(state[name], dtype=self.dtype, device=self.device).clone()
-
-        stopping_action = state["stopping_action"]
-        self.state = AGVSState(
-            nodes=nodes,
-            active_leaf_ids=list(state["active_leaf_ids"]),
-            root_id=int(state["root_id"]),
-            global_actions=tensor("global_actions"),
-            global_observations=tensor("global_observations"),
-            global_posterior_means=tensor("global_posterior_means"),
-            global_posterior_stds=tensor("global_posterior_stds"),
-            benchmark_actions=tensor("benchmark_actions"),
-            benchmark_means=tensor("benchmark_means"),
-            current_leaf_id=state["current_leaf_id"],
-            current_path=list(state["current_path"]),
-            remaining_sequence_steps=int(state["remaining_sequence_steps"]),
-            visit_start_best=state["visit_start_best"],
-            visit_evaluations=int(state["visit_evaluations"]),
-            next_node_id=int(state["next_node_id"]),
-            batch_count=int(state["batch_count"]),
-            bad_visits=int(state["bad_visits"]),
-            tree_epoch=int(state["tree_epoch"]),
-            restart_count=int(state["restart_count"]),
-            stopped=bool(state["stopped"]),
-            stopping_probability=state["stopping_probability"],
-            stopping_action=(
-                None
-                if stopping_action is None
-                else torch.as_tensor(stopping_action, dtype=self.dtype, device=self.device).clone()
-            ),
-            stopping_mean=state["stopping_mean"],
-        )
-        if self.state.current_leaf_id is not None and not self.state.stopped:
-            self._fit_node_gp(self.state.nodes[self.state.current_leaf_id])
+            stored = deepcopy(value)
+            model_state = stored.pop("model")
+            proposal_state = stored.pop("proposal_optimizer")
+            for name in ("active_indices", "anchor", "local_X", "local_y"):
+                if stored[name] is not None:
+                    stored[name] = torch.as_tensor(stored[name], dtype=torch.long if name == "active_indices" else self.dtype, device=self.device).clone()
+            stored["fitted_rows"] = None if stored["fitted_rows"] is None else tuple(stored["fitted_rows"])
+            stored["model"] = self._restore_model(model_state)
+            stored["proposal_optimizer"] = None if proposal_state is None else TurboProposalState.from_state_dict(proposal_state)
+            nodes[int(key)] = AGVSNode(**stored)
+        self.state = AGVSState(nodes=nodes, **values)
+        self.numpy_generator.bit_generator.state = deepcopy(state["numpy_generator_state"])
+        self._source_turbo_rng.set_state(state["source_turbo_rng_state"])
+        self._source_torch_generator.set_state(torch.as_tensor(state["source_torch_generator_state"], dtype=torch.uint8).cpu())
+        self._source_cuda_generators = {}
+        for key, value in state.get("source_cuda_generator_states", {}).items():
+            generator = torch.Generator(device=self.device)
+            generator.set_state(torch.as_tensor(value, dtype=torch.uint8).cpu())
+            self._source_cuda_generators[key] = generator
+        points = state["initial_design_points"]
+        self._initial_design_points = None if points is None else torch.as_tensor(points, dtype=self.dtype, device=self.device).clone()
+        self._initial_design_cursor = int(state["initial_design_cursor"])
+        self._posterior_records = deepcopy(state["posterior_records"])
+        self._last_full_dim_gp_state = deepcopy(state["last_full_dim_gp_state"])
+        self._last_gp_fit_error = state.get("last_gp_fit_error")
+        self._sobol_engines = {}
+        for dimension, value in state["sobol_engines"].items():
+            engine = torch.quasirandom.SobolEngine(int(dimension), scramble=True, seed=int(value["seed"]))
+            if value["num_generated"]:
+                engine.fast_forward(int(value["num_generated"]))
+            self._sobol_engines[int(dimension)] = engine
 
     def _reset_impl(self) -> None:
-        """Reset tree and model dimension while retaining immutable configuration."""
-
+        self.numpy_generator = np.random.default_rng(self.seed)
+        self._source_turbo_rng = np.random.RandomState(self.seed)
+        self._source_torch_generator = torch.Generator(device="cpu").manual_seed(self.seed)
+        self._source_cuda_generators: dict[str, torch.Generator] = {}
+        self._sobol_engines: dict[int, Any] = {}
+        self._initial_design_points = None
+        self._initial_design_cursor = 0
+        self._posterior_records: dict[tuple[int, ...], dict[str, Any]] = {}
+        self._last_full_dim_gp_state = None
+        self._last_gp_fit_error = None
         self.state = self._fresh_state()
         self.model_input_dimension = self.action_dimension
 
 
-# Compatibility alias for releases that exposed the abbreviation without the
-# separator used by the algorithm's public name.
 AGVSConfig = AG_VSConfig
-
 
 __all__ = ["AG_VS", "AGVSConfig", "AGVSNode", "AGVSState", "AG_VSConfig"]

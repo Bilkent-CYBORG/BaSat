@@ -2154,9 +2154,11 @@ class Algorithm(ABC):
     def state_dict(self) -> dict[str, Any]:
         """Return versioned observations and search progress for continuation.
 
-        Fitted surrogate parameters are intentionally excluded by concrete
-        algorithms. After loading, the surrogate is rebuilt from the restored
-        algorithm observations with the current fitting budget.
+        Surrogate training data come from the algorithm's observation history,
+        never from an external checkpoint dataset. Most concrete algorithms
+        rebuild their surrogate after loading. Protocols with scheduled fitting
+        may also retain fitted hyperparameters so resume does not introduce an
+        extra fit or change a pending proposal; see the concrete algorithm.
         """
 
         snapshot = self._configuration_snapshot()

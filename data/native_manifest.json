@@ -1,0 +1,202 @@
+[
+  {
+    "environment": "stochastic",
+    "dataset": "diabetes",
+    "path": "data/stochastic/diabetes_bandit.csv",
+    "rows": 442,
+    "columns": [
+      "action_0",
+      "action_1",
+      "action_2",
+      "reward"
+    ],
+    "sha256": "a0de7dc9122f5aa5a88de3174b21fa81586ececc467e7e19c5e1ca60ef3e1f21",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/diabetes_data_raw.csv.gz",
+        "sha256": "a3e94cc7cea00f8a84fa5f6345203913a68efa42df18f87ddf9bead721bfd503"
+      },
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/diabetes_target.csv.gz",
+        "sha256": "8e53f65eb811df43c206f3534bb3af0e5fed213bc37ed6ba36310157d6023803"
+      }
+    ],
+    "source_documentation": "https://scikit-learn.org/1.6/datasets/toy_dataset.html",
+    "scaling": {
+      "source_columns": [
+        2,
+        3,
+        8
+      ],
+      "minimum": [
+        18.0,
+        62.0,
+        3.2581
+      ],
+      "maximum": [
+        42.2,
+        133.0,
+        6.107
+      ]
+    },
+    "action_meanings": [
+      "BMI",
+      "blood pressure",
+      "s5"
+    ],
+    "reward_meaning": "Negative recorded one-year disease-progression response.",
+    "construction": "Search among measured patients; no intervention or causal claim.",
+    "unique_actions": 442
+  },
+  {
+    "environment": "contextual",
+    "dataset": "wine",
+    "path": "data/contextual/wine_bandit.csv",
+    "rows": 178,
+    "columns": [
+      "action_0",
+      "action_1",
+      "action_2",
+      "context_0",
+      "context_1",
+      "context_2",
+      "reward"
+    ],
+    "sha256": "c31cfc0accb36712c1488ad4d49d537725472fc77b1111c754c1116380f57f10",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/wine_data.csv",
+        "sha256": "10e8a802908b34f86e5da8ce962f3c806694bc98450a18f61851af59f324bede"
+      }
+    ],
+    "source_documentation": "https://scikit-learn.org/1.6/datasets/toy_dataset.html",
+    "scaling": {
+      "source_columns": [
+        0,
+        1,
+        2
+      ],
+      "minimum": [
+        11.03,
+        0.74,
+        1.36
+      ],
+      "maximum": [
+        14.83,
+        5.8,
+        3.23
+      ]
+    },
+    "action_meanings": [
+      "alcohol",
+      "malic acid",
+      "ash"
+    ],
+    "context_meaning": "One-hot recorded cultivar category, revealed first; context_0, context_1, context_2 identify the three categories.",
+    "reward_meaning": "Recorded proline concentration; not wine quality.",
+    "construction": "Choose among observed wines of the revealed cultivar.",
+    "unique_actions": 178
+  },
+  {
+    "environment": "distributional",
+    "dataset": "opsd_wind_power",
+    "path": "data/distributional/wind_power_bandit.csv",
+    "rows": 1111,
+    "columns": [
+      "action_0",
+      "context_0",
+      "reference_probability",
+      "sampling_probability",
+      "margin",
+      "reward"
+    ],
+    "unique_actions": 101,
+    "context_support": [
+      0.0,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9,
+      1.0
+    ],
+    "sha256": "097ba412d5351767cc6bd0a76e91c686723ac6241b634647e84fd370fef11bfa",
+    "sources": [
+      {
+        "url": "https://data.open-power-system-data.org/time_series/2019-06-05/time_series_60min_singleindex.csv",
+        "retained_subset": "data/distributional/opsd_wind_2013.csv",
+        "sha256": "bec340914646f01f2c2c9fa1ec5d9a4d74088e7f49338afd020fd122c77d908f",
+        "years": [
+          2013
+        ],
+        "columns": [
+          "utc_timestamp",
+          "DE_wind_generation_actual",
+          "DE_wind_capacity",
+          "DE_wind_profile"
+        ],
+        "rows": 98
+      }
+    ],
+    "paper": "https://proceedings.mlr.press/v108/kirschner20a/kirschner20a.pdf",
+    "source_documentation": "https://data.open-power-system-data.org/time_series/2019-06-05/",
+    "action_meanings": [
+      "Energy commitment as a fraction of capacity, grid 0:0.01:1"
+    ],
+    "context_meaning": "Recorded German wind capacity factor, rounded to nearest 0.1. All 11 grid contexts are present in the reward table.",
+    "reward_meaning": "Constructed revenue 0.1*max(c-x,0)+min(x,c)-5*max(x-c,0); not a recorded market payment.",
+    "construction": "50-hour chronological replay after 48-hour public history. Reference updated using only the preceding 48 observations. Private sampling vector is a point mass on the next recorded, quantized observation. Margin 0.1 is an illustrative fixed choice. Finite CSV grid computes revenue from the published formula, not inferred missing physical measurements. Repeated actions allowed. This is a reduced replay adaptation, not a reproduction of the paper annual simulator experiment."
+  },
+  {
+    "environment": "adversarial",
+    "dataset": "iris",
+    "path": "data/adversarial/iris_bandit.csv",
+    "rows": 143,
+    "columns": [
+      "action_0",
+      "action_1",
+      "action_2",
+      "evaluated_action_0",
+      "evaluated_action_1",
+      "evaluated_action_2",
+      "reward"
+    ],
+    "sha256": "6fc279562a8b54a7f6826a5617c54016bd356480899e0e36d243d9b202d1c4ae",
+    "sources": [
+      {
+        "url": "https://raw.githubusercontent.com/scikit-learn/scikit-learn/1.6.1/sklearn/datasets/data/iris.csv",
+        "sha256": "f13ffa8fdd56fd8e6c8d16d4081a3fbd3114bcd0aae4256c43205169cd9d1449"
+      }
+    ],
+    "source_documentation": "https://scikit-learn.org/1.6/datasets/toy_dataset.html",
+    "scaling": {
+      "source_columns": [
+        1,
+        2,
+        3
+      ],
+      "minimum": [
+        2.0,
+        1.0,
+        0.1
+      ],
+      "maximum": [
+        4.4,
+        6.9,
+        2.5
+      ]
+    },
+    "action_meanings": [
+      "sepal width",
+      "petal length",
+      "petal width"
+    ],
+    "reward_meaning": "Recorded sepal length at the evaluated descriptor coordinate.",
+    "construction": "Explicit artificial permutation attack on a measured finite table. Duplicate descriptor triples retain the first measured specimen; paired sorted coordinates are exchanged, with an odd last point fixed.",
+    "unique_actions": 143
+  }
+]

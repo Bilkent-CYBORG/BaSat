@@ -1,7 +1,9 @@
 """Adaptive Linear Embedding Bayesian Optimization (ALEBO).
 
 Continuous ALEBO uses the exact polytope ``{y: -1 <= B^dagger y <= 1}``; it never
-replaces that domain by a box and never clips a substantively infeasible map.
+replaces that domain by a box. The explicit Ax 0.1.17 source protocol retains
+finite optimized endpoints and clips their ambient map, as its release does;
+the native and Ax 0.2.2 policies retain their strict feasibility certificates.
 Finite-row selection uses a separately warned projection extension by default.
 """
 
@@ -15,8 +17,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 import gpytorch
+import numpy as np
 import torch
 import torch.nn.functional as F
+from botorch.acquisition.analytic import ExpectedImprovement
 from botorch.models.model import Model
 from botorch.posteriors.gpytorch import GPyTorchPosterior
 from linear_operator.utils.errors import NanError, NotPSDError  # type: ignore[import-untyped]
@@ -37,6 +41,7 @@ from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
 from basat.models.utils import Bounds, from_symmetric_box, to_symmetric_box
 from basat.warnings import translate_backend_warnings
 
+from ._ax_source_random import export_streams, validate_streams
 from .Exception.exception_ALEBO import (
     ALEBOAcquisitionOptimizationError,
     ALEBOCheckpointError,
@@ -49,6 +54,43 @@ from .Exception.exception_ALEBO import (
 )
 
 _AX_OPTIMIZATION_POLICY = "ax-fresh-map-ordinary-ei-v2"
+_AX01_OPTIMIZATION_POLICY = "ax-0.1.17-owned-streams-exact-metric-ei-ambient-clip-v4"
+
+
+class _Ax01ExpectedImprovement(ExpectedImprovement):
+    """Ordinary historical EI with its floor in transformed outcome units."""
+
+    def _mean_and_sigma(
+        self, X: torch.Tensor, compute_sigma: bool = True, min_var: float = 1e-9
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        del min_var
+        return super()._mean_and_sigma(X, compute_sigma=compute_sigma, min_var=1e-9)
+
+
+class _Ax01StandardizedModel(Model):
+    """Expose the historical GP's standardized posterior without a round trip."""
+
+    def __init__(self, model: Any) -> None:
+        super().__init__()
+        self.source_model = model
+
+    @property
+    def num_outputs(self) -> int:
+        return 1
+
+    def posterior(
+        self, X: torch.Tensor, output_indices: Any = None, observation_noise: Any = False,
+        posterior_transform: Any = None, **kwargs: Any,
+    ) -> GPyTorchPosterior:
+        if output_indices is not None or observation_noise is not False:
+            raise ValueError("Historical ALEBO EI requires a single latent output.")
+        if isinstance(self.source_model, _ALEBOMomentMatchedModel):
+            posterior = self.source_model.posterior(X, standardized_outputs=True, **kwargs)
+        else:
+            # ExactGP.__call__ returns standardized coordinates; SingleTaskGP's
+            # posterior() would undo them with its outcome transform.
+            posterior = GPyTorchPosterior(self.source_model(X))
+        return posterior if posterior_transform is None else posterior_transform(posterior)
 
 
 class ALEBOMahalanobisKernel(gpytorch.kernels.Kernel):
@@ -57,7 +99,8 @@ class ALEBOMahalanobisKernel(gpytorch.kernels.Kernel):
     _ROUNDOFF_MARGIN = 8.0
 
     def __init__(
-        self, dimension: int, min_diagonal: float = 1e-6, *, source_coordinates: bool = False
+        self, dimension: int, min_diagonal: float = 1e-6, *, source_coordinates: bool = False,
+        exact_source_metric: bool = False,
     ) -> None:
         """Initialize an unconstrained Cholesky parameter for ``D_model``."""
 
@@ -65,6 +108,7 @@ class ALEBOMahalanobisKernel(gpytorch.kernels.Kernel):
         self.raw_lower = torch.nn.Parameter(torch.zeros(dimension, dimension))
         self.min_diagonal = min_diagonal
         self.source_coordinates = source_coordinates
+        self.exact_source_metric = exact_source_metric
 
     def _lower_factor(self, raw_lower: torch.Tensor | None = None) -> torch.Tensor:
         """Return ALEBO's constrained lower-triangular metric factor."""
@@ -88,6 +132,8 @@ class ALEBOMahalanobisKernel(gpytorch.kernels.Kernel):
         out of ALEBO's metric-parameter optimization objective.
         """
 
+        if self.exact_source_metric:
+            return lower.new_zeros(())
         gram_diagonal = lower.square().sum(dim=-1)
         scale = gram_diagonal.amax().clamp_min(1.0).detach()
         dimension = lower.shape[-1]
@@ -126,6 +172,10 @@ class ALEBOMahalanobisKernel(gpytorch.kernels.Kernel):
         """
 
         del params
+        if self.exact_source_metric:
+            lower = self._lower_factor()
+            squared = self.covar_dist(y1 @ lower, y2 @ lower, diag=diag, square_dist=True)
+            return squared.div(-2).exp()
         difference = y1.unsqueeze(-2) - y2.unsqueeze(-3)
         lower = self._lower_factor()
         jitter = self._roundoff_jitter(lower)
@@ -155,6 +205,7 @@ class _ALEBOMomentMatchedModel(Model):
         model: Any = gp.model
         assert model is not None
         base = model.covar_module.base_kernel
+        self.exact_source_metric = base.exact_source_metric
         self.register_buffer("train_X", model.train_inputs[0].detach().clone())
         self.register_buffer(
             "factors",
@@ -205,6 +256,10 @@ class _ALEBOMomentMatchedModel(Model):
     def _covariance(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
         Xs = X.unsqueeze(-3) @ self.factors
         Zs = Z.unsqueeze(-3) @ self.factors
+        if self.exact_source_metric:
+            from gpytorch.kernels.kernel import sq_dist
+
+            return self.scale * sq_dist(Xs, Zs, x1_eq_x2=torch.equal(Xs, Zs)).div(-2).exp()
         delta = Xs.unsqueeze(-2) - Zs.unsqueeze(-3)
         physical = X.unsqueeze(-2) - Z.unsqueeze(-3)
         return self.scale * torch.exp(
@@ -221,6 +276,7 @@ class _ALEBOMomentMatchedModel(Model):
         output_indices: Any = None,
         observation_noise: Any = False,
         posterior_transform: Any = None,
+        standardized_outputs: bool = False,
         **kwargs: Any,
     ) -> GPyTorchPosterior:
         del kwargs
@@ -235,12 +291,19 @@ class _ALEBOMomentMatchedModel(Model):
         covariance = (
             covariances.mean(dim=-3) + (centered.transpose(-1, -2) @ centered) / means.shape[-2]
         )
+        if self.exact_source_metric:
+            covariance = (
+                covariances.mean(dim=-3)
+                + (means.transpose(-1, -2) @ means) / means.shape[-2]
+                - mean.unsqueeze(-1) @ mean.unsqueeze(-2)
+            )
         if observation_noise:
             covariance = covariance + self.noise.mean() * torch.eye(
                 X.shape[-2], dtype=X.dtype, device=X.device
             )
-        mean = mean * self.outcome_std + self.outcome_mean
-        covariance = covariance * self.outcome_std.square()
+        if not standardized_outputs:
+            mean = mean * self.outcome_std + self.outcome_mean
+            covariance = covariance * self.outcome_std.square()
         posterior = GPyTorchPosterior(gpytorch.distributions.MultivariateNormal(mean, covariance))
         return posterior if posterior_transform is None else posterior_transform(posterior)
 
@@ -263,13 +326,17 @@ class ALEBOConfig:
         ``"paper"``, ``"sobol"``, or ``"uniform"`` initial-design sampling.
     source_protocol:
         ``"basat"`` retains the native metric implementation. Historical
-        ``"ax_0_1_17"`` and ``"ax_0_2_2"`` use equivalent custom ALEBO
+        ``"ax_0_1_17"`` and ``"ax_0_2_2"`` use custom ALEBO
         protocols: unrestricted triangular U, TNC fitting, finite-difference
         Laplace curvature and ambient projection/rejection initializers.
         In these modes ``noise_variance`` is in standardized reward units;
         set it to 1e-7 for the released deterministic benchmark. Every update
         uses fresh MAP restarts and ordinary standardized EI, not a warm start
         or LogEI. Checkpoints retain observations and random-stream progress.
+        Ax 0.1.17 additionally preserves the released upper-triangle parameter
+        order, NumPy metric samples and unregularized metric. Its unrecorded
+        initializer entropy is replaced by a separately checkpointed seed stream;
+        this makes new trials reproducible, not identical to unknown author seeds.
     metric_inference, metric_posterior_samples:
         Laplace or qualified MAP Mahalanobis-metric approximation controls.
     feasibility_tolerance, acquisition_solver:
@@ -411,6 +478,14 @@ class ALEBO(Algorithm):
             verbose_setting=verbose_setting,
             verbose_iter_by_iter=verbose_iter_by_iter,
         )
+        if config.source_protocol == "ax_0_1_17" and self.device.type != "cpu":
+            raise AlgorithmConfigurationError("Historical Ax streams require device='cpu'.")
+        self._source_rng = np.random.RandomState(config.seed)
+        self._initializer_seed_rng = np.random.RandomState(config.seed)
+        self._initializer_seeds: list[dict[str, Any]] = []
+        self._source_evaluation_draws = 0
+        self._source_readback_draws = 0
+        self._source_last_sampled_X: torch.Tensor | None = None
         B = self._sample_projection(config.embedding_dimension, self.action_dimension)
         B_pinv, A_ineq, b_ineq = self._make_polytope(B)
         self.state = ALEBOState(
@@ -433,7 +508,8 @@ class ALEBO(Algorithm):
         )
         self.model_input_dimension = config.embedding_dimension
         self.metric_kernel = ALEBOMahalanobisKernel(
-            config.embedding_dimension, source_coordinates=config.source_protocol.startswith("ax_")
+            config.embedding_dimension, source_coordinates=config.source_protocol.startswith("ax_"),
+            exact_source_metric=config.source_protocol == "ax_0_1_17",
         ).to(dtype=self.dtype, device=self.device)
         self.gp = GaussianProcess(
             GaussianProcessConfig(
@@ -510,7 +586,11 @@ class ALEBO(Algorithm):
             matrix = torch.randn(
                 (d, D), dtype=self.dtype, device=self.device, generator=self.generator
             )
-            norms = torch.linalg.vector_norm(matrix, dim=0)
+            norms = (
+                torch.sqrt((matrix ** 2).sum(dim=0))
+                if self.config.source_protocol == "ax_0_1_17"
+                else torch.linalg.vector_norm(matrix, dim=0)
+            )
             if bool((norms <= torch.finfo(self.dtype).tiny).any()):
                 continue
             B = matrix / norms
@@ -521,7 +601,11 @@ class ALEBO(Algorithm):
     def _make_polytope(self, B: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Construct B-pseudoinverse and exact ambient box inequalities."""
 
-        B_pinv = torch.linalg.pinv(B, rcond=1e-12)
+        B_pinv = (
+            torch.pinverse(B)
+            if self.config.source_protocol == "ax_0_1_17"
+            else torch.linalg.pinv(B, rcond=1e-12)
+        )
         A_ineq = torch.cat((B_pinv, -B_pinv), dim=0)
         b_ineq = torch.ones(2 * self.action_dimension, dtype=self.dtype, device=self.device)
         return B_pinv, A_ineq, b_ineq
@@ -533,8 +617,28 @@ class ALEBO(Algorithm):
         return residual.max(dim=-1).values <= self.config.feasibility_tolerance
 
     def _map_y_to_action(self, Y: torch.Tensor) -> torch.Tensor:
-        """Map feasible y through B-dagger, rejecting substantive violations."""
+        """Map through B-dagger with the selected protocol's box policy."""
 
+        if self.config.source_protocol == "ax_0_1_17":
+            # Ax 0.1.17 ALEBO.gen selects the best SLSQP endpoint before
+            # projecting up, then clamps Xopt. A post-hoc latent certificate
+            # would discard source candidates and change the selected action.
+            X = (self.state.B_pinv @ Y.T).T
+            if not bool(torch.isfinite(Y).all() & torch.isfinite(X).all()):
+                raise ALEBOPolytopeError("ALEBO source map is non-finite.", algorithm=self)
+            excess = float((X.abs() - 1.0).clamp_min(0).max().item())
+            if excess > 0:
+                warnings.warn(
+                    "Ax 0.1.17 ALEBO source projection: clipping the selected "
+                    f"ambient action to [-1, 1]; maximum box excess={excess:.17g}. "
+                    "This follows the released source endpoint policy; feedback "
+                    "is projected from the evaluated, clipped action.",
+                    ALEBOWarning,
+                    stacklevel=2,
+                )
+            return from_symmetric_box(
+                X.clamp(-1.0, 1.0), self.bounds.to(dtype=self.dtype, device=self.device)
+            )
         if not bool(self._is_feasible_y(Y).all()):
             raise ALEBOPolytopeError("ALEBO candidate left the exact polytope.", algorithm=self)
         X = Y @ self.state.B_pinv.T
@@ -677,6 +781,28 @@ class ALEBO(Algorithm):
     ) -> torch.Tensor:
         """Sample the polytope by rejection, then hit-and-run if necessary."""
 
+        if self.config.source_protocol == "ax_0_1_17":
+            # Ax reconstructs an entropy-seeded NumPy UniformGenerator for
+            # each initial gen(), and another for each acquisition pool. A
+            # separately owned recorded seed stream replaces that unavailable
+            # entropy without consuming either historical proposal stream.
+            seed = int(self._initializer_seed_rng.randint(0, 2**32, dtype=np.uint32))
+            self._initializer_seeds.append({"phase": phase, "seed": seed})
+            rng = np.random.RandomState(seed)
+            sample_count = 10000 if phase == "initial" else 10 * count
+            source_unit = rng.uniform(size=(sample_count, self.action_dimension))
+            B = self.state.B.detach().cpu().numpy()
+            projection = np.linalg.pinv(B) @ B
+            width = 16.0
+            while True:
+                source_ambient = (2 * width * source_unit - width) @ projection.T
+                source_feasible = source_ambient[((source_ambient >= -1) & (source_ambient <= 1)).all(axis=1)]
+                if len(source_feasible) >= count:
+                    self._source_last_sampled_X = torch.as_tensor(
+                        source_feasible[:count].copy(), dtype=self.dtype, device=self.device
+                    )
+                    return self._source_last_sampled_X @ self.state.B.T
+                width /= 2
         if self.config.source_protocol.startswith("ax_"):
             # Ax ALEBOInitializer: ambient uniform points, projection, then
             # rejection with a shared box half-width beginning at16.
@@ -750,7 +876,11 @@ class ALEBO(Algorithm):
         """Synchronize non-empty ALEBO training tensors with the GP wrapper."""
 
         if self.state.y_train.numel():
-            quality = to_quality(self.state.y_train, maximize=self.maximize)
+            quality = (
+                self.state.y_train
+                if self.config.source_protocol == "ax_0_1_17"
+                else to_quality(self.state.y_train, maximize=self.maximize)
+            )
             source_noise = None
             if self.config.source_protocol.startswith("ax_"):
                 variance = quality.var() if quality.numel() > 1 else quality.new_tensor(1.0)
@@ -764,6 +894,24 @@ class ALEBO(Algorithm):
                 quality,
                 noise_variance=source_noise,
             )
+            if self.config.source_protocol == "ax_0_1_17":
+                from ._historical_ax01 import standardize_ax01_outcomes
+
+                standardized, mean, std = standardize_ax01_outcomes(quality)
+                source_model: Any = self.gp.model
+                assert source_model is not None
+                # Ax 0.1.17 StandardizeY uses NumPy population SD (ddof=0),
+                # unlike modern BoTorch's sample SD. Preserve raw learner data
+                # while matching targets, transform and fixed noise exactly.
+                source_model.set_train_data(targets=standardized, strict=False)
+                with torch.no_grad():
+                    transform = source_model.outcome_transform
+                    transform.means.fill_(mean)
+                    transform.stdvs.fill_(std)
+                    transform._stdvs_sq.fill_(std * std)
+                    source_model.likelihood.noise_covar.noise.fill_(self.config.noise_variance)
+                    assert self.gp.observation_noise is not None
+                    self.gp.observation_noise.fill_(self.config.noise_variance * std * std)
 
     def _fit_source_gp(self) -> None:
         """Fit exactly mean, raw outputscale and unrestricted triangular U via TNC."""
@@ -773,9 +921,7 @@ class ALEBO(Algorithm):
         model, mll = self.gp.model, self.gp.mll
         assert model is not None and mll is not None
         base = model.covar_module.base_kernel
-        indices = torch.tril_indices(
-            self.config.embedding_dimension, self.config.embedding_dimension
-        )
+        indices = self._metric_parameter_indices()
         parameters = (
             model.mean_module.raw_constant,
             model.covar_module.raw_outputscale,
@@ -818,9 +964,31 @@ class ALEBO(Algorithm):
         with translate_backend_warnings(operation="Historical Ax ALEBO TNC hyperparameter fit"):
             fitted = minimize(objective, initial, jac=True, method="TNC")
             objective(fitted.x)
+        if not fitted.success:
+            warnings.warn(
+                f"ALEBO TNC hyperparameter fit returned status {fitted.status}: {fitted.message}. "
+                "Retaining its finite endpoint, as in the released source.",
+                ALEBOWarning, stacklevel=2,
+            )
         model.eval()
         mll.eval()
         self.gp.is_fit = True
+
+    def _metric_parameter_indices(self) -> torch.Tensor:
+        """Map source upper-triangle row order into transposed lower storage."""
+        d = self.config.embedding_dimension
+        if self.config.source_protocol == "ax_0_1_17":
+            return torch.triu_indices(d, d, device=self.device).flip(0)
+        return torch.tril_indices(d, d, device=self.device)
+
+    def _draw_initial_metric(self) -> torch.Tensor:
+        """One source ALEBOKernel construction, including its owned Torch draw."""
+        dimension = self.action_dimension
+        rotation = torch.linalg.qr(torch.randn(
+            dimension, dimension, dtype=self.dtype, device=self.device, generator=self.generator
+        )).Q
+        embedding = rotation[: self.config.embedding_dimension] @ self.state.B_pinv
+        return torch.linalg.cholesky(embedding.T @ embedding)
 
     def _fit_model(self) -> None:
         """Fit the GP and record MAP or local-Laplace metric state.
@@ -845,18 +1013,7 @@ class ALEBO(Algorithm):
                 model = self.gp.model
                 assert model is not None
                 model.load_state_dict(fresh_state)
-                dimension = self.action_dimension
-                rotation = torch.linalg.qr(
-                    torch.randn(
-                        dimension,
-                        dimension,
-                        dtype=self.dtype,
-                        device=self.device,
-                        generator=self.generator,
-                    )
-                ).Q
-                embedding = rotation[: self.config.embedding_dimension] @ self.state.B_pinv
-                factor = torch.linalg.cholesky(embedding.T @ embedding)
+                factor = self._draw_initial_metric()
                 raw = factor.clone()
                 if not self.config.source_protocol.startswith("ax_"):
                     diagonal = (factor.diag() - 1e-6).clamp_min(1e-12)
@@ -882,6 +1039,10 @@ class ALEBO(Algorithm):
                     best_loss = objective
                     best_state = copy.deepcopy(fitted_model.state_dict())
             assert self.gp.model is not None and best_state is not None
+            if self.config.source_protocol == "ax_0_1_17":
+                # get_map_model constructs one more kernel before loading the
+                # selected MAP state. Its random initialization is overwritten.
+                self._draw_initial_metric()
             self.gp.model.load_state_dict(best_state)
             self._metric_fit_state = None
         except Exception as error:
@@ -898,7 +1059,9 @@ class ALEBO(Algorithm):
             "roundoff_jitter": roundoff_jitter.detach().clone(),
         }
         _, certificate = torch.linalg.cholesky_ex(metric)
-        if not bool(torch.isfinite(metric).all()) or int(certificate.item()) != 0:
+        if not bool(torch.isfinite(metric).all()) or (
+            self.config.source_protocol != "ax_0_1_17" and int(certificate.item()) != 0
+        ):
             raise ALEBOMetricError(
                 "ALEBO metric failed its finite Cholesky positive-definiteness certificate.",
                 algorithm=self,
@@ -916,6 +1079,7 @@ class ALEBO(Algorithm):
             loss = -mll(model(model.train_inputs[0]), model.train_targets)
             gradient = torch.autograd.grad(loss, base.raw_lower, create_graph=True)[0]
             variance = torch.zeros_like(raw)
+            source_curvature: list[float] = []
             for row in range(raw.shape[0]):
                 for column in range(row + 1):
                     if self.config.source_protocol.startswith("ax_"):
@@ -927,7 +1091,12 @@ class ALEBO(Algorithm):
                         shifted_gradient = torch.autograd.grad(shifted_loss, base.raw_lower)[0]
                         curvature = (
                             shifted_gradient[row, column] - gradient[row, column].detach()
-                        ) / epsilon
+                        ) / (
+                            (raw[row, column] + epsilon) - raw[row, column]
+                            if self.config.source_protocol == "ax_0_1_17" else epsilon
+                        )
+                        if self.config.source_protocol == "ax_0_1_17":
+                            source_curvature.append(float(curvature.detach()))
                         # NumPy's released multivariate_normal uses singular
                         # values if its numerical covariance is indefinite.
                         variance[row, column] = (
@@ -945,16 +1114,47 @@ class ALEBO(Algorithm):
             model.eval()
             mll.eval()
             self.state.metric_posterior_samples = []
+            source_samples = None
+            if self.config.source_protocol == "ax_0_1_17":
+                # The release samples the triangular vector with NumPy's SVD
+                # multivariate-normal implementation, not a dense Torch matrix
+                # or componentwise absolute/clipped Hessian variances.
+                indices = self._metric_parameter_indices()
+                curvatures = torch.zeros_like(raw)
+                curvatures[torch.tril_indices(raw.shape[0], raw.shape[0]).unbind()] = raw.new_tensor(source_curvature)
+                source_diagonal = curvatures[indices[0], indices[1]].cpu().numpy() + 1e-3
+                covariance = np.linalg.inv(np.diag(source_diagonal))
+                mean = raw[indices[0], indices[1]].cpu().numpy()
+                # NumPy reports this warning at its caller, so the generic
+                # dependency-path translator cannot identify it reliably.
+                # Relabel locally without repairing the covariance or changing
+                # the released SVD sampler, its draws, or its random stream.
+                with warnings.catch_warnings(record=True) as sampling_warnings:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    samples = self._source_rng.multivariate_normal(
+                        mean, covariance, size=self.config.metric_posterior_samples - 1
+                    )
+                for warning in sampling_warnings:
+                    warnings.warn(
+                        "Ax 0.1.17 ALEBO Laplace metric sampling: "
+                        f"{warning.message}",
+                        ALEBOWarning,
+                        stacklevel=2,
+                    )
+                source_samples = np.vstack((mean, samples))
             for sample_index in range(self.config.metric_posterior_samples):
-                perturbation = variance.sqrt() * torch.randn(
-                    raw.shape,
-                    dtype=self.dtype,
-                    device=self.device,
-                    generator=self.generator,
-                )
-                if sample_index == 0:
-                    perturbation.zero_()
-                sample_raw = raw + torch.tril(perturbation)
+                if source_samples is not None:
+                    sample_raw = torch.zeros_like(raw)
+                    sample_raw[indices[0], indices[1]] = torch.as_tensor(
+                        source_samples[sample_index], dtype=self.dtype, device=self.device
+                    )
+                else:
+                    perturbation = variance.sqrt() * torch.randn(
+                        raw.shape, dtype=self.dtype, device=self.device, generator=self.generator,
+                    )
+                    if sample_index == 0:
+                        perturbation.zero_()
+                    sample_raw = raw + torch.tril(perturbation)
                 lower = base._lower_factor(sample_raw)
                 sample_metric, sample_jitter = base._metric_from_factor(lower)
                 self.state.metric_posterior_samples.append(
@@ -964,12 +1164,16 @@ class ALEBO(Algorithm):
                         "roundoff_jitter": sample_jitter,
                     }
                 )
+            if self.config.source_protocol == "ax_0_1_17":
+                # get_batch_model constructs another subsequently overwritten
+                # kernel, consuming one additional D-by-D Torch normal draw.
+                self._draw_initial_metric()
             self._mixture_model = _ALEBOMomentMatchedModel(
                 self.gp, self.state.metric_posterior_samples
             )
 
     def _optimize_constrained_acquisition(self, acquisition: Any) -> tuple[torch.Tensor, float]:
-        """Screen feasible starts, refine with derivatives, and retain certified points."""
+        """Refine feasible starts and apply the selected endpoint policy."""
         try:
             import numpy as np
             from scipy.optimize import LinearConstraint, minimize
@@ -1004,17 +1208,32 @@ class ALEBO(Algorithm):
                     operation="Historical Ax ALEBO nonnegative-EI starting points"
                 ),
             ):
-                torch.manual_seed(self.config.seed + self.iteration)
-                starts, _ = initialize_q_batch_nonneg(
-                    X=pool[indices].unsqueeze(1),
-                    acq_vals=pool_values[indices],
-                    n=self.config.num_restarts,
-                )
+                if self.config.source_protocol == "ax_0_1_17":
+                    torch.set_rng_state(self.generator.get_state())
+                else:
+                    torch.manual_seed(self.config.seed + self.iteration)
+                try:
+                    if self.config.source_protocol == "ax_0_1_17":
+                        from ._historical_ax01 import select_nonnegative_starts
+
+                        starts = select_nonnegative_starts(
+                            pool[indices].unsqueeze(1), pool_values[indices], self.config.num_restarts
+                        )
+                    else:
+                        starts, _ = initialize_q_batch_nonneg(
+                            X=pool[indices].unsqueeze(1),
+                            acq_vals=pool_values[indices],
+                            n=self.config.num_restarts,
+                        )
+                finally:
+                    if self.config.source_protocol == "ax_0_1_17":
+                        self.generator.set_state(torch.get_rng_state())
             starts = starts.squeeze(1)
         else:
             starts = pool[selected]
         best = pool[selected[0] : selected[0] + 1].detach().clone()
         source_protocol = self.config.source_protocol.startswith("ax_")
+        source_clip = self.config.source_protocol == "ax_0_1_17"
         # The source selects the best optimized endpoint, not the best of
         # endpoints and the original raw candidate pool.
         best_value = -math.inf if source_protocol else float(pool_values[selected[0]])
@@ -1099,7 +1318,7 @@ class ALEBO(Algorithm):
             if (
                 not bool(torch.isfinite(candidate).all())
                 or not math.isfinite(residual)
-                or residual > self.config.feasibility_tolerance
+                or (not source_clip and residual > self.config.feasibility_tolerance)
             ):
                 failures.append(
                     {
@@ -1140,6 +1359,12 @@ class ALEBO(Algorithm):
                     {"success": False, "message": str(result.message), "residual": residual}
                 )
         if accepted == 0 and source_protocol:
+            if source_clip:
+                raise ALEBOAcquisitionOptimizationError(
+                    "Ax 0.1.17 ALEBO has no finite optimized acquisition endpoint. "
+                    f"No screened-point substitution was made. Diagnostics: {failures}",
+                    algorithm=self,
+                )
             best_value = float(pool_values[selected[0]])
             failures.append(
                 {
@@ -1150,10 +1375,18 @@ class ALEBO(Algorithm):
                 }
             )
         if failures:
+            endpoint_policy = (
+                "Returning the best finite source endpoint, with released ambient "
+                f"clipping on projection; {accepted} local endpoints were finite. "
+                "Non-finite endpoints were not substituted with screened points."
+                if source_clip else
+                "Returning the best independently feasible finite acquisition point; "
+                f"{accepted} local endpoints were feasible. A screened feasible point "
+                "is retained if refinement cannot improve it."
+            )
             warnings.warn(
                 f"ALEBO constrained refinement diagnostics: {failures}. "
-                f"Returning the best independently feasible finite acquisition point; {accepted} local endpoints were feasible. "
-                "A screened feasible point is retained if refinement cannot improve it.",
+                f"{endpoint_policy}",
                 ALEBOWarning,
                 stacklevel=2,
             )
@@ -1189,7 +1422,14 @@ class ALEBO(Algorithm):
         if self.state.y_train.numel() < self._initial_design_size():
             if table is None:
                 Y = self._sample_feasible_Y(1, phase="initial")
-                action = self._map_y_to_action(Y)
+                if self.config.source_protocol == "ax_0_1_17":
+                    assert self._source_last_sampled_X is not None
+                    action = from_symmetric_box(
+                        self._source_last_sampled_X,
+                        self.bounds.to(dtype=self.dtype, device=self.device),
+                    )
+                else:
+                    action = self._map_y_to_action(Y)
             else:
                 position = int(torch.argmin(table.dataset_indices).item())
                 Y = table.model_inputs[position : position + 1]
@@ -1198,10 +1438,13 @@ class ALEBO(Algorithm):
         else:
             self._fit_model()
             quality = self.state.y_train if self.maximize else -self.state.y_train
+            source_maximize = True
+            if self.config.source_protocol == "ax_0_1_17":
+                quality = self.state.y_train
+                source_maximize = self.maximize
             if self.config.source_protocol.startswith(
                 "ax_"
             ) and self.config.acquisition.name.lower() in {"ei", "expectedimprovement"}:
-                from botorch.acquisition.analytic import ExpectedImprovement
                 from botorch.acquisition.objective import ScalarizedPosteriorTransform
 
                 model = self.gp.model
@@ -1213,18 +1456,34 @@ class ALEBO(Algorithm):
                 # ordinary analytic EI. Modern generic LogEI is not a drop-in
                 # replacement for its nonnegative-EI restart initializer.
                 with translate_backend_warnings(operation="Historical Ax ALEBO analytic EI"):
-                    acquisition = ExpectedImprovement(
-                        model=(
-                            self._mixture_model
-                            if self.config.metric_inference == "laplace"
-                            else model
-                        ),
-                        best_f=(quality.max() + self.config.acquisition.xi - mean) / std,
-                        posterior_transform=ScalarizedPosteriorTransform(
-                            weights=std.reciprocal().reshape(1), offset=float(-mean / std)
-                        ),
-                        maximize=True,
+                    acquisition_class = (
+                        _Ax01ExpectedImprovement
+                        if self.config.source_protocol == "ax_0_1_17" else ExpectedImprovement
                     )
+                    incumbent = (
+                        quality.max() + self.config.acquisition.xi
+                        if source_maximize else quality.min() - self.config.acquisition.xi
+                    )
+                    acquisition_model = (
+                        self._mixture_model if self.config.metric_inference == "laplace" else model
+                    )
+                    if self.config.source_protocol == "ax_0_1_17":
+                        best_f = (model.train_targets.max() if source_maximize
+                                  else model.train_targets.min())
+                        best_f = best_f + ((1 if source_maximize else -1) * self.config.acquisition.xi / std)
+                        acquisition = acquisition_class(
+                            model=_Ax01StandardizedModel(acquisition_model),
+                            best_f=best_f, maximize=source_maximize,
+                        )
+                    else:
+                        acquisition = acquisition_class(
+                            model=acquisition_model,
+                            best_f=(incumbent - mean) / std,
+                            posterior_transform=ScalarizedPosteriorTransform(
+                                weights=std.reciprocal().reshape(1), offset=float(-mean / std)
+                            ),
+                            maximize=source_maximize,
+                        )
             else:
                 acquisition = build_acquisition(
                     model=self._mixture_model
@@ -1271,6 +1530,8 @@ class ALEBO(Algorithm):
             raise ALEBODataCompatibilityError("ALEBO tell is missing ask state.", algorithm=self)
         pending_Y = self.last_ask.model_inputs
         pending_X = to_symmetric_box(action, self.bounds.to(dtype=self.dtype, device=self.device))
+        if self.config.source_protocol == "ax_0_1_17":
+            pending_Y = (self.state.B @ pending_X.T).T
         self.state.Y_train = torch.cat((self.state.Y_train, pending_Y), dim=0)
         self.state.X_train_symmetric = torch.cat((self.state.X_train_symmetric, pending_X), dim=0)
         self.state.y_train = torch.cat((self.state.y_train, feedback["observation"]), dim=0)
@@ -1288,9 +1549,10 @@ class ALEBO(Algorithm):
             "metric_mode": self.state.metric_mode,
             "metric_samples": len(self.state.metric_posterior_samples),
             "rejected_finite_rows": self._last_rejected_finite_rows,
-            "source_optimization_policy": (
-                _AX_OPTIMIZATION_POLICY if self.config.source_protocol.startswith("ax_") else None
-            ),
+            "source_optimization_policy": self._source_optimization_policy,
+            "source_evaluation_draws": self._source_evaluation_draws,
+            "source_readback_draws": self._source_readback_draws,
+            "initializer_seed_records": copy.deepcopy(self._initializer_seeds),
         }
 
     def _state_dict_impl(self) -> Mapping[str, Any]:
@@ -1298,9 +1560,13 @@ class ALEBO(Algorithm):
 
         return {
             "config": repr(asdict(self.config)),
-            "source_optimization_policy": (
-                _AX_OPTIMIZATION_POLICY if self.config.source_protocol.startswith("ax_") else None
+            "source_optimization_policy": self._source_optimization_policy,
+            "source_random_streams": export_streams(
+                self._source_rng, self.generator, self._initializer_seed_rng
             ),
+            "source_evaluation_draws": self._source_evaluation_draws,
+            "source_readback_draws": self._source_readback_draws,
+            "initializer_seed_records": copy.deepcopy(self._initializer_seeds),
             "B": self.state.B,
             "B_pinv": self.state.B_pinv,
             "A_ineq": self.state.A_ineq,
@@ -1335,20 +1601,46 @@ class ALEBO(Algorithm):
             raise ALEBOCheckpointError("ALEBO B shape is incompatible.", algorithm=self)
         if (
             self.config.source_protocol.startswith("ax_")
-            and state.get("source_optimization_policy") != _AX_OPTIMIZATION_POLICY
+            and state.get("source_optimization_policy") != self._source_optimization_policy
         ):
             raise ALEBOCheckpointError(
-                "ALEBO historical-source optimization policy differs: this version uses fresh "
-                "MAP restarts and ordinary standardized EI on every update. Preserve the old "
-                "warm-start/LogEI results and start a new output directory.",
+                "ALEBO historical-source numerical/random-stream policy differs. Preserve "
+                "the old results and start a new output directory.",
                 algorithm=self,
             )
+        if self.config.source_protocol == "ax_0_1_17":
+            try:
+                _, _, initializer = validate_streams(state["source_random_streams"])
+                if initializer is None:
+                    raise ValueError("Missing initializer seed stream.")
+                for name in ("source_evaluation_draws", "source_readback_draws"):
+                    value = state[name]
+                    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                        raise ValueError(f"Invalid {name}.")
+                records = state["initializer_seed_records"]
+                if not isinstance(records, list) or any(
+                    not isinstance(row, Mapping)
+                    or set(row) != {"phase", "seed"}
+                    or row["phase"] not in {"initial", "acquisition"}
+                    or isinstance(row["seed"], bool)
+                    or not isinstance(row["seed"], int)
+                    or not 0 <= row["seed"] < 2**32
+                    for row in records
+                ):
+                    raise ValueError("Invalid initializer seed records.")
+            except (KeyError, ValueError, TypeError, RuntimeError) as error:
+                raise ALEBOCheckpointError(f"Invalid Ax source state: {error}", algorithm=self) from error
         del strict
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
         """Restore ALEBO geometry and data, then reset fitted model state."""
 
         del strict
+        if self.config.source_protocol == "ax_0_1_17":
+            self._import_random_streams(state["source_random_streams"])
+            self._source_evaluation_draws = state["source_evaluation_draws"]
+            self._source_readback_draws = state["source_readback_draws"]
+            self._initializer_seeds = copy.deepcopy(state["initializer_seed_records"])
         for name in ("B", "B_pinv", "A_ineq", "b_ineq", "Y_train", "X_train_symmetric", "y_train"):
             setattr(
                 self.state,
@@ -1382,6 +1674,12 @@ class ALEBO(Algorithm):
         self._last_finite_valid_mask = None
         self._metric_fit_state = None
         self._last_rejected_finite_rows = 0
+        self._source_rng.seed(self.seed)
+        self._initializer_seed_rng.seed(self.seed)
+        self._initializer_seeds = []
+        self._source_evaluation_draws = 0
+        self._source_readback_draws = 0
+        self._source_last_sampled_X = None
         B = self._sample_projection(self.config.embedding_dimension, self.action_dimension)
         B_pinv, A_ineq, b_ineq = self._make_polytope(B)
         self.state = ALEBOState(
@@ -1402,6 +1700,68 @@ class ALEBO(Algorithm):
             last_ask_Y=None,
             last_ask_X=None,
         )
+
+    @property
+    def _supports_ax017_evaluation(self) -> bool:
+        return self.config.source_protocol == "ax_0_1_17"
+
+    @property
+    def _supports_shared_trial_streams(self) -> bool:
+        return self.config.source_protocol == "ax_0_1_17"
+
+    @property
+    def _source_optimization_policy(self) -> str | None:
+        if self.config.source_protocol == "ax_0_1_17":
+            return _AX01_OPTIMIZATION_POLICY
+        return _AX_OPTIMIZATION_POLICY if self.config.source_protocol == "ax_0_2_2" else None
+
+    def _export_random_streams(self) -> dict[str, Any]:
+        """Copy Ax streams without modifying progress, including pending asks."""
+        if self.config.source_protocol != "ax_0_1_17":
+            raise NotImplementedError("Ax stream exchange requires source_protocol='ax_0_1_17'.")
+        return export_streams(self._source_rng, self.generator, self._initializer_seed_rng)
+
+    def _import_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Validate streams atomically; an omitted initializer stream is preserved."""
+        if self.config.source_protocol != "ax_0_1_17":
+            raise NotImplementedError("Ax stream exchange requires source_protocol='ax_0_1_17'.")
+        numpy_rng, generator, initializer = validate_streams(state)
+        self._source_rng, self.generator = numpy_rng, generator
+        if initializer is not None:
+            self._initializer_seed_rng = initializer
+
+    def _consume_source_evaluation_draws(self, count: int) -> None:
+        """Advance only the source's discarded zero-noise evaluation draws."""
+        if self.config.source_protocol != "ax_0_1_17":
+            raise NotImplementedError("Ax evaluation draws require source_protocol='ax_0_1_17'.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Source evaluation-draw count must be a nonnegative integer.")
+        self._source_rng.randn(count)
+        self._source_evaluation_draws += count
+
+    def _consume_source_readback_draws(self, count: int) -> None:
+        """Advance Ax's cached-data metric draws without new evaluations.
+
+        Experiment supplies the full environment history count before ``ask``.
+        For an interleaved strategy this is not the selected child's local count.
+        """
+        if self.config.source_protocol != "ax_0_1_17":
+            raise NotImplementedError("Ax readback draws require source_protocol='ax_0_1_17'.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Source readback-draw count must be a nonnegative integer.")
+        self._source_rng.randn(count)
+        self._source_readback_draws += count
+
+    def _reset_shared_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Reconstruct one projection from the supplied continuing Torch stream."""
+        if self.evaluations or self.last_ask is not None:
+            raise ValueError("Projection reset is allowed only on a fresh source learner.")
+        validate_streams(state)
+        self.reset()
+        self._import_random_streams(state)
+        B = self._sample_projection(self.config.embedding_dimension, self.action_dimension)
+        self.state.B = B
+        self.state.B_pinv, self.state.A_ineq, self.state.b_ineq = self._make_polytope(B)
 
 
 __all__ = ["ALEBO", "ALEBOConfig", "ALEBOMahalanobisKernel", "ALEBOState"]

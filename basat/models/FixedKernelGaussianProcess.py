@@ -21,6 +21,7 @@ from linear_operator.operators import DenseLinearOperator  # type: ignore[import
 
 from ..warnings import BasatJitterWarning, BasatNumericalWarning
 from .FixedRBFKernel import FixedRBFKernel
+from .FixedPolynomialKernel import FixedPolynomialKernel
 from .GaussianProcess import (
     GaussianProcess,
     GaussianProcessConfig,
@@ -202,7 +203,7 @@ class FixedKernelGaussianProcess(GaussianProcess):
 
     def _covariance(self, x: Any, z: Any) -> np.ndarray:
         with torch.no_grad():
-            if isinstance(self._kernel, FixedRBFKernel) and x is z:
+            if isinstance(self._kernel, (FixedRBFKernel, FixedPolynomialKernel)) and x is z:
                 return self._kernel(torch.as_tensor(x, dtype=self.dtype)).to_dense().numpy()
             return (
                 self._kernel(
@@ -465,6 +466,60 @@ class FixedKernelGaussianProcess(GaussianProcess):
         return torch.from_numpy(mean.copy()), torch.from_numpy(
             np.sqrt(np.maximum(np.diag(covariance), 0))
         )
+
+    def predict_marginals(
+        self, X: Any, *, observation_noise: bool = False, chunk_size: int = 1024
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return exact marginal moments without a candidate-by-candidate matrix.
+
+        This explicit alternative to :meth:`predict` leaves the existing
+        joint-covariance cache untouched. Each chunk uses an exact triangular
+        solve against every observed row. Workspace is O(N * chunk_size),
+        excluding the existing O(N**2) training factor; no posterior history
+        is discarded. It is useful for finite UCB candidate tables when only
+        means and standard deviations are needed.
+        """
+        if not self.is_fit:
+            raise ModelNotFitError("Supply training data before posterior inference.")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+            raise InvalidModelDataError("chunk_size must be a positive integer.")
+        values = torch.as_tensor(X, dtype=self.dtype)
+        if (values.ndim != 2 or values.shape[1] != self.input_dimension
+                or not bool(torch.isfinite(values).all())):
+            raise InvalidModelDataError("Prediction inputs must be finite (N, D_model) coordinates.")
+        if self.arithmetic == "gpy" and values.requires_grad:
+            raise InvalidModelDataError("Fixed GPy arithmetic does not support input gradients.")
+        points = values.detach().numpy()
+        if observation_noise and self.config.noise_variance is None:
+            raise InvalidModelDataError("Prediction noise requires a scalar configured noise_variance.")
+        means, variances = np.empty(len(points)), np.empty(len(points))
+        assert self.X_train is not None
+        for start in range(0, len(points), chunk_size):
+            end = min(start + chunk_size, len(points))
+            if self.arithmetic == "gpy":
+                mean, variance = self._gpy_moments(
+                    points[start:end], observation_noise, full_covariance=False
+                )
+            else:
+                cross = self._covariance(self.X_train.numpy(), points[start:end])
+                projection = la.solve_triangular(
+                    self._factor[:self._count, :self._count], cross,
+                    lower=True, check_finite=False,
+                )
+                mean = projection.T @ self._whitened[:self._count]
+                with torch.no_grad():
+                    diagonal = self._kernel(values[start:end], diag=True).numpy()
+                variance = diagonal - np.square(projection).sum(axis=0)
+                if observation_noise:
+                    variance += float(self.config.noise_variance)
+            means[start:end], variances[start:end] = mean, variance
+        if bool((variances < 0).any()):
+            warnings.warn(
+                "Basat fixed-kernel GP: negative marginal variance from floating-point "
+                f"roundoff (minimum {float(variances.min()):.6g}) was clipped to zero.",
+                BasatNumericalWarning, stacklevel=2,
+            )
+        return torch.from_numpy(means), torch.from_numpy(np.sqrt(np.maximum(variances, 0)))
 
     def posterior(self, X: Any, *, observation_noise: bool = False) -> GPyTorchPosterior:
         """Return the fixed-kernel joint posterior; no input gradients are retained."""

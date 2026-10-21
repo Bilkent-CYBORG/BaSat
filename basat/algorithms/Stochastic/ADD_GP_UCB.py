@@ -15,11 +15,13 @@ import warnings
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
 import gpytorch
+import numpy as np
 import torch
 
 from basat.algorithms.algorithm import (
@@ -32,6 +34,8 @@ from basat.models.Acquisitions import DiscreteAcquisitionCandidates
 from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
 from basat.models.utils import Bounds, normalize, unnormalize
 
+from ._ax_source_random import validate_streams
+from ._tree_numerics import random_state_dict, restore_random_state
 from .Exception.exception_ADD_GP_UCB import (
     ADD_GP_UCBAcquisitionError,
     ADD_GP_UCBCheckpointError,
@@ -385,6 +389,10 @@ class AddGPUCBConfig:
         Algorithm-owned random seed.
     implementation:
         ``"basat"`` uses the configurable native implementation.
+        ``"basat-icml-2015"`` uses the paper-first 2015 protocol implemented
+        natively in physical coordinates, with shared isotropic SE kernels,
+        periodic fitting and componentwise original DIRECT. Exact known groups
+        may omit irrelevant coordinates; those coordinates use bounds midpoints.
         ``"basat-alebo-2020"`` uses Basat's internal, source-equivalent
         implementation of the ALEBO paper's additive comparator: local NumPy
         RNG, native GP fitting, slice sampling and component-UCB optimization.
@@ -402,6 +410,20 @@ class AddGPUCBConfig:
         Maximum wait for a historical subprocess proposal, including replay.
         It does not limit the in-process native comparator's GP computation.
         ``close()`` releases the isolated source process without losing history.
+    acquisition_evaluations : int
+        Nominal total DIRECT evaluations per proposal in the 2015 protocol.
+        Each component receives ``ceil(total / number_of_groups)``. A callback
+        cap stops DIRECT at that limit and retains its best evaluated point;
+        actual calls and budget stops are logged.
+    common_mean, noise_variance, kernel_scale_bounds:
+        Raw-reward GP calibration for the 2015 protocol. Noise is a fixed
+        diagonal variance, not objective observation noise. ``None`` derives
+        noise/scale bounds from the initial observations, never extra queries.
+    bandwidth_bounds, initial_bandwidth, initial_bandwidth_steps:
+        Physical-coordinate bandwidth bounds and the initial fixed-bandwidth
+        phase, counted after the initial design (25 proposals by default).
+    hyperparameter_iterations : int
+        DIRECT iterations per likelihood search, not objective evaluations.
     """
 
     groups: tuple[tuple[int, ...], ...] | None = None
@@ -416,9 +438,17 @@ class AddGPUCBConfig:
     batch_size: int | None = 1
     q_batch: int | None = None
     seed: int = 1
-    implementation: Literal["basat", "basat-alebo-2020", "dragonfly-0.1.4"] = "basat"
+    implementation: Literal["basat", "basat-icml-2015", "basat-alebo-2020", "dragonfly-0.1.4"] = "basat"
     source_max_capital: int | None = None
     source_timeout_seconds: float = 3600.0
+    acquisition_evaluations: int = 900
+    common_mean: float = 0.0
+    noise_variance: float | None = None
+    kernel_scale_bounds: tuple[float, float] | None = None
+    bandwidth_bounds: tuple[float, float] = (1e-5, 5.0)
+    initial_bandwidth: float = 1e-5
+    initial_bandwidth_steps: int = 25
+    hyperparameter_iterations: int = 20
 
 
 @dataclass(slots=True)
@@ -469,6 +499,14 @@ class ADD_GP_UCB(Algorithm):
             "implementation": "basat",
             "source_max_capital": None,
             "source_timeout_seconds": 3600.0,
+            "acquisition_evaluations": 900,
+            "common_mean": 0.0,
+            "noise_variance": None,
+            "kernel_scale_bounds": None,
+            "bandwidth_bounds": (1e-5, 5.0),
+            "initial_bandwidth": 1e-5,
+            "initial_bandwidth_steps": 25,
+            "hyperparameter_iterations": 20,
         }
     )
 
@@ -556,10 +594,19 @@ class ADD_GP_UCB(Algorithm):
         self._source_pending = False
         self._source_provenance: dict[str, Any] = {}
         self._native_additive_policy: Any = None
+        self._native_random_journal: list[dict[str, Any]] = []
+        self._native_numpy_snapshot: dict[str, Any] | None = random_state_dict(np.random.RandomState(config.seed))
+        self._native_fit_rows_snapshot: tuple[int, ...] = ()
+        self._additive_2015_policy: Any = None
+        self._posterior_factor_cache: Any = None
         if config.implementation != "basat" and self.dtype != torch.float64:
             raise AlgorithmConfigurationError(
-                "The ALEBO additive comparator requires dtype='float64' to preserve proposals."
+                "Source-derived additive protocols require dtype='float64' to preserve proposals."
             )
+        if config.implementation == "basat-icml-2015":
+            if self.device.type != "cpu":
+                raise AlgorithmConfigurationError("The 2015 numerical protocol requires device='cpu'.")
+            self.state.groups = self._paper_2015().groups
 
     @staticmethod
     def _validate_config(config: AddGPUCBConfig, D: int) -> None:
@@ -567,11 +614,11 @@ class ADD_GP_UCB(Algorithm):
 
         if not isinstance(config, AddGPUCBConfig):
             raise AlgorithmConfigurationError("config must be AddGPUCBConfig.")
-        if config.implementation not in {"basat", "basat-alebo-2020", "dragonfly-0.1.4"}:
+        if config.implementation not in {"basat", "basat-icml-2015", "basat-alebo-2020", "dragonfly-0.1.4"}:
             raise AlgorithmConfigurationError("Unknown Add-GP-UCB implementation.")
         if not math.isfinite(config.source_timeout_seconds) or config.source_timeout_seconds <= 0:
             raise AlgorithmConfigurationError("source_timeout_seconds must be positive and finite.")
-        if config.implementation != "basat":
+        if config.implementation in {"basat-alebo-2020", "dragonfly-0.1.4"}:
             if (
                 isinstance(config.source_max_capital, bool)
                 or not isinstance(config.source_max_capital, int)
@@ -624,7 +671,27 @@ class ADD_GP_UCB(Algorithm):
         ):
             raise AlgorithmConfigurationError("initial_points must be positive or None.")
         if config.groups is not None:
-            ADD_GP_UCB._validate_groups_static(config.groups, D)
+            ADD_GP_UCB._validate_groups_static(
+                config.groups, D, allow_subset=config.implementation == "basat-icml-2015"
+            )
+        if config.implementation == "basat-icml-2015":
+            if config.beta != "paper" or config.component_optimizer is not None:
+                raise AlgorithmConfigurationError(
+                    "The 2015 protocol requires its dimension-dependent UCB and original DIRECT."
+                )
+            if config.initial_points_sampling_method not in {"paper", "uniform"}:
+                raise AlgorithmConfigurationError("The 2015 initial design must be uniform.")
+            if config.batch_size not in (None, 1) or config.q_batch is not None:
+                raise AlgorithmConfigurationError("The 2015 protocol is sequential (batch_size=1).")
+        else:
+            defaults = AddGPUCBConfig()
+            for name in ("acquisition_evaluations", "common_mean", "noise_variance",
+                         "kernel_scale_bounds", "bandwidth_bounds", "initial_bandwidth",
+                         "initial_bandwidth_steps", "hyperparameter_iterations"):
+                if getattr(config, name) != getattr(defaults, name):
+                    raise AlgorithmConfigurationError(
+                        f"{name} requires implementation='basat-icml-2015'."
+                    )
         if isinstance(config.beta, str) and config.beta != "paper":
             raise AlgorithmConfigurationError("beta string must be 'paper'.")
         if (
@@ -635,7 +702,9 @@ class ADD_GP_UCB(Algorithm):
             raise AlgorithmConfigurationError("beta must be finite and non-negative.")
 
     @staticmethod
-    def _validate_groups_static(groups: tuple[tuple[int, ...], ...], D: int) -> None:
+    def _validate_groups_static(
+        groups: tuple[tuple[int, ...], ...], D: int, *, allow_subset: bool = False
+    ) -> None:
         """Require non-empty integer groups that partition ``range(D)`` exactly."""
 
         if not groups or any(not group for group in groups):
@@ -643,13 +712,19 @@ class ADD_GP_UCB(Algorithm):
         flattened = [coordinate for group in groups for coordinate in group]
         if any(isinstance(index, bool) or not isinstance(index, int) for index in flattened):
             raise ADD_GP_UCBGroupError("Group indices must be integers.")
-        if sorted(flattened) != list(range(D)):
+        if allow_subset:
+            if len(set(flattened)) != len(flattened) or any(i < 0 or i >= D for i in flattened):
+                raise ADD_GP_UCBGroupError("Groups must be disjoint valid coordinate subsets.")
+        elif sorted(flattened) != list(range(D)):
             raise ADD_GP_UCBGroupError("Groups must partition every coordinate exactly once.")
 
     def _validate_groups(self, groups: tuple[tuple[int, ...], ...]) -> None:
         """Validate a complete disjoint coordinate partition."""
 
-        self._validate_groups_static(groups, self.action_dimension)
+        self._validate_groups_static(
+            groups, self.action_dimension,
+            allow_subset=self.config.implementation == "basat-icml-2015",
+        )
 
     def _random_partition(self) -> tuple[tuple[int, ...], ...]:
         """Draw a seeded partition with groups no larger than the configured cap."""
@@ -668,7 +743,12 @@ class ADD_GP_UCB(Algorithm):
 
         groups = self.config.groups
         if groups is None:
-            groups = self._random_partition()
+            if self.config.implementation == "basat-icml-2015":
+                size = self.config.maximum_group_size
+                groups = tuple(tuple(range(i, min(i + size, self.action_dimension)))
+                               for i in range(0, self.action_dimension, size))
+            else:
+                groups = self._random_partition()
         self._validate_groups(groups)
         return tuple(tuple(group) for group in groups)
 
@@ -744,21 +824,22 @@ class ADD_GP_UCB(Algorithm):
     def _set_gp_data(self) -> None:
         """Synchronize non-empty normalized history with the shared additive GP."""
 
+        self._posterior_factor_cache = None
         if self.state.y_train.numel():
             self.state.additive_gp.set_data(
                 self.state.X_train,
                 to_quality(self.state.y_train, maximize=self.maximize),
             )
+            model = self.state.additive_gp.model
+            if model is not None:
+                self.state.component_kernels = tuple(model.covar_module.kernels)
 
     def _initialize_fit_scales(self) -> None:
         """Seed MLE at scales compatible with the observed response magnitude.
 
-        The additive model uses a zero mean, so unit output scales can be a very
-        poor numerical starting point when otherwise valid observations have a
-        large offset.  This initialization changes neither the additive kernel
-        nor the marginal-likelihood objective: every component still receives
-        full MLE fitting.  The total initial prior variance is split equally
-        across the additive components.
+        Use the transformed training targets used by the shared GP, rather than
+        raw targets with an unrelated offset/scale. Every component still
+        receives full MLE fitting; the initial total variance is split equally.
 
         Raises
         ------
@@ -774,7 +855,7 @@ class ADD_GP_UCB(Algorithm):
                 "Shared additive GP was not constructed from the observations.",
                 algorithm=self,
             )
-        quality = to_quality(self.state.y_train, maximize=self.maximize)
+        quality = model.train_targets.detach()
         signal_scale = quality.square().mean().clamp_min(1e-3)
         if not torch.isfinite(signal_scale):
             raise ADD_GP_UCBKernelError(
@@ -832,13 +913,15 @@ class ADD_GP_UCB(Algorithm):
         group_id:
             Index of the additive coordinate group.
         U:
-            ``(N, |group|)`` candidate coordinates in normalized model units.
+            ``(N, |group|)`` candidate coordinates in normalized model units,
+            or physical coordinates for ``basat-icml-2015``.
 
         Returns
         -------
         tuple[torch.Tensor, torch.Tensor]
-            Component posterior mean and standard deviation, each shaped
-            ``(N,)``.
+            Component posterior mean and variance, each shaped ``(N,)`` in
+            reward-quality units. The general native standardized model shares
+            its constant outcome offset equally between component means.
 
         Raises
         ------
@@ -848,6 +931,13 @@ class ADD_GP_UCB(Algorithm):
             If no observations or fitted component kernel are available.
         """
 
+        if self.config.implementation == "basat-icml-2015":
+            points = torch.as_tensor(U, dtype=self.dtype, device=self.device)
+            mean, variance = self._paper_2015().component_posterior(
+                group_id, points.detach().cpu().numpy()
+            )
+            return (torch.as_tensor(mean, dtype=self.dtype, device=self.device),
+                    torch.as_tensor(variance, dtype=self.dtype, device=self.device))
         if self.config.implementation != "basat":
             raise ADD_GP_UCBKernelError(
                 "Comparator component models are managed by their own fitted policy; "
@@ -871,34 +961,53 @@ class ADD_GP_UCB(Algorithm):
                 f"Component query must have shape (N, {len(group)}).", algorithm=self
             )
         X = self.state.X_train
-        full_covariance = torch.zeros(
-            (X.shape[0], X.shape[0]), dtype=self.dtype, device=self.device
-        )
-        for index, coordinates in enumerate(self.state.groups):
-            full_covariance += self._component_covariance(
-                index, X[:, coordinates], X[:, coordinates]
-            )
-        noise = torch.tensor(1e-4, dtype=self.dtype, device=self.device)
         model = self.state.additive_gp.model
-        if model is not None:
-            likelihood = self.state.additive_gp.likelihood
-            candidate_noise = getattr(likelihood, "noise", None)
-            if candidate_noise is not None:
-                noise = torch.as_tensor(
-                    candidate_noise, dtype=self.dtype, device=self.device
-                ).mean()
-        delta = full_covariance + (noise + 1e-8) * torch.eye(
-            X.shape[0], dtype=self.dtype, device=self.device
+        likelihood = self.state.additive_gp.likelihood
+        if model is None or likelihood is None:
+            raise ADD_GP_UCBKernelError("Component posterior requires a shared GP.", algorithm=self)
+        noise = torch.as_tensor(
+            likelihood.noise, dtype=self.dtype, device=self.device
+        ).detach().reshape(-1)
+        transform = getattr(model, "outcome_transform", None)
+        scale = (torch.ones((), dtype=self.dtype, device=self.device) if transform is None
+                 else transform.stdvs.detach().reshape(()))
+        offset = (torch.zeros((), dtype=self.dtype, device=self.device) if transform is None
+                  else transform.means.detach().reshape(()))
+        kernel_values = tuple(
+            (tuple(k.base_kernel.lengthscale.detach().reshape(-1).tolist()),
+             float(k.outputscale.detach())) for k in self.state.component_kernels
         )
-        cholesky = torch.linalg.cholesky(delta)
-        quality = to_quality(self.state.y_train, maximize=self.maximize)
-        alpha = torch.cholesky_solve(quality[:, None], cholesky)
+        key = (id(model), X.data_ptr(), X._version, self.state.y_train.data_ptr(),
+               self.state.y_train._version, tuple(X.shape), self.state.groups,
+               kernel_values, tuple(noise.tolist()), float(scale), float(offset))
+        cache = self._posterior_factor_cache
+        if cache is None or cache[0] != key:
+            full_covariance = torch.zeros(
+                (X.shape[0], X.shape[0]), dtype=self.dtype, device=self.device
+            )
+            for index, coordinates in enumerate(self.state.groups):
+                full_covariance += self._component_covariance(
+                    index, X[:, coordinates], X[:, coordinates]
+                )
+            delta = full_covariance + torch.diag(noise.expand(X.shape[0]))
+            from linear_operator.utils.cholesky import (  # type: ignore[import-untyped]
+                psd_safe_cholesky,
+            )
+
+            from basat.warnings import translate_backend_warnings
+            with translate_backend_warnings(operation="ADD_GP_UCB shared posterior factorization"):
+                cholesky = psd_safe_cholesky(delta)
+            quality = to_quality(self.state.y_train, maximize=self.maximize)
+            centered = (quality - offset) / scale
+            alpha = torch.cholesky_solve(centered[:, None], cholesky)
+            self._posterior_factor_cache = (key, cholesky, alpha)
+        else:
+            _, cholesky, alpha = cache
         cross = self._component_covariance(group_id, U, X[:, group])
-        mean = (cross @ alpha).squeeze(-1)
+        mean = (cross @ alpha).squeeze(-1) * scale + offset / len(self.state.groups)
         solved = torch.cholesky_solve(cross.T, cholesky)
-        prior = self._component_covariance(group_id, U, U)
-        covariance = 0.5 * ((prior - cross @ solved) + (prior - cross @ solved).T)
-        variance = torch.diagonal(covariance).clamp_min(0)
+        prior_variance = self.state.component_kernels[group_id].outputscale.detach()
+        variance = (prior_variance - (cross * solved.T).sum(-1)).clamp_min(0) * scale.square()
         return mean, variance
 
     def _beta(self) -> float:
@@ -1052,7 +1161,54 @@ class ADD_GP_UCB(Algorithm):
     def _initial_design_size(self) -> int:
         """Return the configured or ambient-dimension initial-design size."""
 
-        return self.config.initial_points or max(2 * self.action_dimension, 4)
+        return self.config.initial_points or (
+            10 if self.config.implementation == "basat-icml-2015"
+            else max(2 * self.action_dimension, 4)
+        )
+
+    def _new_paper_2015(self) -> Any:
+        """Construct a benchmark-independent, independently checkpointed policy."""
+        from ._additive_2015 import Additive2015Policy
+        config = self.config
+        return Additive2015Policy(
+            lower=self.bounds.lower.detach().cpu().tolist(),
+            upper=self.bounds.upper.detach().cpu().tolist(),
+            groups=config.groups, maximum_group_size=config.maximum_group_size,
+            learn_decomposition=config.learn_decomposition,
+            initial_points=self._initial_design_size(), seed=self.seed,
+            refresh_cycle=config.refresh_cycle,
+            decomposition_candidates=config.decomposition_candidates or 5,
+            acquisition_evaluations=config.acquisition_evaluations,
+            common_mean=config.common_mean if self.maximize else -config.common_mean,
+            noise_variance=config.noise_variance,
+            kernel_scale_bounds=config.kernel_scale_bounds,
+            bandwidth_bounds=config.bandwidth_bounds,
+            initial_bandwidth=config.initial_bandwidth,
+            initial_bandwidth_steps=config.initial_bandwidth_steps,
+            hyperparameter_iterations=config.hyperparameter_iterations,
+        )
+
+    def _paper_2015(self) -> Any:
+        """Return the native 2015 policy without replaying or refitting history."""
+        if self._additive_2015_policy is None:
+            self._additive_2015_policy = self._new_paper_2015()
+        return self._additive_2015_policy
+
+    def _ask_paper_2015(self, round_info: Mapping[str, Any]) -> torch.Tensor:
+        if "candidate_actions" in round_info:
+            raise AlgorithmConfigurationError("The 2015 protocol requires continuous bounds.")
+        if (self.initial_points_sampling_method not in {"paper", "uniform"}
+                or self.acquisition_sampling_method != "paper"):
+            raise AlgorithmConfigurationError("The 2015 protocol uses uniform initialization and DIRECT.")
+        policy = self._paper_2015()
+        action = torch.as_tensor(policy.propose(), dtype=self.dtype, device=self.device).reshape(1, -1)
+        self.state.groups = tuple(tuple(g) for g in policy.groups)
+        self.state.last_ask_action = action.detach().clone()
+        self._record_last_ask(
+            actions=action, model_inputs=action, round_info=round_info,
+            algorithm_metadata={"implementation": "basat-icml-2015", "groups": self.state.groups},
+        )
+        return action
 
     def close(self) -> None:
         """Release the optional source process; saved action/reward history remains.
@@ -1065,6 +1221,7 @@ class ADD_GP_UCB(Algorithm):
             self._source_finalizer()
         self._source_process = None
         self._source_pending = False
+        self._capture_native_progress()
         self._native_additive_policy = None
 
     def _native_additive(self) -> Any:
@@ -1079,23 +1236,109 @@ class ADD_GP_UCB(Algorithm):
 
         policy = AdditivePolicy(
             torch.stack((self.bounds.lower, self.bounds.upper), -1).cpu().tolist(),
-            seed=self.config.seed,
+            seed=self.seed,
             max_capital=self.config.source_max_capital,
         )
         physical = unnormalize(
             self.state.X_train, self.bounds.to(dtype=self.dtype, device=self.device)
         )
         quality = to_quality(self.state.y_train, maximize=self.maximize)
-        for expected, observation in zip(physical, quality, strict=True):
+        for index, (expected, observation) in enumerate(zip(physical, quality, strict=True)):
+            self._apply_native_random_journal(policy, index, "before_ask")
             proposed = torch.as_tensor(policy.propose(), dtype=self.dtype, device=self.device)
             if not torch.allclose(expected, proposed, rtol=1e-11, atol=1e-11):
                 raise ADD_GP_UCBCheckpointError(
                     "Native additive history replay diverged; the saved progress was not changed.",
                     algorithm=self,
                 )
+            self._apply_native_random_journal(policy, index, "before_tell")
             policy.observe(float(observation.item()))
+        self._apply_native_random_journal(policy, len(quality), "before_ask")
+        if self.state.last_ask_action is not None:
+            proposed = torch.as_tensor(policy.propose(), dtype=self.dtype, device=self.device)
+            if not torch.allclose(
+                proposed.reshape_as(self.state.last_ask_action), self.state.last_ask_action,
+                rtol=1e-11, atol=1e-11,
+            ):
+                raise ADD_GP_UCBCheckpointError("Native additive pending replay diverged.", algorithm=self)
+            self._apply_native_random_journal(policy, len(quality), "before_tell")
         self._native_additive_policy = policy
         return policy
+
+    def _apply_native_random_journal(self, policy: Any, row: int, phase: str) -> None:
+        """Replay only recorded stream operations, never benchmark evaluations."""
+        for event in self._native_random_journal:
+            if event["row"] != row or event["phase"] != phase:
+                continue
+            if event["kind"] == "import":
+                restore_random_state(policy.rng, event["state"])
+            else:
+                policy.rng.randn(event["count"])
+
+    def _capture_native_progress(self) -> None:
+        """Snapshot lightweight source diagnostics without constructing a GP."""
+        if self._native_additive_policy is not None:
+            self._native_numpy_snapshot = random_state_dict(self._native_additive_policy.rng)
+            self._native_fit_rows_snapshot = tuple(self._native_additive_policy.build_rows)
+
+    @property
+    def _supports_ax017_evaluation(self) -> bool:
+        return self.config.implementation == "basat-alebo-2020"
+
+    def _export_random_streams(self) -> dict[str, Any]:
+        """Export current source streams without lazy history replay or fitting."""
+        if self.config.implementation != "basat-alebo-2020":
+            raise NotImplementedError("Ax stream exchange requires the native ALEBO comparator.")
+        self._capture_native_progress()
+        if self._native_numpy_snapshot is None:
+            raise ValueError("Legacy additive checkpoint has no RNG snapshot; resume a proposal before exporting streams.")
+        return {"numpy": deepcopy(self._native_numpy_snapshot), "torch": self.generator.get_state().clone()}
+
+    def _import_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Record an atomic stream handoff for deterministic partial-run replay."""
+        if self.config.implementation != "basat-alebo-2020":
+            raise NotImplementedError("Ax stream exchange requires the native ALEBO comparator.")
+        numpy_rng, generator, initializer = validate_streams(state)
+        if initializer is not None:
+            raise ValueError("The additive comparator has no entropy-backed Ax initializer.")
+        snapshot = random_state_dict(numpy_rng)
+        self._native_random_journal.append({
+            "row": len(self.state.y_train),
+            "phase": "before_tell" if self.state.last_ask_action is not None else "before_ask",
+            "kind": "import", "state": snapshot,
+        })
+        self._native_numpy_snapshot = deepcopy(snapshot)
+        self.generator = generator
+        if self._native_additive_policy is not None:
+            self._native_additive_policy.rng = numpy_rng
+
+    def _consume_source_evaluation_draws(self, count: int) -> None:
+        """Record Ax's discarded normal draws before source feedback/refitting."""
+        if self.config.implementation != "basat-alebo-2020":
+            raise NotImplementedError("Ax evaluation draws require the native ALEBO comparator.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Source evaluation-draw count must be a nonnegative integer.")
+        if self.state.last_ask_action is None:
+            raise ValueError("Source evaluation draws require a pending proposal.")
+        self._capture_native_progress()
+        if self._native_numpy_snapshot is None:
+            self._native_additive()
+            self._capture_native_progress()
+        assert self._native_numpy_snapshot is not None
+        rng = np.random.RandomState(0)
+        restore_random_state(rng, self._native_numpy_snapshot)
+        rng.randn(count)
+        self._native_numpy_snapshot = random_state_dict(rng)
+        if self._native_additive_policy is not None:
+            self._native_additive_policy.rng = rng
+        self._native_random_journal.append({
+            "row": len(self.state.y_train), "phase": "before_tell", "kind": "draw", "count": count,
+        })
+
+    def _reset_shared_random_streams(self, state: Mapping[str, Any]) -> None:
+        validate_streams(state)
+        self.reset()
+        self._import_random_streams(state)
 
     def _ask_native_additive(self, round_info: Mapping[str, Any]) -> torch.Tensor:
         """Ask Basat's internal component-UCB policy for a physical action."""
@@ -1114,6 +1357,7 @@ class ADD_GP_UCB(Algorithm):
             self._native_additive().propose(), dtype=self.dtype, device=self.device
         ).reshape(1, -1)
         self.state.last_ask_action = action.detach().clone()
+        self._capture_native_progress()
         self._record_last_ask(
             actions=action,
             model_inputs=normalize(action, self.bounds.to(dtype=self.dtype, device=self.device)),
@@ -1267,6 +1511,8 @@ class ADD_GP_UCB(Algorithm):
             return self._ask_source(round_info)
         if self.config.implementation == "basat-alebo-2020":
             return self._ask_native_additive(round_info)
+        if self.config.implementation == "basat-icml-2015":
+            return self._ask_paper_2015(round_info)
 
         finite = "candidate_actions" in round_info
         table = None
@@ -1364,6 +1610,16 @@ class ADD_GP_UCB(Algorithm):
         del round_info
         source = self.config.implementation == "dragonfly-0.1.4"
         native_comparator = self.config.implementation == "basat-alebo-2020"
+        paper_2015 = self.config.implementation == "basat-icml-2015"
+        if paper_2015:
+            if not torch.equal(action, feedback["evaluated_action"]):
+                raise ADD_GP_UCBCheckpointError(
+                    "The evaluated 2015 proposal was modified; use a float64 environment "
+                    "without an action-transforming adapter.", algorithm=self)
+            self._paper_2015().observe(
+                action.detach().cpu().numpy().reshape(-1),
+                float(to_quality(feedback["observation"], maximize=self.maximize).item()),
+            )
         if native_comparator:
             policy = self._native_additive()
             replayed = torch.as_tensor(
@@ -1377,6 +1633,7 @@ class ADD_GP_UCB(Algorithm):
                 )
             quality = float(to_quality(feedback["observation"], maximize=self.maximize).item())
             policy.observe(quality)
+            self._capture_native_progress()
         if source:
             if not torch.allclose(action, feedback["evaluated_action"], rtol=1e-11, atol=1e-11):
                 raise AlgorithmConfigurationError(
@@ -1395,18 +1652,22 @@ class ADD_GP_UCB(Algorithm):
                 {"kind": "observation", "value": float(feedback["observation"].item())}
             )
             self._source_pending = False
-        evaluated_unit = normalize(
+        evaluated_unit = (feedback["evaluated_action"] if paper_2015 else normalize(
             feedback["evaluated_action"], self.bounds.to(dtype=self.dtype, device=self.device)
-        )
+        ))
         self.state.X_train = torch.cat((self.state.X_train, evaluated_unit), dim=0)
         self.state.y_train = torch.cat((self.state.y_train, feedback["observation"]), dim=0)
         self.state.last_ask_action = None
-        if not source and not native_comparator:
+        if not source and not native_comparator and not paper_2015:
             self._set_gp_data()
 
     def _diagnostics_impl(self) -> Mapping[str, Any]:
         """Return group, decomposition, component-UCB, and training diagnostics."""
 
+        if self.config.implementation == "basat-icml-2015":
+            return {"implementation": "basat-icml-2015", "algorithm_owner": "basat",
+                    "training_rows": int(self.state.y_train.numel()),
+                    "external_algorithm_runner": False, **self._paper_2015().diagnostics()}
         if self.config.implementation == "basat-alebo-2020":
             policy = self._native_additive_policy
             return {
@@ -1415,7 +1676,11 @@ class ADD_GP_UCB(Algorithm):
                 "external_algorithm_runner": False,
                 "training_rows": int(self.state.y_train.numel()),
                 "source_max_capital": self.config.source_max_capital,
-                "native_fit_rows": () if policy is None else tuple(policy.build_rows),
+                "native_fit_rows": self._native_fit_rows_snapshot if policy is None else tuple(policy.build_rows),
+                "source_evaluation_draws": sum(
+                    event["count"] for event in self._native_random_journal if event["kind"] == "draw"
+                ),
+                "source_readback_draws": 0,
                 "native_policy_revision": "basat-native-alebo-additive-v1",
             }
         if self.config.implementation == "dragonfly-0.1.4":
@@ -1445,6 +1710,15 @@ class ADD_GP_UCB(Algorithm):
         source metadata.
         """
         result = super().result()
+        if self.config.implementation == "basat-icml-2015":
+            return replace(result, source=replace(
+                self.SOURCE,
+                repository_url=("https://github.com/kirthevasank/add-gp-bandits/tree/"
+                                "d248c26b9c1c6d74bfa6aed23b8f8c41b086ac14"),
+                notes=("Independent Basat-native paper-first 2015 additive GP implementation; "
+                       "25 fixed-bandwidth BO proposals, followed by periodic fitting. "
+                       "Released-code discrepancies are explicit, not silently copied."),
+            ))
         if self.config.implementation == "basat-alebo-2020":
             return replace(
                 result,
@@ -1482,6 +1756,7 @@ class ADD_GP_UCB(Algorithm):
     def _state_dict_impl(self) -> Mapping[str, Any]:
         """Serialize partition, normalized history, and diagnostic progress."""
 
+        self._capture_native_progress()
         return {
             "config": self._config_repr(),
             "groups": self.state.groups,
@@ -1492,10 +1767,17 @@ class ADD_GP_UCB(Algorithm):
             "last_ask_action": self.state.last_ask_action,
             "last_component_values": self._last_component_values,
             "source_backend": dict(self._source_provenance),
+            "native_random_journal": deepcopy(self._native_random_journal),
+            "native_numpy_snapshot": deepcopy(self._native_numpy_snapshot),
+            "native_fit_rows_snapshot": self._native_fit_rows_snapshot,
             "native_policy_revision": (
                 "basat-native-alebo-additive-v1"
                 if self.config.implementation == "basat-alebo-2020"
                 else None
+            ),
+            "paper_2015_policy": (
+                self._paper_2015().state_dict()
+                if self.config.implementation == "basat-icml-2015" else None
             ),
         }
 
@@ -1523,7 +1805,75 @@ class ADD_GP_UCB(Algorithm):
             raise ADD_GP_UCBCheckpointError(
                 "Native additive policy revision does not match the checkpoint.", algorithm=self
             )
+        if self.config.implementation == "basat-alebo-2020":
+            try:
+                rows = len(torch.as_tensor(state["y_train"]))
+                journal = state.get("native_random_journal", [])
+                if not isinstance(journal, list):
+                    raise ValueError("Random journal must be a list.")
+                previous = (-1, -1)
+                for event in journal:
+                    if not isinstance(event, Mapping):
+                        raise ValueError("Invalid random-journal event.")
+                    row, phase, kind = event.get("row"), event.get("phase"), event.get("kind")
+                    if (isinstance(row, bool) or not isinstance(row, int) or not 0 <= row <= rows
+                            or phase not in {"before_ask", "before_tell"}
+                            or kind not in {"import", "draw"}):
+                        raise ValueError("Invalid random-journal position or operation.")
+                    position = (row, int(phase == "before_tell"))
+                    if position < previous:
+                        raise ValueError("Random-journal events are out of order.")
+                    previous = position
+                    if phase == "before_tell" and row == rows and state["last_ask_action"] is None:
+                        raise ValueError("Pending random-journal event has no proposal.")
+                    if kind == "import":
+                        restore_random_state(np.random.RandomState(0), event["state"])
+                    else:
+                        count = event["count"]
+                        if (isinstance(count, bool) or not isinstance(count, int) or count < 0
+                                or phase != "before_tell"):
+                            raise ValueError("Invalid discarded-normal event.")
+                snapshot = state.get("native_numpy_snapshot")
+                if snapshot is not None:
+                    restore_random_state(np.random.RandomState(0), snapshot)
+                if journal and snapshot is None:
+                    raise ValueError("Random-journal checkpoint has no RNG snapshot.")
+                fit_rows = state.get("native_fit_rows_snapshot", ())
+                if any(isinstance(n, bool) or not isinstance(n, int) or not 0 <= n <= rows for n in fit_rows):
+                    raise ValueError("Invalid source fitting-row diagnostics.")
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                raise ADD_GP_UCBCheckpointError(f"Invalid source RNG journal: {error}", algorithm=self) from error
         self._validate_groups(tuple(tuple(group) for group in state["groups"]))
+        if self.config.implementation == "basat-icml-2015":
+            saved = state.get("paper_2015_policy")
+            if not isinstance(saved, Mapping):
+                raise ADD_GP_UCBCheckpointError("Missing native 2015 policy state.", algorithm=self)
+            try:
+                candidate = self._new_paper_2015()
+                candidate.load_state_dict(saved)
+            except (ValueError, TypeError, KeyError) as error:
+                raise ADD_GP_UCBCheckpointError(
+                    f"Invalid native 2015 policy state: {error}", algorithm=self
+                ) from error
+            if tuple(tuple(g) for g in candidate.groups) != tuple(tuple(g) for g in state["groups"]):
+                raise ADD_GP_UCBCheckpointError("Stored 2015 groups disagree.", algorithm=self)
+            stored_x = torch.as_tensor(state["X_train"], dtype=self.dtype, device=self.device)
+            stored_y = to_quality(torch.as_tensor(state["y_train"], dtype=self.dtype,
+                                                  device=self.device), maximize=self.maximize)
+            if (not torch.equal(stored_x, torch.as_tensor(candidate.X, dtype=self.dtype,
+                                                          device=self.device))
+                    or not torch.equal(stored_y, torch.as_tensor(candidate.y, dtype=self.dtype,
+                                                               device=self.device))):
+                raise ADD_GP_UCBCheckpointError("Stored 2015 policy and learner histories disagree.",
+                                                algorithm=self)
+            pending = state["last_ask_action"]
+            if (pending is None) != (candidate.pending is None):
+                raise ADD_GP_UCBCheckpointError("Stored 2015 pending proposals disagree.", algorithm=self)
+            if pending is not None and not torch.equal(
+                torch.as_tensor(pending, dtype=self.dtype, device=self.device).reshape(-1),
+                torch.as_tensor(candidate.pending, dtype=self.dtype, device=self.device),
+            ):
+                raise ADD_GP_UCBCheckpointError("Stored 2015 pending proposals disagree.", algorithm=self)
         del strict
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
@@ -1531,6 +1881,8 @@ class ADD_GP_UCB(Algorithm):
 
         del strict
         self.close()
+        self._posterior_factor_cache = None
+        self._additive_2015_policy = None
         groups = tuple(tuple(group) for group in state["groups"])
         components, gp = self._build_additive_kernel(groups)
         self.state.groups = groups
@@ -1556,12 +1908,22 @@ class ADD_GP_UCB(Algorithm):
             float(value) for value in state["last_component_values"]
         )
         self._source_provenance = dict(state.get("source_backend", {}))
+        self._native_random_journal = deepcopy(state.get("native_random_journal", []))
+        self._native_numpy_snapshot = deepcopy(state.get("native_numpy_snapshot"))
+        self._native_fit_rows_snapshot = tuple(state.get("native_fit_rows_snapshot", ()))
+        if self.config.implementation == "basat-icml-2015":
+            self._paper_2015().load_state_dict(state["paper_2015_policy"])
 
     def _reset_impl(self) -> None:
         """Clear observations and rebuild the seeded initial additive model."""
 
         self.close()
+        self._posterior_factor_cache = None
+        self._additive_2015_policy = None
         self._source_provenance = {}
+        self._native_random_journal = []
+        self._native_numpy_snapshot = random_state_dict(np.random.RandomState(self.seed))
+        self._native_fit_rows_snapshot = ()
         groups = self._resolve_initial_groups()
         components, gp = self._build_additive_kernel(groups)
         self.state = AddGPUCBState(
@@ -1575,6 +1937,8 @@ class ADD_GP_UCB(Algorithm):
             last_ask_action=None,
         )
         self._last_component_values = ()
+        if self.config.implementation == "basat-icml-2015":
+            self.state.groups = self._paper_2015().groups
 
 
 __all__ = ["ADD_GP_UCB", "AddGPUCBConfig", "AddGPUCBState"]

@@ -54,11 +54,27 @@ from .algorithms.algorithm import (
 from .algorithms.Contextual import AcquisitionOptimizerSpec
 from .algorithms.Distributional import ActionOptimizerSpec
 from .algorithms.helper import AlgorithmDiagnostics, AlgorithmResult, SourceRecord
+from .algorithms.interleaved import InterleavedAlgorithm
+from .benchmarks import AdveRSSynthetic, Branin, RoBOSSynthetic
+from ._robos_protocol import RoBOSSourceProtocol
+from ._robos_regret import RoBOSSourceRegret
 from .catalog import adapt_environment, algorithm_names, make_algorithm
+from .comparison import compare_trials
+from .contextual_statistics import ContextualSelectionStatistics, contextual_selection_statistics
+from .mhc_benchmark import MHCBindingBenchmark, MHCCalibrationSample
+from .mhc_statistics import (
+    ContextualRegretStatistics,
+    contextual_regret_statistics,
+    compare_contextual_regret_statistics,
+)
+from .reference_comparison import compare_reference_statistics
 from .datasets import DatasetFamily, DatasetSchema, LoadedDataset, load_dataset
 from .environments import (
     AdversarialEnvironment,
     AttackProvider,
+    LCBAttack,
+    RandomAttack,
+    WorstCaseAttack,
     AvailableActions,
     ContextProvider,
     ContextualEnvironment,
@@ -81,15 +97,26 @@ from .experiment import (
     ExperimentFailure,
     ExperimentProtocolError,
 )
+from ._advers_source_protocol import AdveRSSourceProtocol
+from ._advers_serial_protocol import AdveRSSerialSourceProtocol
 from .models import AcquisitionConfig, GaussianProcess, GaussianProcessConfig, KernelConfig
 from .models.FixedKernelGaussianProcess import FiniteSupportKernel, FixedKernelGaussianProcess
 from .models.FixedRBFKernel import FixedRBFKernel
+from .models.FixedPolynomialKernel import FixedPolynomialKernel
 from .models.GoodActionGaussianProcess import GoodActionGaussianProcess, GoodActionGPConfig
 from .models.Kernels import make_kernel
 from .models.PolynomialFeatureGaussianProcess import PolynomialFeatureGaussianProcess
 from .models.SeparableCalibration import SeparableCalibration, fit_separable_matern
+from .models.ContextualCalibration import ContextualRBFCalibration, fit_contextual_rbf
 from .models.utils import DEFAULT_DEVICE, DEFAULT_DTYPE, Bounds
 from .plotting import PlotPanel, PlotResult, PlotSeries, plot, plot_panels, show
+from .regret import (
+    FiniteDomainFragility,
+    RSRegret,
+    RSRegretStatistics,
+    finite_domain_optimal_fragility,
+    rs_regret_statistics,
+)
 from .sensor_data import SensorTable, SensorTextSchema, load_sensor_table
 from .stopping import (
     MaximumEvaluationsStoppingRule,
@@ -103,6 +130,13 @@ from .stopping import (
     all_of,
     any_of,
 )
+from .success import (
+    SuccessComparison,
+    SuccessCurve,
+    SuccessRun,
+    SuccessStatistics,
+    success_statistics,
+)
 from .warnings import (
     BasatAcquisitionWarning,
     BasatBackendWarning,
@@ -113,6 +147,7 @@ from .warnings import (
 )
 from .workflow import (
     ArtifactStore,
+    NumericalFunction,
     RandomStream,
     array,
     derive_seed,
@@ -139,6 +174,8 @@ from .workflow import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "AdveRSSourceProtocol",
+    "AdveRSSerialSourceProtocol",
     "ADD_GP_UCB",
     "AG_VS",
     "ALEBO",
@@ -163,6 +200,7 @@ __all__ = [
     "AddGPUCBConfig",
     "AdveRS",
     "AdveRSConfig",
+    "AdveRSSynthetic",
     "AdversarialEnvironment",
     "Algorithm",
     "AlgorithmDiagnostics",
@@ -170,6 +208,9 @@ __all__ = [
     "ArtifactStore",
     "AssumptionViolationWarning",
     "AttackProvider",
+    "LCBAttack",
+    "RandomAttack",
+    "WorstCaseAttack",
     "AvailableActions",
     "BallPerturbations",
     "BasatAcquisitionWarning",
@@ -179,9 +220,13 @@ __all__ = [
     "BasatNumericalWarning",
     "BasatWarning",
     "Bounds",
+    "Branin",
     "CGPUCBConfig",
     "ContextProvider",
     "ContextualEnvironment",
+    "ContextualRBFCalibration",
+    "ContextualRegretStatistics",
+    "ContextualSelectionStatistics",
     "CrossEnvironmentWarning",
     "DRBOConfig",
     "DatasetFamily",
@@ -202,33 +247,46 @@ __all__ = [
     "ExperimentFailure",
     "ExperimentProtocolError",
     "ExperimentTrialsResult",
+    "FiniteDomainFragility",
     "FiniteSupportKernel",
     "FixedKernelGaussianProcess",
     "FixedRBFKernel",
+    "FixedPolynomialKernel",
     "FullDomainPerturbations",
     "GaussianProcess",
     "GaussianProcessConfig",
     "GoodActionConfig",
     "GoodActionGPConfig",
     "GoodActionGaussianProcess",
+    "GroupedExperimentResult",
+    "GroupedTrialConfig",
     "HeSBO",
     "HeSBOConfig",
+    "InterleavedAlgorithm",
     "KernelConfig",
     "L2Distance",
     "LAMCTSConfig",
     "LinfDistance",
     "LoadedDataset",
     "MCTSVSConfig",
+    "MHCBindingBenchmark",
+    "MHCCalibrationSample",
     "MaximumEvaluationsStoppingRule",
     "MaximumRoundsStoppingRule",
     "MaximumTimeStoppingRule",
     "MultiStartSolver",
     "NoImprovementStoppingRule",
+    "NumericalFunction",
     "PlotPanel",
     "PlotResult",
     "PlotSeries",
     "PolynomialFeatureGaussianProcess",
     "REMBOConfig",
+    "RSRegret",
+    "RoBOSSynthetic",
+    "RoBOSSourceProtocol",
+    "RoBOSSourceRegret",
+    "RSRegretStatistics",
     "RandomStream",
     "RoBOS",
     "RoBOSConfig",
@@ -246,6 +304,10 @@ __all__ = [
     "StoppingContext",
     "StoppingDecision",
     "StoppingRule",
+    "SuccessComparison",
+    "SuccessCurve",
+    "SuccessRun",
+    "SuccessStatistics",
     "TargetValueStoppingRule",
     "TrialStatistics",
     "TuRBO",
@@ -256,10 +318,17 @@ __all__ = [
     "all_of",
     "any_of",
     "array",
+    "compare_trials",
+    "compare_reference_statistics",
+    "compare_contextual_regret_statistics",
+    "contextual_regret_statistics",
+    "contextual_selection_statistics",
     "derive_seed",
     "expected_values",
     "find_path",
+    "finite_domain_optimal_fragility",
     "fit_separable_matern",
+    "fit_contextual_rbf",
     "get_seed",
     "join_path",
     "linspace",
@@ -274,6 +343,7 @@ __all__ = [
     "normal_probabilities",
     "plot",
     "plot_panels",
+    "rs_regret_statistics",
     "runtime_info",
     "save_csv",
     "save_dataset",
@@ -281,8 +351,14 @@ __all__ = [
     "show",
     "sin",
     "square",
+    "success_statistics",
     "sum",
     "to_list",
 ]
 
-from .trials import ExperimentTrialsResult, TrialStatistics
+from .trials import (
+    ExperimentTrialsResult,
+    GroupedExperimentResult,
+    GroupedTrialConfig,
+    TrialStatistics,
+)

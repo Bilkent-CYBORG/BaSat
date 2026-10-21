@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
@@ -25,6 +26,8 @@ from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
 from basat.models.Kernels import KernelConfig
 from basat.models.utils import Bounds, from_symmetric_box, to_symmetric_box
 
+from ._historical_ax01 import POLICY as _AX01_NUMERICAL_POLICY
+from ._historical_ax01 import Ax01StreamOwner, Ax01Streams
 from .Exception.exception_HeSBO import (
     HeSBOCheckpointError,
     HeSBODataCompatibilityError,
@@ -55,8 +58,13 @@ class HeSBOConfig:
     source_protocol:
         ``"hesbo"`` preserves native settings. ``"ax_0_1_17"`` selects the
         released comparison baseline: uniform initialization, unit latent inputs,
-        sample-standardized targets, fixed standardized noise 1e-7, Matérn 5/2
-        ARD MAP, and 512-sample qNEI with 20 SLSQP starts (1000 raw candidates).
+        NumPy population-standardized raw targets, fixed standardized noise 1e-7, Matérn 5/2
+        ARD MAP with five SciPy/prior attempts and no Adam fallback, and
+        candidate-first 512-sample qNEI with 2048 pruning draws and 20 joint
+        SLSQP starts (1000 raw candidates). Its CPU-only streams continue
+        between queries. Each historically unseeded initializer is reconstructed
+        with a recorded seed from a separate, checkpointed MT19937 stream.
+        Objective direction is applied after posterior sampling and during pruning.
         The latter accepts sequential ``acquisition.name="EI"`` only, the
         source paper's shorthand for its effective noisy-EI implementation.
         ``"ax_0_2_2"`` uses the same GP priors and qNEI but the newer 1e-6
@@ -111,7 +119,7 @@ class HeSBOState:
     last_ask_X: torch.Tensor | None
 
 
-class HeSBO(Algorithm):
+class HeSBO(Ax01StreamOwner, Algorithm):
     """Optimize through a sparse signed hash map from ``R^d`` to ``R^D``.
 
     Examples
@@ -188,6 +196,10 @@ class HeSBO(Algorithm):
             verbose_setting=verbose_setting,
             verbose_iter_by_iter=verbose_iter_by_iter,
         )
+        self._ax01_streams = Ax01Streams(config.seed) if config.source_protocol == "ax_0_1_17" else None
+        self._ax01_last_diagnostics: dict[str, Any] = {}
+        if self._ax01_streams is not None and self.device.type != "cpu":
+            raise AlgorithmConfigurationError("The historical Ax 0.1.17 numerical policy requires CPU.")
         hash_index, sign, buckets = self._draw_hash_and_sign()
         self.state = HeSBOState(
             hash_index=hash_index,
@@ -253,11 +265,12 @@ class HeSBO(Algorithm):
         """Draw seeded uniform buckets and independent Rademacher signs."""
 
         d = self.config.embedding_dimension
+        generator = self.generator if self._ax01_streams is None else self._ax01_streams.torch
         hash_index = torch.randint(
             d,
             (self.action_dimension,),
             device=self.device,
-            generator=self.generator,
+            generator=generator,
         )
         sign = (
             2
@@ -265,7 +278,7 @@ class HeSBO(Algorithm):
                 2,
                 (self.action_dimension,),
                 device=self.device,
-                generator=self.generator,
+                generator=generator,
             )
             - 1
         ).to(self.dtype)
@@ -273,6 +286,9 @@ class HeSBO(Algorithm):
             torch.nonzero(hash_index == index, as_tuple=False).flatten() for index in range(d)
         )
         return hash_index, sign, buckets
+
+    def _redraw_ax01_projection(self) -> None:
+        self.state.hash_index, self.state.sign, self.state.bucket_members = self._draw_hash_and_sign()
 
     @property
     def empty_buckets(self) -> tuple[int, ...]:
@@ -461,7 +477,9 @@ class HeSBO(Algorithm):
             )
             upper = -lower
             if count < self._initial_design_size():
-                unit = _ax_uniform_initial_point(
+                unit = self._ax01_streams.uniform(
+                    self.config.embedding_dimension, dtype=self.dtype, device=self.device
+                ) if self._ax01_streams is not None else _ax_uniform_initial_point(
                     count=count,
                     dimension=self.config.embedding_dimension,
                     seed=self.config.seed,
@@ -472,13 +490,18 @@ class HeSBO(Algorithm):
             else:
                 Y, self.gp, ax_value = _ax01_embedding_proposal(
                     self.state.Y_train,
-                    to_quality(self.state.y_train, maximize=self.maximize),
+                    self.state.y_train if self._ax01_streams is not None
+                    else to_quality(self.state.y_train, maximize=self.maximize),
                     lower,
                     upper,
                     self.config.seed + self.iteration,
                     protocol=self.config.source_protocol,
+                    streams=self._ax01_streams,
+                    objective_weight=1.0 if self.maximize else -1.0,
                 )
                 self._last_acquisition_value = float(ax_value.sum().item())
+                if self._ax01_streams is not None:
+                    self._ax01_last_diagnostics = copy.deepcopy(self.gp.last_fit_diagnostics)
             action = self._map_y_to_action(Y)
             X = to_symmetric_box(action, self.bounds.to(dtype=self.dtype, device=self.device))
             self.state.last_ask_Y, self.state.last_ask_X = Y.detach().clone(), X.detach().clone()
@@ -490,6 +513,10 @@ class HeSBO(Algorithm):
                     "hash_index": self.state.hash_index,
                     "sign": self.state.sign,
                     "source_protocol": self.config.source_protocol,
+                    **({"source_numerical_policy": _AX01_NUMERICAL_POLICY,
+                        "initializer_seed": self._ax01_streams.initializer_seeds[-1]
+                        if count < self._initial_design_size() else None}
+                       if self._ax01_streams is not None else {}),
                 },
             )
             return action
@@ -632,6 +659,12 @@ class HeSBO(Algorithm):
         return {
             **self._bucket_diagnostics(),
             "training_rows": int(self.state.y_train.numel()),
+            **({"source_numerical_policy": _AX01_NUMERICAL_POLICY,
+                "initializer_seeds": list(self._ax01_streams.initializer_seeds),
+                "source_evaluation_draws": self._ax01_streams.evaluation_draws,
+                "source_readback_draws": self._ax01_streams.readback_draws,
+                "source_fit": copy.deepcopy(self._ax01_last_diagnostics)}
+               if self._ax01_streams is not None else {}),
             "source_model_fit_policy": _AX02_MODEL_FIT_POLICY
             if self.config.source_protocol == "ax_0_2_2"
             else None,
@@ -641,6 +674,8 @@ class HeSBO(Algorithm):
         """Serialize the hash map, embedded history, and pending progress."""
 
         return {
+            **({"ax01_numerics": self._ax01_checkpoint()}
+               if self._ax01_streams is not None else {}),
             "source_model_fit_policy": _AX02_MODEL_FIT_POLICY
             if self.config.source_protocol == "ax_0_2_2"
             else None,
@@ -660,6 +695,11 @@ class HeSBO(Algorithm):
     def _validate_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
         """Validate required HeSBO checkpoint fields and ambient hash shape."""
 
+        if self.config.source_protocol == "ax_0_1_17":
+            try:
+                self._validate_ax01_checkpoint(state.get("ax01_numerics", {}))
+            except (TypeError, ValueError, KeyError) as error:
+                raise HeSBOCheckpointError(str(error), algorithm=self) from error
         if (
             self.config.source_protocol == "ax_0_2_2"
             and state.get("source_model_fit_policy") != _AX02_MODEL_FIT_POLICY
@@ -699,6 +739,8 @@ class HeSBO(Algorithm):
         """Restore the HeSBO map and history, then reset the GP."""
 
         del strict
+        if self._ax01_streams is not None:
+            self._load_ax01_checkpoint(state["ax01_numerics"])
         self.state.hash_index = (
             torch.as_tensor(state["hash_index"], dtype=torch.long, device=self.device)
             .detach()
@@ -734,6 +776,9 @@ class HeSBO(Algorithm):
         """Clear observations and redraw the seeded hash/sign embedding."""
 
         self.gp.reset()
+        if self._ax01_streams is not None:
+            self._ax01_streams = Ax01Streams(self.seed)
+            self._ax01_last_diagnostics = {}
         hash_index, sign, buckets = self._draw_hash_and_sign()
         self.state = HeSBOState(
             hash_index=hash_index,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from typing import Any, cast
 
@@ -75,11 +74,11 @@ class AG_VSException(AlgorithmExceptionController):
         """Require the manuscript effective dimension to lie within ``D_env``."""
 
         value = self._config.effective_dimension
-        if value < 1 or value > self.algorithm.action_dimension:
+        if value < 1 or value >= self.algorithm.action_dimension:
             self.add_issue(
                 "error",
                 "effective_dimension",
-                "effective_dimension must lie between one and D_env.",
+                "effective_dimension must lie between one and D_env - 1.",
             )
 
     def _check_anchor(self) -> None:
@@ -103,7 +102,7 @@ class AG_VSException(AlgorithmExceptionController):
         if config.sequence_length < 1 or config.initial_points < 1:
             self.add_issue("error", "node", "sequence_length and initial_points must be positive.")
         if (
-            config.gp_maxiter < 1
+            (config.gp_maxiter is not None and config.gp_maxiter < 1)
             or config.acquisition_restarts < 1
             or config.acquisition_raw_samples < 1
         ):
@@ -114,24 +113,20 @@ class AG_VSException(AlgorithmExceptionController):
     def _check_split_merge(self) -> None:
         """Require enough groups for a meaningful disjoint split."""
 
-        if self._config.split_groups < 2:
-            self.add_issue("error", "split_merge", "split_groups must be at least two.")
+        groups = self._config.split_groups
+        if groups is None or not self._config.effective_dimension < groups <= self.algorithm.action_dimension:
+            self.add_issue("error", "split_merge", "Require effective_dimension < split_groups <= D_env.")
 
     def _check_stopping(self) -> None:
         """Validate paired posterior-stopping settings and sequential semantics."""
 
         config = self._config
         enabled = config.stopping_threshold is not None or config.stopping_delta is not None
-        if enabled and (
-            config.stopping_threshold is None
-            or config.stopping_delta is None
-            or not math.isfinite(config.stopping_threshold)
-            or not 0 < config.stopping_delta < 1
-        ):
+        if enabled:
             self.add_issue(
                 "error",
                 "node",
-                "stopping_threshold and a stopping_delta in (0, 1) must be supplied together.",
+                "Posterior stopping is disabled in the supplied AG-VS source.",
             )
 
     def diagnose_initialization(self) -> ExceptionDiagnosticReport:

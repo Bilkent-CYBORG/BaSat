@@ -36,6 +36,23 @@ from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
 from basat.models.utils import Bounds, from_symmetric_box, to_symmetric_box
 from basat.warnings import translate_backend_warnings
 
+from ._historical_ax01 import (
+    POLICY as _AX01_NUMERICAL_POLICY,
+)
+from ._historical_ax01 import (
+    Ax01StreamOwner,
+    Ax01Streams,
+    standardize_ax01_outcomes,
+)
+from ._historical_ax01 import (
+    fit_gp as _fit_ax01_gp,
+)
+from ._historical_ax01 import (
+    numerical_context as _ax01_numerical_context,
+)
+from ._historical_ax01 import (
+    optimize_qnei as _optimize_ax01_qnei,
+)
 from .Exception.exception_REMBO import (
     REMBOAcquisitionError,
     REMBOCheckpointError,
@@ -118,7 +135,7 @@ def _fit_ax02_embedding_gp(gp: GaussianProcess) -> None:
 def _ax_uniform_initial_point(
     *, count: int, dimension: int, seed: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    """Return one replayable uniform point from the historical Ax design law.
+    """Return the previously validated Ax 0.2.2 replayable uniform design.
 
     Ax 0.1.17/0.2.2 REMBOInitializer inherits UniformGenerator, despite a
     misleading strategy comment saying Sobol. The released strategy does not
@@ -126,6 +143,9 @@ def _ax_uniform_initial_point(
     original initial points use entropy and are not determined by the run's
     published seed label. Basat explicitly seeds an independent MT19937 stream
     for reproducibility, preserving the IID uniform design and affine map.
+    The Ax 0.1.17 mode now uses :class:`Ax01Streams` to explicitly reconstruct
+    a fresh initializer seed on every generation; this helper is retained for
+    the separately validated Song/Ax 0.2.2 protocol.
     """
     import numpy as np
 
@@ -140,6 +160,8 @@ def _ax01_embedding_proposal(
     upper: torch.Tensor,
     seed: int,
     protocol: str = "ax_0_1_17",
+    streams: Ax01Streams | None = None,
+    objective_weight: float = 1.0,
 ) -> tuple[torch.Tensor, GaussianProcess, torch.Tensor]:
     """Fit the historical Ax 0.1.17 embedding baseline and maximize qNEI.
 
@@ -147,17 +169,23 @@ def _ax01_embedding_proposal(
     Ax standardized outcomes before flooring known variance at 1e-7, used
     unit-scaled latent inputs and Matérn-5/2 ARD MAP priors, and optimized
     512-sample qNEI with twenty SLSQP starts (1000 raw Sobol candidates).
-    The benchmark itself is never passed to this helper.
+    For Ax01, ``quality`` contains the raw observed outcomes; the objective
+    direction is applied to posterior samples, not before GP fitting. Ax02
+    retains its previously validated signed-quality convention. The benchmark
+    itself is never passed to this helper.
     """
     from botorch.acquisition.monte_carlo import qNoisyExpectedImprovement
     from botorch.optim import optimize_acqf
     from botorch.sampling.normal import SobolQMCNormalSampler
 
     unit = (coordinates - lower) / (upper - lower)
-    scale = quality.std()
-    if not torch.isfinite(scale) or scale < 1e-8:
-        scale = torch.ones_like(scale)
-    standardized = (quality - quality.mean()) / scale
+    if protocol == "ax_0_1_17":
+        standardized, outcome_mean, outcome_std = standardize_ax01_outcomes(quality)
+    else:
+        scale = quality.std()
+        if not torch.isfinite(scale) or scale < 1e-8:
+            scale = torch.ones_like(scale)
+        standardized = (quality - quality.mean()) / scale
     gp = GaussianProcess(
         GaussianProcessConfig(
             kernel=gpytorch.kernels.ScaleKernel(
@@ -181,7 +209,16 @@ def _ax01_embedding_proposal(
     if protocol == "ax_0_2_2":
         _fit_ax02_embedding_gp(gp)
     else:
-        gp.fit(maxiter=1000)
+        owned_streams = Ax01Streams(seed) if streams is None else streams
+        with _ax01_numerical_context(owned_streams):
+            _fit_ax01_gp(gp)
+            candidate, value, diagnostics = _optimize_ax01_qnei(
+                gp.model, unit, objective_weight=objective_weight
+            )
+        gp.last_fit_diagnostics["acquisition"] = diagnostics
+        gp.last_fit_diagnostics.update(outcome_mean=outcome_mean, outcome_std=outcome_std,
+                                       outcome_std_ddof=0)
+        return lower + candidate.detach() * (upper - lower), gp, value.detach()
     assert gp.model is not None
     with (
         torch.random.fork_rng(devices=[]),
@@ -286,13 +323,27 @@ class REMBOConfig:
     embedding_dimension, Y_lower, Y_upper:
         Reduced dimension and optional explicit search-box endpoints.
     source_protocol:
-        ``"rembo"`` retains the original Algorithm3 protocol.
-        ``"ax_0_1_17"`` selects the released comparison baseline: Sobol
-        initialization, unit latent coordinates, sample-standardized targets,
-        Matérn5/2 ARD MAP, fixed standardized noise1e-7, and512-sample qNEI
-        with20 SLSQP starts (1000 raw candidates). The latter requires
+        ``"rembo"`` retains Basat's configurable Algorithm-3-inspired GP.
+        ``"wang_2016"`` selects the explicitly documented paper-first,
+        float64 CPU protocol: one zero initial point, fixed zero mean/unit
+        covariance scale, fixed noise, and adaptive shared lengthscale.
+        Its native numerical model follows the released equations; EI,
+        square-root embedding bounds, and DIRECT/CMA reflect the paper,
+        which differs from the released demonstration. Checkpoints preserve
+        the fitted parameters and random stream without additional fitting.
+        ``"ax_0_1_17"`` selects the released comparison baseline: uniform
+        initialization, unit latent coordinates, NumPy population-standardized raw outcomes,
+        Matérn 5/2 ARD MAP, fixed standardized noise 1e-7, and candidate-first
+        512-sample qNEI (2048 pruning draws) with 20 jointly optimized SLSQP
+        starts (1000 raw candidates). MAP uses five default SciPy attempts,
+        restoring parameters and sampling priors between failed attempts,
+        without an Adam fallback. Source Torch streams continue across queries;
+        a separate recorded MT19937 seed stream reconstructs each historically
+        unseeded uniform initializer. This CPU-only policy requires
         sequential low-dimensional ``acquisition="EI"`` (source shorthand)
-        and bypasses Algorithm3 lengthscale adaptation and DIRECT/CMA search.
+        and bypasses Algorithm 3 lengthscale adaptation and DIRECT/CMA search.
+        Minimization applies objective weight -1 after posterior sampling,
+        including baseline pruning, rather than fitting negated outcomes.
     kernel_type, custom_kernel:
         Paper kernel coordinate system or qualified custom kernel.
     acquisition, initial_points, batch_size:
@@ -306,10 +357,24 @@ class REMBOConfig:
         Source exploitation/refit and interval-shrink constants.
     seed:
         Embedding, optimizer, and acquisition seed.
+    noise_variance:
+        Fixed GP diagonal variance in ``"wang_2016"`` (not observation noise
+        added to the benchmark). The other protocols retain their own models.
+    ei_xi:
+        Nonnegative improvement offset in ``"wang_2016"``. The released
+        ``acq.m`` EI branch uses 0.0001 and optimizes negative log-EI.
+    acquisition_direct_evaluations, acquisition_direct_iterations:
+        Separate DIRECT likelihood-free acquisition limits in ``"wang_2016"``.
+    hyperparameter_direct_evaluations, hyperparameter_direct_iterations:
+        Separate DIRECT limits for the one-dimensional log-lengthscale fit.
+    cma_evaluations, cma_tolfun:
+        CMA-ES limits in the paper-first mode, for both acquisition and fitting.
+        The 2,000-call fitting budget is an explicit adopted setting: the
+        release supplies it for acquisition but does not enable CMA for fitting.
     """
 
     embedding_dimension: int
-    source_protocol: Literal["rembo", "ax_0_1_17"] = "rembo"
+    source_protocol: Literal["rembo", "ax_0_1_17", "wang_2016"] = "rembo"
     finite_candidate_mode: Literal["project", "exact"] = field(default="project", kw_only=True)
     Y_lower: Any | None = None
     Y_upper: Any | None = None
@@ -328,6 +393,14 @@ class REMBOConfig:
     exploitation_count_limit: int = 5
     upper_bound_multiplier: float = 0.9
     seed: int = 1
+    noise_variance: float = 1e-10
+    ei_xi: float = 0.0001
+    acquisition_direct_evaluations: int = 500
+    acquisition_direct_iterations: int = 200
+    hyperparameter_direct_evaluations: int = 400
+    hyperparameter_direct_iterations: int = 300
+    cma_evaluations: int = 2000
+    cma_tolfun: float = 1e-8
 
 
 @dataclass(slots=True)
@@ -359,7 +432,7 @@ class REMBOState:
     last_ask_x: torch.Tensor | None
 
 
-class REMBO(Algorithm):
+class REMBO(Ax01StreamOwner, Algorithm):
     """Optimize a bounded objective through one immutable dense embedding.
 
     Examples
@@ -376,6 +449,14 @@ class REMBO(Algorithm):
     CHECKPOINT_ADDED_CONFIG_DEFAULTS: ClassVar[Mapping[str, Any]] = {
         "initial_points": None,
         "initial_points_sampling_method": "paper",
+        "noise_variance": 1e-10,
+        "ei_xi": 0.0001,
+        "acquisition_direct_evaluations": 500,
+        "acquisition_direct_iterations": 200,
+        "hyperparameter_direct_evaluations": 400,
+        "hyperparameter_direct_iterations": 300,
+        "cma_evaluations": 2000,
+        "cma_tolfun": 1e-8,
     }
 
     EXCEPTION_CLASS = REMBOException
@@ -387,7 +468,7 @@ class REMBO(Algorithm):
         paper_url="https://doi.org/10.1613/jair.4806",
         repository_url="https://github.com/ziyuw/rembo",
         repository_status="author",
-        notes="Clean-room PyTorch implementation; q>1 and custom kernels are explicit extensions.",
+        notes="Independent Python implementation with explicit source protocols; q>1 and custom kernels are extensions.",
     )
 
     def __init__(
@@ -443,9 +524,21 @@ class REMBO(Algorithm):
         self.Y_lower, self.Y_upper = self._make_Y(
             config.embedding_dimension, config.Y_lower, config.Y_upper
         )
-        A = self._sample_embedding(self.action_dimension, config.embedding_dimension)
+        self._ax01_streams = Ax01Streams(config.seed) if config.source_protocol == "ax_0_1_17" else None
+        self._ax01_last_diagnostics: dict[str, Any] = {}
+        if self._ax01_streams is not None and self.device.type != "cpu":
+            raise AlgorithmConfigurationError("The historical Ax 0.1.17 numerical policy requires CPU.")
+        self._wang_2016_policy: Any = None
+        if config.source_protocol == "wang_2016":
+            if self.dtype != torch.float64 or self.device.type != "cpu":
+                raise AlgorithmConfigurationError("wang_2016 requires dtype='float64', device='cpu'.")
+            self._wang_2016_policy = self._new_wang_2016()
+            A = torch.as_tensor(self._wang_2016_policy.A, dtype=self.dtype).clone()
+        else:
+            A = self._sample_embedding(self.action_dimension, config.embedding_dimension)
         lengthscale = (
-            math.sqrt(config.lengthscale_lower * config.lengthscale_upper)
+            (0.1 if config.source_protocol == "wang_2016"
+             else math.sqrt(config.lengthscale_lower * config.lengthscale_upper))
             if config.initial_lengthscale is None
             else float(config.initial_lengthscale)
         )
@@ -469,7 +562,7 @@ class REMBO(Algorithm):
             if config.kernel_type == "low_dimensional"
             else self.action_dimension
         )
-        self.gp = self._build_gp()
+        self.gp: Any = None if config.source_protocol == "wang_2016" else self._build_gp()
         if self.request_size > 1 or self.acquisition_sampling_method != "paper":
             reason = (
                 "basat.joint_q_acquisition"
@@ -497,8 +590,17 @@ class REMBO(Algorithm):
             raise AlgorithmConfigurationError("REMBO requires 1 <= embedding_dimension <= D.")
         if (config.Y_lower is None) != (config.Y_upper is None):
             raise AlgorithmConfigurationError("Y_lower and Y_upper must be supplied together.")
-        if config.source_protocol not in {"rembo", "ax_0_1_17"}:
+        if config.source_protocol not in {"rembo", "ax_0_1_17", "wang_2016"}:
             raise AlgorithmConfigurationError("Unknown REMBO source_protocol.")
+        if config.source_protocol == "wang_2016" and (
+            config.kernel_type != "low_dimensional" or config.custom_kernel is not None
+            or config.initial_points not in {None, 1}
+            or config.initial_points_sampling_method != "paper"
+            or config.batch_size != 1 or config.q_batch is not None
+        ):
+            raise AlgorithmConfigurationError(
+                "wang_2016 requires a sequential low-dimensional SE model and one zero initial point."
+            )
         if config.source_protocol == "ax_0_1_17" and (
             config.kernel_type != "low_dimensional"
             or config.acquisition != "EI"
@@ -543,11 +645,89 @@ class REMBO(Algorithm):
             config.lengthscale_lower <= config.initial_lengthscale <= config.lengthscale_upper
         ):
             raise AlgorithmConfigurationError("initial_lengthscale must lie in [L, U].")
+        wang_defaults = {
+            "noise_variance": 1e-10, "ei_xi": 0.0001, "acquisition_direct_evaluations": 500,
+            "acquisition_direct_iterations": 200, "hyperparameter_direct_evaluations": 400,
+            "hyperparameter_direct_iterations": 300, "cma_evaluations": 2000,
+            "cma_tolfun": 1e-8,
+        }
+        if config.source_protocol != "wang_2016" and any(
+            getattr(config, name) != default for name, default in wang_defaults.items()
+        ):
+            raise AlgorithmConfigurationError(
+                "The fixed-noise and DIRECT/CMA numerical settings require source_protocol='wang_2016'."
+            )
+
+    def _new_wang_2016(self) -> Any:
+        """Construct the objective-free numerical policy with an owned RNG."""
+        from ._rembo_wang2016 import REMBO2016Policy
+
+        names = (
+            "embedding_dimension", "acquisition", "noise_variance", "ei_xi", "lengthscale_lower",
+            "lengthscale_upper", "t_sigma", "refit_interval", "exploitation_count_limit",
+            "upper_bound_multiplier", "acquisition_direct_evaluations",
+            "acquisition_direct_iterations", "hyperparameter_direct_evaluations",
+            "hyperparameter_direct_iterations", "cma_evaluations", "cma_tolfun",
+        )
+        return REMBO2016Policy(
+            lower=self.bounds.lower.detach().cpu().numpy(),
+            upper=self.bounds.upper.detach().cpu().numpy(),
+            Y_lower=self.Y_lower.detach().cpu().numpy(),
+            Y_upper=self.Y_upper.detach().cpu().numpy(),
+            seed=self.seed,
+            initial_lengthscale=(0.1 if self.config.initial_lengthscale is None
+                                 else self.config.initial_lengthscale),
+            **{name: getattr(self.config, name) for name in names},
+        )
+
+    def _sync_wang_2016(self) -> None:
+        """Mirror numerical history for the normal Algorithm result interface."""
+        policy = self._wang_2016_policy
+        self.state.A = torch.as_tensor(policy.A, dtype=self.dtype).clone()
+        self.state.Y_train = torch.as_tensor(policy.Y, dtype=self.dtype).clone()
+        physical = torch.as_tensor(policy.X, dtype=self.dtype).clone()
+        self.state.X_train = self._to_unit_box(physical)
+        quality = torch.as_tensor(policy.quality, dtype=self.dtype).clone()
+        self.state.function_values = quality if self.maximize else -quality
+        self.state.iteration = len(policy.quality)
+        self.state.lengthscale = float(policy.lengthscale)
+        self.state.lengthscale_upper = float(policy.lengthscale_upper)
+        self.state.C = int(policy.exploitation_count)
+        self.state.last_refit_iteration = policy.last_refit_observation
+        self.state.last_ask_y = (
+            None if policy.pending_y is None
+            else torch.as_tensor(policy.pending_y, dtype=self.dtype).reshape(1, -1).clone()
+        )
+        self.state.last_ask_x = (
+            None if policy.pending_action is None else self._to_unit_box(
+                torch.as_tensor(policy.pending_action, dtype=self.dtype).reshape(1, -1)
+            )
+        )
+
+    def _ask_wang_2016(self, round_info: Mapping[str, Any]) -> torch.Tensor:
+        if "candidate_actions" in round_info:
+            raise REMBODataCompatibilityError("wang_2016 requires continuous bounds.", algorithm=self)
+        if self.initial_points_sampling_method != "paper" or self.acquisition_sampling_method != "paper":
+            raise AlgorithmConfigurationError(
+                "wang_2016 uses zero initialization and the configured DIRECT/CMA optimizers."
+            )
+        action = torch.as_tensor(self._wang_2016_policy.propose(), dtype=self.dtype).reshape(1, -1)
+        self._sync_wang_2016()
+        self._record_last_ask(
+            actions=action, model_inputs=self.state.last_ask_y, round_info=round_info,
+            algorithm_metadata={"Y": self.state.last_ask_y, "X_symmetric": self.state.last_ask_x,
+                                "source_protocol": "wang_2016"},
+        )
+        return action
 
     def _sample_embedding(self, D: int, d: int) -> torch.Tensor:
         """Draw the immutable ``D x d`` standard-normal matrix A."""
 
-        return torch.randn((D, d), dtype=self.dtype, device=self.device, generator=self.generator)
+        generator = self.generator if self._ax01_streams is None else self._ax01_streams.torch
+        return torch.randn((D, d), dtype=self.dtype, device=self.device, generator=generator)
+
+    def _redraw_ax01_projection(self) -> None:
+        self.state.A = self._sample_embedding(self.action_dimension, self.config.embedding_dimension)
 
     def _make_Y(
         self, d: int, lower: Any | None, upper: Any | None
@@ -719,6 +899,11 @@ class REMBO(Algorithm):
         rows = int(data.observations.shape[0])
         if rows == 0:
             return
+        if self.config.source_protocol == "wang_2016":
+            raise REMBOHistoricalDataError(
+                "wang_2016 starts with one zero point; use its full checkpoint to resume, "
+                "not an unowned warm-start dataset.", algorithm=self,
+            )
         metadata = data.metadata if isinstance(data.metadata, Mapping) else {}
         actions = torch.as_tensor(data.actions, dtype=self.dtype, device=self.device)
         Y, X = self._finite_coordinates(actions, metadata, historical=True)
@@ -919,22 +1104,25 @@ class REMBO(Algorithm):
     def _initial_design_size(self) -> int:
         """Return the paper initial-design size in embedded coordinates."""
 
+        if self.config.source_protocol == "wang_2016":
+            return 1
         return self.config.initial_points or max(2 * self.config.embedding_dimension, 4)
 
     def _ask_impl(self, *, round_info: Mapping[str, Any]) -> torch.Tensor:
         """Select a continuous or finite REMBO action batch."""
 
+        if self.config.source_protocol == "wang_2016":
+            return self._ask_wang_2016(round_info)
         if self.config.source_protocol == "ax_0_1_17":
             if "candidate_actions" in round_info:
                 raise REMBODataCompatibilityError(
                     "Historical Ax comparison requires a continuous domain."
                 )
             count = self.state.function_values.numel()
+            assert self._ax01_streams is not None
             if count < self._initial_design_size():
-                unit = _ax_uniform_initial_point(
-                    count=count,
-                    dimension=self.config.embedding_dimension,
-                    seed=self.config.seed,
+                unit = self._ax01_streams.uniform(
+                    self.config.embedding_dimension,
                     dtype=self.dtype,
                     device=self.device,
                 )
@@ -942,12 +1130,15 @@ class REMBO(Algorithm):
             else:
                 Y, self.gp, ax_value = _ax01_embedding_proposal(
                     self.state.Y_train,
-                    to_quality(self.state.function_values, maximize=self.maximize),
+                    self.state.function_values,
                     self.Y_lower,
                     self.Y_upper,
                     self.config.seed + self.iteration,
+                    streams=self._ax01_streams,
+                    objective_weight=1.0 if self.maximize else -1.0,
                 )
                 self._last_acquisition_value = float(ax_value.sum().item())
+                self._ax01_last_diagnostics = copy.deepcopy(self.gp.last_fit_diagnostics)
             X = self._project_to_X(Y)
             actions = self._from_unit_box(X)
             self.state.last_ask_y, self.state.last_ask_x = Y.detach().clone(), X.detach().clone()
@@ -955,7 +1146,10 @@ class REMBO(Algorithm):
                 actions=actions,
                 model_inputs=Y,
                 round_info=round_info,
-                algorithm_metadata={"Y": Y, "X_symmetric": X, "source_protocol": "ax_0_1_17"},
+                algorithm_metadata={"Y": Y, "X_symmetric": X, "source_protocol": "ax_0_1_17",
+                                    "source_numerical_policy": _AX01_NUMERICAL_POLICY,
+                                    "initializer_seed": self._ax01_streams.initializer_seeds[-1]
+                                    if count < self._initial_design_size() else None},
             )
             return actions
         finite = "candidate_actions" in round_info
@@ -1037,6 +1231,13 @@ class REMBO(Algorithm):
     ) -> None:
         """Append evaluated data and apply the Algorithm 3 lengthscale update."""
 
+        if self.config.source_protocol == "wang_2016":
+            quality = float(feedback["observation"].reshape(-1)[0])
+            self._wang_2016_policy.observe(
+                action.detach().cpu().numpy().reshape(-1), quality if self.maximize else -quality,
+            )
+            self._sync_wang_2016()
+            return
         del action, round_info
         if self.state.last_ask_y is None or self.state.last_ask_x is None:
             raise REMBODataCompatibilityError(
@@ -1062,6 +1263,11 @@ class REMBO(Algorithm):
     def _diagnostics_impl(self) -> Mapping[str, Any]:
         """Return detached embedding, lengthscale, and training diagnostics."""
 
+        if self.config.source_protocol == "wang_2016":
+            return {"source_protocol": "wang_2016", "algorithm_owner": "basat",
+                    "embedding_dimension": self.config.embedding_dimension,
+                    "training_rows": int(self.state.function_values.numel()),
+                    **self._wang_2016_policy.diagnostics()}
         return {
             "embedding_dimension": self.config.embedding_dimension,
             "training_rows": int(self.state.function_values.numel()),
@@ -1069,12 +1275,20 @@ class REMBO(Algorithm):
             "lengthscale_upper": self.state.lengthscale_upper,
             "exploitation_counter": self.state.C,
             "embedding_matrix": self.state.A,
+            **({"source_numerical_policy": _AX01_NUMERICAL_POLICY,
+                "initializer_seeds": list(self._ax01_streams.initializer_seeds),
+                "source_evaluation_draws": self._ax01_streams.evaluation_draws,
+                "source_readback_draws": self._ax01_streams.readback_draws,
+                "source_fit": copy.deepcopy(self._ax01_last_diagnostics)}
+               if self._ax01_streams is not None else {}),
         }
 
     def _state_dict_impl(self) -> Mapping[str, Any]:
-        """Serialize REMBO observations and search progress, excluding GP state."""
+        """Serialize progress; the Wang policy also retains fitted numerical state."""
 
         return {
+            **({"ax01_numerics": self._ax01_checkpoint()}
+               if self._ax01_streams is not None else {}),
             "source_initialization": _AX_UNIFORM_INITIALIZATION
             if self.config.source_protocol == "ax_0_1_17"
             else None,
@@ -1090,11 +1304,60 @@ class REMBO(Algorithm):
             "last_refit_iteration": self.state.last_refit_iteration,
             "last_ask_y": self.state.last_ask_y,
             "last_ask_x": self.state.last_ask_x,
+            **({"wang_2016_policy": self._wang_2016_policy.state_dict()}
+               if self.config.source_protocol == "wang_2016" else {}),
         }
+
+    def load_state_dict(self, state: Mapping[str, Any], *, strict: bool = True) -> None:
+        """Restore progress, checking public history against the Wang GP history.
+
+        The numerical model and public result must describe the same evaluations.
+        This check precedes any mutation and does not fit or rebuild the GP.
+        Historical REMBO protocols retain their existing checkpoint behavior.
+        """
+        if self.config.source_protocol == "wang_2016" and isinstance(state, Mapping):
+            method = state.get("algorithm_state")
+            policy = method.get("wang_2016_policy") if isinstance(method, Mapping) else None
+            if isinstance(policy, Mapping):
+                try:
+                    n = policy["observations"]
+                    expected_actions = torch.as_tensor(policy["X"], dtype=self.dtype).reshape(
+                        n, self.action_dimension
+                    )
+                    quality = torch.as_tensor(policy["quality"], dtype=self.dtype)
+                    expected_values = quality if self.maximize else -quality
+                    matches = (
+                        torch.equal(torch.as_tensor(state["observed_actions"], dtype=self.dtype), expected_actions)
+                        and torch.equal(torch.as_tensor(state["observed_values"], dtype=self.dtype), expected_values)
+                        and state["iteration"] == n and state["evaluations"] == n
+                        and state["model_input_dimension"] == self.config.embedding_dimension
+                    )
+                    pending, action = state["last_ask"], policy["pending_action"]
+                    matches = matches and ((pending is None) == (action is None))
+                    if n or action is not None:
+                        matches = matches and state["initialized"] is True
+                    if pending is not None and action is not None:
+                        matches = matches and torch.equal(
+                            torch.as_tensor(pending["actions"], dtype=self.dtype),
+                            torch.as_tensor(action, dtype=self.dtype).reshape(1, -1),
+                        ) and torch.equal(
+                            torch.as_tensor(pending["model_inputs"], dtype=self.dtype),
+                            torch.as_tensor(policy["pending_y"], dtype=self.dtype).reshape(1, -1),
+                        )
+                except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                    raise REMBOCheckpointError("Invalid Wang public/numerical checkpoint history.", algorithm=self) from error
+                if not matches:
+                    raise REMBOCheckpointError("Wang public history or pending proposal differs from numerical policy.", algorithm=self)
+        super().load_state_dict(state, strict=strict)
 
     def _validate_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
         """Validate required REMBO checkpoint fields and embedding dimensions."""
 
+        if self.config.source_protocol == "ax_0_1_17":
+            try:
+                self._validate_ax01_checkpoint(state.get("ax01_numerics", {}))
+            except (TypeError, ValueError, KeyError) as error:
+                raise REMBOCheckpointError(str(error), algorithm=self) from error
         if (
             self.config.source_protocol == "ax_0_1_17"
             and state.get("source_initialization") != _AX_UNIFORM_INITIALIZATION
@@ -1124,6 +1387,40 @@ class REMBO(Algorithm):
         A = torch.as_tensor(state["A"])
         if A.shape != (self.action_dimension, self.config.embedding_dimension):
             raise REMBOCheckpointError("REMBO state has an incompatible A matrix.", algorithm=self)
+        if self.config.source_protocol == "wang_2016":
+            if "wang_2016_policy" not in state:
+                raise REMBOCheckpointError("Missing complete wang_2016 numerical state.", algorithm=self)
+            policy = self._new_wang_2016()
+            policy.load_state_dict(state["wang_2016_policy"])
+            quality = torch.as_tensor(policy.quality, dtype=self.dtype)
+            expected = {
+                "A": torch.as_tensor(policy.A, dtype=self.dtype),
+                "Y_train": torch.as_tensor(policy.Y, dtype=self.dtype),
+                "X_train": self._to_unit_box(torch.as_tensor(policy.X, dtype=self.dtype)),
+                "function_values": quality if self.maximize else -quality,
+            }
+            if any(not torch.equal(torch.as_tensor(state[name], dtype=self.dtype), value)
+                   for name, value in expected.items()):
+                raise REMBOCheckpointError("Wang policy and REMBO observation mirrors differ.", algorithm=self)
+            scalars = {
+                "lengthscale": policy.lengthscale,
+                "lengthscale_upper": policy.lengthscale_upper,
+                "C": policy.exploitation_count,
+                "method_iteration": len(policy.quality),
+                "last_refit_iteration": policy.last_refit_observation,
+            }
+            if any(state[name] != value for name, value in scalars.items()):
+                raise REMBOCheckpointError("Wang policy and REMBO progress mirrors differ.", algorithm=self)
+            for name, value in {
+                "last_ask_y": (None if policy.pending_y is None else
+                               torch.as_tensor(policy.pending_y, dtype=self.dtype).reshape(1, -1)),
+                "last_ask_x": (None if policy.pending_action is None else self._to_unit_box(
+                    torch.as_tensor(policy.pending_action, dtype=self.dtype).reshape(1, -1))),
+            }.items():
+                if ((value is None) != (state[name] is None)
+                        or (value is not None and not torch.equal(
+                            torch.as_tensor(state[name], dtype=self.dtype), value))):
+                    raise REMBOCheckpointError("Wang policy and REMBO pending mirrors differ.", algorithm=self)
         del strict
 
     def _config_repr(self) -> str:
@@ -1138,9 +1435,15 @@ class REMBO(Algorithm):
         return repr(values)
 
     def _load_state_dict_impl(self, state: Mapping[str, Any], *, strict: bool) -> None:
-        """Restore REMBO progress and construct a fresh unfitted GP."""
+        """Restore the selected policy, without refitting a Wang checkpoint."""
 
         del strict
+        if self.config.source_protocol == "wang_2016":
+            self._wang_2016_policy.load_state_dict(state["wang_2016_policy"])
+            self._sync_wang_2016()
+            return
+        if self._ax01_streams is not None:
+            self._load_ax01_checkpoint(state["ax01_numerics"])
         for name in ("A", "Y_train", "X_train", "function_values"):
             setattr(
                 self.state,
@@ -1169,7 +1472,14 @@ class REMBO(Algorithm):
     def _reset_impl(self) -> None:
         """Clear observations and redraw the seeded REMBO embedding."""
 
+        if self.config.source_protocol == "wang_2016":
+            self._wang_2016_policy = self._new_wang_2016()
+            self._sync_wang_2016()
+            return
         self.gp.reset()
+        if self._ax01_streams is not None:
+            self._ax01_streams = Ax01Streams(self.seed)
+            self._ax01_last_diagnostics = {}
         self.state = REMBOState(
             A=self._sample_embedding(self.action_dimension, self.config.embedding_dimension),
             Y_train=torch.empty(

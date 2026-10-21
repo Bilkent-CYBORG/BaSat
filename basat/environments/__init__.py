@@ -1,7 +1,7 @@
 """Public environment contracts and concrete environment families."""
 
 from .adapters import StochasticContextAdapter, adapt_environment_for_algorithm
-from .Adversarial import AdversarialEnvironment, AttackProvider
+from .Adversarial import AdversarialEnvironment, AttackProvider, LCBAttack, RandomAttack, WorstCaseAttack
 from .Contextual import ContextProvider, ContextualEnvironment
 from .Distributional import (
     DistributionalEnvironment,
@@ -33,6 +33,9 @@ __all__ = [
     "MATCH_ATOL",
     "AdversarialEnvironment",
     "AttackProvider",
+    "LCBAttack",
+    "RandomAttack",
+    "WorstCaseAttack",
     "AvailableActions",
     "ContextProvider",
     "ContextualEnvironment",

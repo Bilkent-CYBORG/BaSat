@@ -15,6 +15,7 @@ from .Acquisitions import (
 )
 from .FixedKernelGaussianProcess import FiniteSupportKernel, FixedKernelGaussianProcess
 from .FixedRBFKernel import FixedRBFKernel
+from .FixedPolynomialKernel import FixedPolynomialKernel
 from .GaussianProcess import (
     GaussianProcess,
     GaussianProcessConfig,
@@ -92,6 +93,7 @@ __all__ = [
     "FiniteSupportKernel",
     "FixedKernelGaussianProcess",
     "FixedRBFKernel",
+    "FixedPolynomialKernel",
     "GaussianProcess",
     "GaussianProcessConfig",
     "GaussianProcessError",

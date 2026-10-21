@@ -29,6 +29,7 @@ from basat.models.GaussianProcess import GaussianProcess, GaussianProcessConfig
 from basat.models.utils import Bounds, normalize, unnormalize
 from basat.warnings import translate_backend_warnings
 
+from ._ax_source_random import export_streams, validate_streams
 from ._tree_numerics import (
     latin_hypercube,
     random_state_dict,
@@ -82,6 +83,10 @@ class TuRBOConfig:
         overrides require native mode. Explicit source-protocol checkpoints
         cannot resume older numerical policies. Use float64 history and an
         initial design divisible by the ordinary batch size for released runs.
+        ``"alebo_2020"`` uses the same standalone TuRBO-0.0.1 numerical
+        policy, with explicit owned-stream hooks for the historical Ax
+        benchmark's discarded zero-noise evaluation draws. Experiment controls
+        those draws; they never change returned observations or call an objective.
     """
 
     batch_size: int | None = 1
@@ -101,7 +106,7 @@ class TuRBOConfig:
     max_cholesky_size: int = 2000
     gp_training_steps: int = 50
     seed: int = 1
-    source_protocol: Literal["basat", "mcts_vs_2022"] = "basat"
+    source_protocol: Literal["basat", "mcts_vs_2022", "alebo_2020"] = "basat"
 
 
 @dataclass(slots=True)
@@ -228,7 +233,7 @@ class TuRBO(Algorithm):
         )
         if isinstance(resolved_config.acquisition, AcquisitionConfig):
             self.invalidate_source_guarantees("basat.turbo_acquisition_override")
-        if resolved_config.source_protocol == "mcts_vs_2022" and self.device.type != "cpu":
+        if resolved_config.source_protocol in {"mcts_vs_2022", "alebo_2020"} and self.device.type != "cpu":
             raise AlgorithmConfigurationError(
                 "Released source-protocol replay currently requires CPU execution."
             )
@@ -243,6 +248,7 @@ class TuRBO(Algorithm):
         self._last_candidate_mask_sparsity: float | None = None
         self._finite_exhaustion_events = 0
         self._source_rng = np.random.RandomState(self.config.seed)
+        self._source_evaluation_draws = 0
         self._source_torch_rng = torch.Generator().manual_seed(self.config.seed)
         self._source_initial_design_cache: torch.Tensor | None = None
         self._source_standardization = (0.0, 1.0)
@@ -252,9 +258,9 @@ class TuRBO(Algorithm):
         """Validate immutable TuRBO settings against ambient dimension ``D``."""
         if not isinstance(config, TuRBOConfig):
             raise AlgorithmConfigurationError("config must be TuRBOConfig.")
-        if config.source_protocol not in {"basat", "mcts_vs_2022"}:
+        if config.source_protocol not in {"basat", "mcts_vs_2022", "alebo_2020"}:
             raise AlgorithmConfigurationError("Unknown TuRBO source_protocol.")
-        if config.source_protocol == "mcts_vs_2022" and config.acquisition != "TS":
+        if config.source_protocol in {"mcts_vs_2022", "alebo_2020"} and config.acquisition != "TS":
             raise AlgorithmConfigurationError(
                 "Released TuRBO source_protocol requires predictive TS; use 'basat' for EI/UCB."
             )
@@ -422,7 +428,7 @@ class TuRBO(Algorithm):
         new_best = float(quality.max().item())
         improvement = new_best - old_best
         success = improvement > self.config.success_relative_tolerance * max(abs(old_best), 1e-12)
-        if self.config.source_protocol == "mcts_vs_2022":
+        if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
             success = -new_best < -old_best - self.config.success_relative_tolerance * abs(old_best)
         if success:
             self.state.success_count += 1
@@ -457,7 +463,7 @@ class TuRBO(Algorithm):
         """
         with ExitStack() as stack:
             stack.enter_context(gpytorch.settings.max_cholesky_size(self.config.max_cholesky_size))
-            if self.config.source_protocol == "mcts_vs_2022":
+            if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                 stack.enter_context(gpytorch.settings.fast_computations(
                     covar_root_decomposition=True, log_prob=True, solves=True
                 ))
@@ -489,7 +495,7 @@ class TuRBO(Algorithm):
         scale = quality.std(unbiased=False)
         scale = torch.where(scale < 1e-6, torch.ones_like(scale), scale)
         standardized = (quality - median) / scale
-        if self.config.source_protocol == "mcts_vs_2022":
+        if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
             self.local_gp = self._new_gp(dtype=torch.float64 if len(X) < 1024 else self.dtype)
             # The released runner fits MINIMIZATION costs. Merely reversing
             # argmax while keeping the same normal draws does not replay it.
@@ -511,7 +517,7 @@ class TuRBO(Algorithm):
             noise_covariance.register_constraint(
                 "raw_noise", gpytorch.constraints.Interval(5e-4, 0.2)
             )
-            if self.config.source_protocol == "mcts_vs_2022":
+            if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                 noise_covariance.raw_noise_constraint.to(
                     dtype=training_X.dtype, device=training_X.device
                 )
@@ -562,7 +568,7 @@ class TuRBO(Algorithm):
 
         if self.config.noisy_center == "posterior_mean":
             mean, _ = self.local_gp.predict(X)
-            if self.config.source_protocol == "mcts_vs_2022":
+            if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                 mean = -mean
             position = int(torch.argmax(mean).item())
         else:
@@ -619,7 +625,7 @@ class TuRBO(Algorithm):
 
         count = self._resolved_candidate_count()
         if (
-            self.config.source_protocol == "mcts_vs_2022"
+            self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}
             and self.acquisition_sampling_method == "paper"
         ):
             model = self.local_gp.model
@@ -761,14 +767,14 @@ class TuRBO(Algorithm):
                 translate_backend_warnings(operation="TuRBO predictive Thompson sampling"),
                 self._numerical_settings(),
             ):
-                if self.config.source_protocol == "mcts_vs_2022":
+                if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                     torch.set_rng_state(self._source_torch_rng.get_state())
                 else:
                     torch.manual_seed(self.config.seed + self.iteration)
                 samples = likelihood(model(prediction_candidates)).sample(
                     torch.Size([self.request_size])
                 )
-                if self.config.source_protocol == "mcts_vs_2022":
+                if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                     self._source_torch_rng.set_state(torch.get_rng_state())
                     location, spread = self._source_standardization
                     samples = torch.as_tensor(
@@ -900,7 +906,7 @@ class TuRBO(Algorithm):
                             ),
                             dim=0,
                         )
-                    if self.config.source_protocol == "mcts_vs_2022":
+                    if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
                         if self._source_initial_design_cache is None:
                             self._source_initial_design_cache = torch.as_tensor(
                                 latin_hypercube(self._source_rng, count, self.action_dimension),
@@ -993,6 +999,8 @@ class TuRBO(Algorithm):
             "local_box_volume": volume,
             "candidate_mask_sparsity": self._last_candidate_mask_sparsity,
             "finite_exhaustion_events": self._finite_exhaustion_events,
+            "source_evaluation_draws": self._source_evaluation_draws,
+            "source_readback_draws": 0,
             "acquisition": (
                 self.config.acquisition
                 if isinstance(self.config.acquisition, str)
@@ -1006,6 +1014,7 @@ class TuRBO(Algorithm):
         return {
             "config": repr(asdict(self.config)),
             "source_numerics_version": 3,
+            "source_evaluation_draws": self._source_evaluation_draws,
             "source_numpy_rng": random_state_dict(self._source_rng),
             "source_torch_rng": self._source_torch_rng.get_state(),
             "source_initial_design": self._source_initial_design_cache,
@@ -1041,7 +1050,7 @@ class TuRBO(Algorithm):
         if missing := required - set(state):
             raise TuRBOCheckpointError(f"TuRBO state is missing {sorted(missing)}.", algorithm=self)
         if (
-            self.config.source_protocol == "mcts_vs_2022"
+            self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}
             and state.get("source_numerics_version") != 3
         ):
             raise TuRBOCheckpointError(
@@ -1049,9 +1058,12 @@ class TuRBO(Algorithm):
                 "(historical posterior sampling); start a fresh run.",
                 algorithm=self,
             )
-        if self.config.source_protocol == "mcts_vs_2022":
+        if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
             try:
                 validate_random_states(state)
+                draws = state.get("source_evaluation_draws", 0)
+                if isinstance(draws, bool) or not isinstance(draws, int) or draws < 0:
+                    raise ValueError("Invalid source evaluation-draw count.")
                 initial = state["source_initial_design"]
                 if initial is not None:
                     design = torch.as_tensor(initial)
@@ -1075,7 +1087,8 @@ class TuRBO(Algorithm):
         """Restore progress and observations while constructing a fresh local GP."""
 
         del strict
-        if self.config.source_protocol == "mcts_vs_2022":
+        if self.config.source_protocol in {"mcts_vs_2022", "alebo_2020"}:
+            self._source_evaluation_draws = int(state.get("source_evaluation_draws", 0))
             restore_random_state(self._source_rng, state["source_numpy_rng"])
             self._source_torch_rng.set_state(
                 torch.as_tensor(state["source_torch_rng"], dtype=torch.uint8, device="cpu")
@@ -1139,9 +1152,44 @@ class TuRBO(Algorithm):
         self._last_candidate_mask_sparsity = None
         self._finite_exhaustion_events = 0
 
-        self._source_rng.seed(self.config.seed)
-        self._source_torch_rng.manual_seed(self.config.seed)
+        self._source_rng.seed(self.seed)
+        self._source_evaluation_draws = 0
+        self._source_torch_rng.manual_seed(self.seed)
         self._source_initial_design_cache = None
+
+    @property
+    def _supports_ax017_evaluation(self) -> bool:
+        return self.config.source_protocol == "alebo_2020"
+
+    def _export_random_streams(self) -> dict[str, Any]:
+        """Copy owned source streams, including while feedback is pending."""
+        if self.config.source_protocol != "alebo_2020":
+            raise NotImplementedError("Ax stream exchange requires source_protocol='alebo_2020'.")
+        return export_streams(self._source_rng, self._source_torch_rng)
+
+    def _import_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Atomically restore proposal streams without changing pending actions."""
+        if self.config.source_protocol != "alebo_2020":
+            raise NotImplementedError("Ax stream exchange requires source_protocol='alebo_2020'.")
+        numpy_rng, generator, initializer = validate_streams(state)
+        if initializer is not None:
+            raise ValueError("TuRBO has no entropy-backed Ax initializer stream.")
+        self._source_rng, self._source_torch_rng = numpy_rng, generator
+
+    def _consume_source_evaluation_draws(self, count: int) -> None:
+        """Mirror Ax's zero-noise randn calls; never evaluate a benchmark."""
+        if self.config.source_protocol != "alebo_2020":
+            raise NotImplementedError("Ax evaluation draws require source_protocol='alebo_2020'.")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("Source evaluation-draw count must be a nonnegative integer.")
+        self._source_rng.randn(count)
+        self._source_evaluation_draws += count
+
+    def _reset_shared_random_streams(self, state: Mapping[str, Any]) -> None:
+        """Reset progress and start from a validated orchestration-owned stream."""
+        validate_streams(state)
+        self.reset()
+        self._import_random_streams(state)
 
 
 def _component_candidates(

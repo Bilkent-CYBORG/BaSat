@@ -2,16 +2,36 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+import scipy
 import scipy.linalg as la
 from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
 from threadpoolctl import threadpool_limits  # type: ignore[import-untyped]
 
 from .FixedKernelGaussianProcess import FiniteSupportKernel
+
+_CACHE_PROTOCOL = "basat-separable-matern-v1"
+_CACHE_NAME = "separable_matern.json"
+
+
+def _json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _array_identity(value: np.ndarray) -> dict[str, Any]:
+    """Hash the effective float64 model inputs, independently of host endianness."""
+    canonical = np.ascontiguousarray(value, dtype="<f8")
+    return {"shape": list(canonical.shape), "dtype": "float64",
+            "sha256": hashlib.sha256(canonical.tobytes()).hexdigest()}
 
 
 def _matern52(distance: np.ndarray) -> np.ndarray:
@@ -61,6 +81,7 @@ def fit_separable_matern(
     maxiter: int = 150,
     ftol: float = 1e-10,
     maxls: int = 40,
+    cache_directory: str | Path | None = None,
 ) -> SeparableCalibration:
     """Fit a Matérn-5/2 grid GP by exact Gaussian marginal likelihood.
 
@@ -91,6 +112,14 @@ def fit_separable_matern(
         Subtract only the global mean of the supplied calibration table.
     maxiter, ftol, maxls : numeric
         L-BFGS-B settings. No randomized restarts or outcome-based tuning.
+    cache_directory : str or Path, optional
+        Opt-in directory for one atomic, checksummed JSON calibration artifact.
+        A successful cached fit is reused only for identical effective float64
+        inputs and scientific/optimizer settings. Changed or corrupt artifacts
+        raise ValueError, rather than being overwritten or silently refitted.
+        Use a fresh directory for a changed experiment. Unsuccessful fits are
+        returned with their diagnostics but are never cached. No posterior
+        observations are retained in the artifact.
 
     Returns
     -------
@@ -151,6 +180,34 @@ def fit_separable_matern(
         raise ValueError("Initial parameters and ordered bounds must be finite and positive.")
     if any(not lo <= v <= hi for v, (lo, hi) in zip(initial, bounds, strict=True)):
         raise ValueError("Initial parameters must lie within their explicit bounds.")
+    cache = None
+    identity = None
+    fingerprint = None
+    if cache_directory is not None:
+        # Import lazily: workflow's public helpers also import model classes.
+        from ..workflow import ArtifactStore
+
+        identity = {
+            "protocol": _CACHE_PROTOCOL,
+            "inputs": {name: _array_identity(value) for name, value in (
+                ("observations", y), ("action_coordinates", x),
+                ("context_coordinates", t), ("context_support", support),
+            )},
+            "settings": {
+                "context_model": context_model,
+                "initial_action_lengthscales": initial_ls.tolist(),
+                "initial_context_lengthscale": float(initial_context_lengthscale),
+                "initial_signal_variance": float(initial_signal_variance),
+                "initial_noise_variance": float(initial_noise_variance),
+                "action_lengthscale_bounds": list(action_lengthscale_bounds),
+                "context_lengthscale_bounds": list(context_lengthscale_bounds),
+                "signal_variance_bounds": list(signal_variance_bounds),
+                "noise_variance_bounds": list(noise_variance_bounds),
+                "center": center, "maxiter": maxiter, "ftol": float(ftol), "maxls": maxls,
+            },
+        }
+        fingerprint = _json_digest(identity)
+        cache = ArtifactStore(str(cache_directory))
     offset = float(y.mean()) if center else 0.0
     centered = y - offset
     temporal_distance = cdist(t, t)
@@ -179,6 +236,57 @@ def fit_separable_matern(
             + centered.size * np.log(2 * np.pi)
         )
 
+    if cache is not None and cache.exists(_CACHE_NAME):
+        try:
+            artifact = cache.read_json(_CACHE_NAME)
+            payload = artifact["payload"]
+            if artifact["sha256"] != _json_digest(payload):
+                raise ValueError("artifact checksum does not match")
+            if payload["fingerprint"] != fingerprint or payload["identity"] != identity:
+                raise ValueError("input/configuration fingerprint does not match; use a fresh directory")
+            parameters = payload["parameters"]
+            diagnostics = payload["diagnostics"]
+            expected_keys = {"action_lengthscales", "context_lengthscale", "signal_variance", "noise_variance"}
+            if set(parameters) != expected_keys or diagnostics["optimizer_success"] is not True:
+                raise ValueError("cached parameters or convergence diagnostics are invalid")
+            fitted = list(parameters["action_lengthscales"])
+            if len(fitted) != d:
+                raise ValueError("wrong number of action lengthscales")
+            if context_model == "matern":
+                fitted.append(parameters["context_lengthscale"])
+            elif parameters["context_lengthscale"] is not None:
+                raise ValueError("unexpected context lengthscale")
+            fitted.extend([parameters["signal_variance"], parameters["noise_variance"]])
+            p = np.asarray(fitted, dtype=float)
+            if not np.isfinite(p).all() or (p <= 0).any() or any(
+                v < lo * (1 - 1e-12) or v > hi * (1 + 1e-12)
+                for v, (lo, hi) in zip(p, bounds, strict=True)
+            ):
+                raise ValueError("cached fitted parameters are outside the configured bounds")
+            spatial, temporal, amplitude, noise = covariance(np.log(p))
+            stored_spatial = np.asarray(payload["action_covariance"], dtype=float)
+            stored_temporal = np.asarray(payload["context_covariance"], dtype=float)
+            if (
+                stored_spatial.shape != spatial.shape or stored_temporal.shape != temporal.shape
+                or not np.allclose(stored_spatial, amplitude * spatial, rtol=5e-14, atol=5e-14)
+                or not np.allclose(stored_temporal, temporal, rtol=5e-14, atol=5e-14)
+                or payload["observation_offset"] != offset
+                or payload["noise_variance"] != parameters["noise_variance"]
+            ):
+                raise ValueError("cached covariance or observation statistics do not match fitted parameters")
+            with threadpool_limits(limits=1):
+                if not np.isclose(nll(np.log(p)), diagnostics["negative_log_marginal_likelihood"],
+                                  rtol=1e-8, atol=1e-8):
+                    raise ValueError("cached likelihood does not match calibration inputs")
+            return SeparableCalibration(
+                FiniteSupportKernel(x, stored_spatial),
+                FiniteSupportKernel(support, stored_temporal),
+                float(parameters["noise_variance"]), offset, parameters,
+                {**diagnostics, "cache_hit": True, "cache_fingerprint": fingerprint},
+            )
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError, OSError) as error:
+            raise ValueError(f"Invalid separable calibration cache: {error}") from error
+
     with threadpool_limits(limits=1):
         fit = minimize(
             nll,
@@ -195,6 +303,18 @@ def fit_separable_matern(
         "signal_variance": float(amplitude),
         "noise_variance": float(noise),
     }
+    names = [f"action_lengthscale[{i}]" for i in range(d)]
+    if context_model == "matern":
+        names.append("context_lengthscale")
+    names.extend(["signal_variance", "noise_variance"])
+    # Bound proximity is measured in the same log coordinates optimized above.
+    boundary_tolerance = 1e-6
+    boundary_parameters = [
+        {"parameter": name, "side": side, "value": float(value), "bound": float(bound)}
+        for name, value, (lo, hi) in zip(names, p, bounds, strict=True)
+        for side, bound in (("lower", lo), ("upper", hi))
+        if abs(float(np.log(value / bound))) <= boundary_tolerance
+    ]
     diagnostics = {
         "context_model": context_model,
         "calibration_rows": int(y.size),
@@ -208,8 +328,14 @@ def fit_separable_matern(
         "ftol": ftol,
         "maxls": maxls,
         "numerical_method": "exact Kronecker eigendecomposition",
+        "boundary_log_tolerance": boundary_tolerance,
+        "boundary_parameters": boundary_parameters,
+        "numpy_version": np.__version__,
+        "scipy_version": scipy.__version__,
     }
-    return SeparableCalibration(
+    if cache is not None:
+        diagnostics.update(cache_hit=False, cache_fingerprint=fingerprint)
+    result = SeparableCalibration(
         FiniteSupportKernel(x, amplitude * spatial),
         FiniteSupportKernel(support, temporal),
         float(noise),
@@ -217,3 +343,13 @@ def fit_separable_matern(
         parameters,
         diagnostics,
     )
+    if cache is not None and bool(fit.success) and np.isfinite(fit.fun):
+        payload = {
+            "identity": identity, "fingerprint": fingerprint,
+            "parameters": parameters, "diagnostics": diagnostics,
+            "action_covariance": (amplitude * spatial).tolist(),
+            "context_covariance": temporal.tolist(),
+            "noise_variance": float(noise), "observation_offset": offset,
+        }
+        cache.write_json(_CACHE_NAME, {"payload": payload, "sha256": _json_digest(payload)})
+    return result

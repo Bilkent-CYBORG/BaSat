@@ -1,28 +1,38 @@
 # Basat
 
-**Bayesian optimization with your own objectives, data, and experiment settings.**
+Basat is a Python library for **Bayesian optimization**: finding good inputs to an expensive objective using a limited number of evaluations. It brings 19 optimization algorithms together behind a consistent interface for objective functions, tabular datasets, experiment management, and plotting.
 
-[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms)
+Define what you want to optimize, choose an environment and an algorithm, and run an `Experiment`.
 
-Basat is a Python library for running and comparing Bayesian optimization algorithms. Define an objective, choose an environment and an algorithm, and run an `Experiment`. The same interface supports one algorithm or several, independent trials, early stopping, saved checkpoints, and plots.
+## What you can do
 
-- **19 algorithms** across stochastic, contextual, distributional, and adversarial/robust families.
-- **User-defined objectives and CSV data**, with environment-specific observations supplied during optimization.
-- **Configurable models and policies**, including GP kernels, acquisition functions, and sampling settings where supported by each algorithm.
-- **Repeatable experiments**, with seed management, per-trial results, and checkpoint continuation.
-- **Built-in plotting**, including comparisons and staggered uncertainty bars across trials.
+- Optimize your own Python objective, simulation, or model-evaluation function.
+- Work with stochastic rewards, contextual information, distributional uncertainty, or adversarial perturbations.
+- Compare algorithms and configurations across independent, seeded trials.
+- Control evaluation budgets, batches, early stopping, and checkpoint continuation.
+- Plot optimization progress and compare measured results with paper-specific benchmarks.
 
-Basat is under active development. The guides describe algorithm assumptions, numerical diagnostics, and cross-environment adaptations.
+## Installation
 
-## Running this source checkout
+Basat requires **Python 3.11–3.14**. From the project root:
 
-Requires **Python 3.11–3.14** and an environment with Basat's runtime dependencies already installed. This repository contains the library source and `uv.lock`, but intentionally omits the packaging manifest (`pyproject.toml`). Consequently, `pip install .`, editable installation, and `uv sync` are not supported from this checkout alone. The lockfile records dependencies; it does not replace the missing manifest.
+```bash
+python -m pip install .
+```
 
-Run the examples from the repository root using an existing Basat environment. For an installable distribution, obtain a packaged build or a complete project containing its packaging metadata. All Python examples below use only `import basat` and Python built-ins.
+For an editable installation with testing and development tools:
+
+```bash
+python -m pip install -e ".[dev]"
+```
+
+The project also includes `uv.lock`; `uv sync` creates the locked project environment.
+
+Some paper-specific backends need additional dependencies. For example, `python -m pip install ".[numpyro]"` installs the NumPyro backend used by the guide's SAASBO experiment. Dedicated numerical environments are described in [reproduction setup](docs/reproduction.md).
 
 ## Quick start
 
-Save this example as `quickstart.py`:
+This example maximizes a two-dimensional function:
 
 ```python
 import basat
@@ -31,58 +41,59 @@ seed = basat.set_seed(42, threads=1)
 bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
 
 
-def objective(values):
-    return -sum((x - 0.25) ** 2 for x in values)
+def objective(x):
+    return -sum((value - 0.25) ** 2 for value in x)
 
 
 algorithm = basat.make_algorithm("TuRBO", bounds=bounds, seed=seed)
 environment = basat.StochasticEnvironment(
-    bounds=bounds, function=objective, seed=seed,
+    bounds=bounds,
+    function=objective,
+    seed=seed,
 )
-experiment = basat.Experiment(environment=environment, algorithm=algorithm)
-result = experiment.run(max_evaluations=50, plot=True, show=True)
+experiment = basat.Experiment(
+    environment=environment,
+    algorithm=algorithm,
+)
+result = experiment.run(max_evaluations=30, plot=True, show=True)
 print(experiment.summary())
 ```
 
-Run it from your terminal:
+Basat proposes inputs within the bounds, evaluates your function, and updates the algorithm from the observed rewards. The maximum reward in this example is `0`, at `[0.25, 0.25]`.
 
-```bash
-python quickstart.py
-```
-
-Basat selects inputs within the bounds, calls your objective, and updates the algorithm from the returned rewards. This example has a maximum reward of `0` at `[0.25, 0.25]`. The summary reports the observed results, and the figure shows optimization progress.
-
-An objective returns one finite scalar. **Basat maximizes reward by default**: return the negative of a loss when you want to minimize it. Replace the function body with your own calculation, model evaluation, or simulator.
-
-`max_evaluations=50` is an example budget, not a library-wide restriction. An evaluation is one objective call; a round can contain several evaluations when using batches.
+An objective returns one finite scalar. Basat maximizes by default; return the negative of a loss to optimize it as a reward. Evaluation budgets are configurable: `30` is an example, not a library-wide limit.
 
 ## Compare algorithms
 
-Pass a list of algorithms or a dictionary of labels to `algorithm`. Each algorithm runs independently on the environment. A dictionary also lets you compare different settings of the same method.
-
-This example can be run on its own:
+Pass a dictionary of labeled algorithms to run independent comparisons. Labels can distinguish different algorithms or different configurations of one algorithm:
 
 ```python
 import basat
 
 seed = basat.set_seed(42, threads=1)
 bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
-run_directory = basat.new_run_directory("results/readme/comparison")
 
 
-def objective(values):
-    return -sum((x - 0.25) ** 2 for x in values)
+def objective(x):
+    return -sum((value - 0.25) ** 2 for value in x)
 
 
 algorithms = {
     "TuRBO / EI": basat.make_algorithm(
-        "TuRBO", bounds=bounds, seed=seed, acquisition="EI",
-        initial_points=8, candidate_count=128,
+        "TuRBO",
+        bounds=bounds,
+        seed=seed,
+        acquisition="EI",
+        initial_points=8,
+        candidate_count=128,
     ),
     "TuRBO / UCB": basat.make_algorithm(
-        "TuRBO", bounds=bounds, seed=seed,
+        "TuRBO",
+        bounds=bounds,
+        seed=seed,
         acquisition=basat.AcquisitionConfig(name="UCB", beta=3.0, seed=seed),
-        initial_points=8, candidate_count=128,
+        initial_points=8,
+        candidate_count=128,
     ),
 }
 experiment = basat.Experiment(
@@ -90,47 +101,19 @@ experiment = basat.Experiment(
         bounds=bounds, function=objective, seed=seed,
     ),
     algorithm=algorithms,
-    output_directory=run_directory,
+    output_directory=basat.new_run_directory("results/comparison"),
 )
-result = experiment.run(trials=5, max_evaluations=50, plot=False)
+comparison = experiment.run(
+    trials=3, max_evaluations=30, plot=True, show=True,
+)
 print(experiment.summary())
-figure = basat.plot(
-    experiment,
-    kind="incumbent",
-    title="TuRBO: EI and UCB",
-    xlabel="Objective evaluations",
-    ylabel="Best observed reward",
-    xlim=(1, 50),
-    save_path=basat.join_path(run_directory, "comparison.png"),
-    show=True,
-)
 ```
 
-`trials=5` repeats the entire optimization five times. A configured algorithm seed of `42` becomes `42, 43, 44, 45, 46`; the environment's seed advances from its own base seed. Each algorithm receives up to 50 evaluations **per trial**, or 250 across five trials. The budget and trial count are user-selected.
+Here each algorithm receives up to 30 evaluations per trial, across three trials. Basat advances the configured seeds between trials and keeps each algorithm's state separate.
 
-Repeated-trial plots show means and, by default, vertical bars spanning **mean ± 1.96 sample standard deviations**. These bars describe variability across trials; they are not confidence intervals for the mean. Bar locations are staggered between algorithms. After early stopping, only trials with observations at an evaluation contribute to that point.
+Use `basat.plot()` to customize plots of saved experiments. `basat.PlotSeries`, `basat.PlotPanel`, and `basat.plot_panels()` support custom metrics, panels, and explicitly configured uncertainty bars. The notebook provides examples of these plotting APIs.
 
-For a single run, `trials` defaults to `1`. `plot=True` in `run()` creates a figure; `show=False` prevents automatic display. Use `basat.plot()` to customize and save plots, and `basat.show(figure)` to display a retained figure explicitly.
-
-For paper-specific metrics, use `basat.PlotSeries`, `basat.PlotPanel`, and
-`basat.plot_panels()`. Matplotlib remains an internal dependency; users need not
-import it. `PlotSeries.from_runs()` transforms each measured run before computing
-means and explicit SD or standard-error bars. For example, `uncertainty="sd",
-ddof=0, error_scale=0.5` means population standard deviation divided by two.
-Unequal-length trajectories must be selected explicitly; missing endpoints are
-never manufactured. `chart.save("./results/comparison.png", dpi=200)` saves a
-returned chart in the user's project. Algorithm colors remain distinct beyond
-the usual 20-color cycle and consistent across panels.
-
-## Choose algorithms and settings
-
-List the registered algorithm names:
-
-```python
-import basat
-
-print(basat.algorithm_names())
-```
+## Available algorithms
 
 | Family | Algorithms |
 | --- | --- |
@@ -139,53 +122,42 @@ print(basat.algorithm_names())
 | Distributional | DRBO, RoBOS |
 | Adversarial / robust | StableOPT, AdveRS |
 
-Use `make_algorithm()` for construction by name, or instantiate an algorithm with its configuration class. For example, this constructs TuRBO with UCB and `beta=3`:
+List the registered names with `basat.algorithm_names()`. Construct an algorithm by name with `basat.make_algorithm()`, or use its class and configuration directly.
 
-```python
-import basat
+Settings differ by method. Embedding-based methods require an embedding dimension, satisficing methods require a threshold, and AG-VS requires a valid split count. The [user guide](docs/basat_user_guide.ipynb) explains these choices and shows expanded configurations.
 
-bounds = basat.Bounds(lower=[0.0, 0.0], upper=[1.0, 1.0])
-algorithm = basat.TuRBO(
-    bounds=bounds,
-    config=basat.TuRBOConfig(
-        seed=42,
-        acquisition=basat.AcquisitionConfig(name="UCB", beta=3.0, seed=42),
-    ),
-)
-```
+## Environments
 
-Pass this algorithm to an `Experiment` as in the quick start. Omitted optional settings use the algorithm's defaults. There are no parameter profiles. Required scientific choices, such as an embedding dimension or a satisficing threshold, depend on the selected method; supported settings also differ between algorithms. The notebook includes expanded configurations and kernel, acquisition, and sampling examples. For configurable action and context kernels, see the CGP_UCB kernel comparison (in the separate full project).
+An environment defines how an action is evaluated and what information the learner receives.
 
-## Environments and real data
-
-An environment defines how an action is evaluated and what information is available to the learner.
-
-| Environment | Information and evaluation |
+| Environment | Purpose |
 | --- | --- |
-| `StochasticEnvironment` | Evaluates an action and returns a scalar reward, optionally with observation noise. |
-| `ContextualEnvironment` | Reveals context before action selection and evaluates the action in that context. |
-| `DistributionalEnvironment` | Provides public distribution information before selection and evaluates the action under a sampled context. |
-| `AdversarialEnvironment` | Applies its configured attack and returns the resulting evaluation and feedback. |
+| `StochasticEnvironment` | Evaluate an action and return a scalar reward, optionally with observation noise. |
+| `ContextualEnvironment` | Reveal context before choosing an action and evaluate the action in that context. |
+| `DistributionalEnvironment` | Supply public distribution information and evaluate an action under a sampled context. |
+| `AdversarialEnvironment` | Apply a configured perturbation or attack during evaluation. |
 
-Environment-provided information takes precedence over internal algorithm defaults. Algorithms ignore extra inputs they do not need. Where execution is technically possible, missing inputs receive documented defaults and cross-environment adaptations produce warnings. An adaptation does not establish the method's native theoretical guarantees. See the guide's **Algorithm adaptations across environments** appendix for each combination.
+Use an algorithm's native environment when you need its original assumptions. A supported cross-environment adaptation does not establish the method's native theoretical guarantees; the guide documents adaptations and their limitations.
 
-For CSV input, use the loader with the appropriate environment family. This example requires the wind dataset from the separate full project. Datasets are not included in this source-only repository:
+## Use your own data
+
+Basat supports CSV-backed experiments as well as callable objectives. Load a table using the appropriate environment family:
 
 ```python
 import basat
 
 loaded = basat.load_dataset(
-    basat.find_path("data/distributional/wind_power_bandit.csv"),
-    environment="distributional",
+    basat.find_path("data/stochastic/diabetes_bandit.csv"),
+    environment="stochastic",
 )
 print(loaded.preview(rows=3))
 ```
 
-The notebook (in the separate full project) shows the required CSV schemas and complete environment construction. It includes four distinct real-data examples: diabetes, wine, wind power, and iris. Dataset sources and transformations are documented in data/README.md (in the separate full project). Example datasets live outside the installed library.
+The `data/` directory contains small diabetes, wine, wind-power, and iris examples. [Dataset documentation](data/README.md) describes their sources and transformations; the guide shows the required CSV schemas and complete environment construction. You can substitute your own data in the same format.
 
-## Early stopping and saved runs
+## Budgets, stopping, and checkpoints
 
-To stop on either an evaluation budget or lack of improvement, pass a stopping rule when constructing an experiment:
+`max_evaluations` limits objective evaluations; a round may contain several evaluations when an algorithm proposes a batch. Use stopping rules for additional conditions such as a target reward or lack of improvement:
 
 ```python
 import basat
@@ -196,34 +168,48 @@ stopping_rule = basat.any_of(
 )
 ```
 
-Use `stopping_rule=stopping_rule` in `basat.Experiment(...)`. The first applicable run limit or stopping condition ends that algorithm's trial. Time limits, target values, round limits, and `all_of()` composition are also available; see the notebook's **Early Stopping** section.
+Pass the rule as `stopping_rule` when constructing an `Experiment`.
 
-Set `output_directory` to retain results and checkpoints. Multiple algorithms and trials receive separate directories under the experiment's output folder. `basat.new_run_directory()` creates a fresh location for a new experiment.
+Set `output_directory` to save results and checkpoints. To continue a run, reconstruct the same objective, environment, configuration, and output directory with `resume=True`, then call `run()` again. Evaluation limits are totals: continuing from 20 evaluations to a limit of 50 permits up to 30 additional evaluations per trial.
 
-To continue a saved experiment, reconstruct it with the same objective, environment, base configuration, output directory, and `resume=True`, then call `run()` with the same trial count. Evaluation limits are **totals**, so continuing from 20 to `max_evaluations=50` allows up to 30 additional evaluations per trial. A completed explicit stopping rule remains stopped. The complete resume example (in the separate full project) demonstrates checkpoint continuation.
+The default transactional checkpoint policy preserves evaluated feedback before giving it to the learner. An explicit periodic policy can reduce disk overhead for replayable experiments, but a crash may repeat evaluations since the last checkpoint. It is not an exactly-once policy for costly or externally stateful objectives.
 
-The default `checkpoint_policy="transactional"` preserves evaluated feedback
-before handing it to the learner. An explicit `checkpoint_policy="periodic"`
-saves at `save_every` rounds and on a normal `run()` return. It can reduce disk
-overhead for replayable offline datasets, but a crash may lose up to that many
-unsaved rounds and repeat their evaluations. It is not an exactly-once policy
-for costly or externally stateful objectives. Changing the persistence cadence
-does not change GP training steps or permit incompatible scientific settings.
+## User guide
 
-## Guides and experiment assets
-
-The GitHub repository intentionally tracks only `basat/`, `.gitignore`, `LICENSE`, `README.md`, and `uv.lock`.
-
-The full local project also contains the editable notebook, PDF guides, Overleaf source, example datasets, and saved experiment results. These assets are not distributed in this repository. If you have the full project and its installed environment, open its notebook with:
+Open the notebook from the project root after installation:
 
 ```bash
 python -m basat notebook docs/basat_user_guide.ipynb
 ```
 
-The guide covers objective definitions, all algorithm configurations, CSV schemas, early stopping, checkpoint continuation, and adaptations across environments. Its stored figures represent saved experiments; changing code alone does not update those results.
+The guide covers objective definitions, algorithm settings, environments, CSV data, stopping rules, checkpoint continuation, plotting, and paper-specific comparisons.
+
+Its embedded figures can be viewed without the original result directories. Editing settings alone does not regenerate saved measurements or embedded figures. Full reproduction campaigns may take substantial time, download additional data, and require separate numerical environments. See [reproduction setup](docs/reproduction.md) before running them. Paper comparisons are not a claim of exact historical or cross-platform bitwise reproduction.
+
+## Project structure
+
+```text
+basat/          Library source and component license notices
+docs/           User-guide notebook and reproduction setup
+data/           Small example datasets and provenance
+tests/          Portable library tests and reference fixtures
+scripts/        Clean-project export utility
+pyproject.toml  Package metadata and dependency settings
+uv.lock         Locked dependencies
+```
+
+Results, checkpoints, caches, temporary environments, and manuscript files are local research artifacts rather than required library files. The ignore rules keep them out of the repository.
+
+## Tests
+
+After installing the development dependencies:
+
+```bash
+python -m pytest
+```
+
+Tests requiring optional reference archives, accelerator hardware, or a dedicated numerical environment skip when those resources are unavailable.
 
 ## License
 
-Basat is distributed under the [Apache License 2.0](LICENSE). Source-derived
-additive-GP numerical routines retain their upstream Dragonfly MIT and PyMC
-Apache notices beside the implementation.
+Basat's project code is distributed under the [Apache License 2.0](LICENSE). Source-derived components retain the applicable upstream license notices and terms alongside their implementation files.

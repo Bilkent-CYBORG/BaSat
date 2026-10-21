@@ -75,8 +75,9 @@ class DRBOConfig:
     inner_solver:
         CVXPY, SLSQP, or enumeration backend for minimizing expected UCB over
         the finite MMD probability ball. ``"source_cvxpy"`` uses fresh, cold
-        CVXPY programs and NumPy score arithmetic matching released finite
-        experiments. Non-full balls are numerically solved even when a minimum
+        CLARABEL programs without solver fallback, and NumPy score arithmetic
+        matching released finite experiments. Non-full balls are numerically
+        solved even when a minimum
         vertex is feasible. The explicit PSD eigen-factor and independent
         residual checks remain enabled; historical dependency bugs are not
         reproduced. Zero-radius and full-simplex limits remain exact.
@@ -655,6 +656,14 @@ class DRBO(_FiniteContextGPAlgorithm):
                 warm_start=not source_protocol,
             )
         except Exception as clarabel_error:
+            if source_protocol:
+                # A reproduction must not silently switch numerical solvers.
+                # The native mode below retains its ordinary SCS fallback.
+                raise DRBOInnerSolverError(
+                    "Source CVXPY protocol requires a cold CLARABEL solve; "
+                    f"CLARABEL reported {clarabel_error}.",
+                    algorithm=self,
+                ) from clarabel_error
             # SCS remains an explicitly CVXPY-managed solver, not a change in
             # the selected mathematical formulation.
             try:

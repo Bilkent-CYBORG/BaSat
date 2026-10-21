@@ -112,6 +112,16 @@ class CGPUCBConfig:
         performs exact fixed-parameter conditioning on CPU/float64 for finite
         action tables; requires zero mean, fixed noise, no standardization,
         and ``fit_maxiter=0``. All observed history is retained.
+    finite_prediction:
+        Opt-in ``"marginal"`` prediction avoids candidate-by-candidate
+        covariance matrices for the fixed incremental GP. ``"joint"`` keeps
+        the existing prediction/cache behavior.
+    marginal_chunk_size:
+        Maximum number of candidate columns in each exact marginal solve.
+    recommendation_candidates:
+        ``"latest_context"`` restricts the final recommendation to candidates
+        revealed at the latest context, including already observed actions at
+        that context. ``"configured"`` retains the configured action domain.
     batch_size:
         Requested proposal count. Contextual version 1 requires ``1``.
     seed:
@@ -135,6 +145,9 @@ class CGPUCBConfig:
     seed: int = 1
     gp_config: GaussianProcessConfig | None = None
     gp_backend: Literal["standard", "fixed_incremental"] = "standard"
+    finite_prediction: Literal["joint", "marginal"] = "joint"
+    marginal_chunk_size: int = 1024
+    recommendation_candidates: Literal["configured", "latest_context"] = "configured"
 
 
 @dataclass(slots=True)
@@ -170,6 +183,7 @@ class CGPUCBState:
     observation_noise_variance: torch.Tensor
     current_context: torch.Tensor | None
     context_history: list[torch.Tensor]
+    latest_context_candidates: torch.Tensor | None = None
 
 
 class CGP_UCB(Algorithm):
@@ -192,7 +206,9 @@ class CGP_UCB(Algorithm):
 
     ACQUISITION_POLICY = "contextual GP-UCB"
     CHECKPOINT_ADDED_CONFIG_DEFAULTS = MappingProxyType(
-        {**Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS, "gp_config": None, "gp_backend": "standard"}
+        {**Algorithm.CHECKPOINT_ADDED_CONFIG_DEFAULTS, "gp_config": None, "gp_backend": "standard",
+         "finite_prediction": "joint", "marginal_chunk_size": 1024,
+         "recommendation_candidates": "configured"}
     )
 
     EXCEPTION_CLASS = CGP_UCBException
@@ -355,6 +371,17 @@ class CGP_UCB(Algorithm):
         ):
             raise AlgorithmConfigurationError(
                 "fixed_incremental requires finite actions and fit_maxiter=0."
+            )
+        if config.finite_prediction not in {"joint", "marginal"}:
+            raise AlgorithmConfigurationError("finite_prediction must be 'joint' or 'marginal'.")
+        if config.finite_prediction == "marginal" and config.gp_backend != "fixed_incremental":
+            raise AlgorithmConfigurationError("Marginal finite prediction requires fixed_incremental.")
+        if (isinstance(config.marginal_chunk_size, bool)
+                or not isinstance(config.marginal_chunk_size, int) or config.marginal_chunk_size < 1):
+            raise AlgorithmConfigurationError("marginal_chunk_size must be a positive integer.")
+        if config.recommendation_candidates not in {"configured", "latest_context"}:
+            raise AlgorithmConfigurationError(
+                "recommendation_candidates must be 'configured' or 'latest_context'."
             )
         if (
             isinstance(config.initial_points, bool)
@@ -685,9 +712,19 @@ class CGP_UCB(Algorithm):
         """Evaluate posterior UCB on ``(N, D_action + D_context)`` inputs."""
 
         assert self.gp is not None
-        mean, std = self.gp.predict(joint_inputs)
+        mean, std = self._predict_finite(joint_inputs)
         quality_mean = mean if self.maximize else -mean
         return quality_mean + math.sqrt(self._beta()) * std
+
+    def _predict_finite(self, joint_inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Use the explicitly selected exact finite prediction operation."""
+        assert self.gp is not None
+        if self.config.finite_prediction == "marginal":
+            assert isinstance(self.gp, FixedKernelGaussianProcess)
+            return self.gp.predict_marginals(
+                joint_inputs, chunk_size=self.config.marginal_chunk_size
+            )
+        return self.gp.predict(joint_inputs)
 
     def _score_available_actions(
         self, actions: torch.Tensor, context: torch.Tensor
@@ -928,6 +965,16 @@ class CGP_UCB(Algorithm):
             (self.state.observation_noise_variance, variance)
         )
         self.state.context_history.append(context.detach().clone())
+        if self.config.recommendation_candidates == "latest_context":
+            exposed = round_info.get("candidate_actions")
+            if exposed is None:
+                self.state.latest_context_candidates = None
+            else:
+                matching = (self.state.contexts_train == context).all(dim=1)
+                self.state.latest_context_candidates = torch.unique(torch.cat((
+                    torch.as_tensor(exposed, dtype=self.dtype, device=self.device),
+                    self.state.actions_train[matching],
+                )), dim=0)
         self.state.current_context = None
         self.gp.set_data(
             self.state.joint_inputs_train,
@@ -942,12 +989,15 @@ class CGP_UCB(Algorithm):
             return self._best_observed()
         context = self.state.context_history[-1]
         self._fit_model()
-        if self.config.action_set is not None:
+        if (self.config.recommendation_candidates == "latest_context"
+                and self.state.latest_context_candidates is not None):
+            actions = self.state.latest_context_candidates
+        elif self.config.action_set is not None:
             actions = torch.as_tensor(self.config.action_set, dtype=self.dtype, device=self.device)
         else:
             actions = self._continuous_candidates()
         assert self.gp is not None
-        mean, _ = self.gp.predict(self._joint_input(actions, context))
+        mean, _ = self._predict_finite(self._joint_input(actions, context))
         quality = mean if self.maximize else -mean
         position = self._stable_position(quality, actions, None)
         return actions[position].detach().clone(), float(mean[position].item())
@@ -1022,7 +1072,17 @@ class CGP_UCB(Algorithm):
                 if raw["current_context"] is None
                 else tensor(raw["current_context"]),
                 context_history=[tensor(x) for x in raw["context_history"]],
+                latest_context_candidates=None
+                if raw.get("latest_context_candidates") is None
+                else tensor(raw["latest_context_candidates"]),
             )
+            candidates = self.state.latest_context_candidates
+            if candidates is not None and (
+                candidates.ndim != 2 or not len(candidates)
+                or candidates.shape[1] != self.action_dimension
+                or not bool(torch.isfinite(candidates).all())
+            ):
+                raise ValueError("Invalid latest-context candidate checkpoint.")
             if self.gp is not None:
                 self.gp.reset()
                 fixed_state = state.get("fixed_gp_state")

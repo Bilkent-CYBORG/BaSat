@@ -12,13 +12,14 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 import time
 import traceback
 import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Literal
@@ -29,6 +30,11 @@ from .algorithms.algorithm import Algorithm
 from .algorithms.helper import AlgorithmResult
 from .environments.adapters import adapt_environment_for_algorithm
 from .environments.environment import Environment, NoAvailableActionError
+from .regret import RSRegret
+from ._robos_regret import RoBOSSourceRegret
+from ._robos_protocol import RoBOSSourceProtocol
+from ._advers_source_protocol import AdveRSSourceProtocol
+from ._advers_serial_protocol import AdveRSSerialSourceProtocol
 from .stopping.stopping_rule import (
     CompositeStoppingRule,
     MaximumEvaluationsStoppingRule,
@@ -38,8 +44,11 @@ from .stopping.stopping_rule import (
 from .trials import (
     ACTIVE,
     ExperimentTrialsResult,
+    GroupedExperimentResult,
+    GroupedTrialConfig,
     aggregate_document,
     rng_state,
+    run_grouped_trials,
     run_trials,
     trial_rng,
 )
@@ -47,6 +56,7 @@ from .warnings import BasatExperimentWarning, translate_backend_warnings
 
 SamplingMethod = Literal["paper", "sobol", "uniform"]
 PerAlgorithmSamplingMethod = SamplingMethod | Mapping[str, SamplingMethod | None] | None
+PerAlgorithmRegret = RSRegret | RoBOSSourceRegret | Mapping[str, RSRegret | RoBOSSourceRegret] | None
 
 
 class ExperimentConfigurationError(ValueError):
@@ -196,6 +206,21 @@ class Experiment:
         those objective evaluations may be repeated on resume. Use periodic
         saving only when that tradeoff is acceptable, such as replayable
         offline datasets. Neither policy changes GP training or observations.
+    evaluation_protocol:
+        ``"standard"`` leaves objective evaluation unchanged. The opt-in
+        ``"ax_0_1_17"`` noiseless source protocol consumes the historical Ax
+        wrapper's discarded NumPy Gaussian draw for each observation, on the
+        learner's owned source stream. Transactional checkpoints record that
+        cursor so feedback replay never repeats the draw or objective call.
+        ``"advers_2025"`` generates a clean finite initial design followed by
+        LCB- or worst-case-attacked noisy evaluations, sharing the learner's
+        MT19937 stream. Worst-case attacks use environment-private latent values.
+        Generated initialization counts toward total objective budgets but is
+        excluded from online rounds and regret. It requires transactional saving.
+        :class:`AdveRSSourceProtocol` additionally opts into the released LCB
+        parallel-task CRC32 chunk seeds and a continuing native MT19937 stream
+        across fresh learners within each chunk. Its method/seed/task manifests
+        are separate from ordinary independent trials and immutable on resume.
     constant_context:
         Reserved compatibility keyword; only ``None`` is accepted. Supply a
         context through the environment. Algorithm defaults are internal.
@@ -263,10 +288,12 @@ class Experiment:
         resume: bool = False,
         save_every: int = 1,
         checkpoint_policy: Literal["transactional", "periodic"] = "transactional",
+        evaluation_protocol: Literal["standard", "ax_0_1_17", "advers_2025", "robos_2023"] | RoBOSSourceProtocol | AdveRSSourceProtocol | AdveRSSerialSourceProtocol = "standard",
         constant_context: Any | None = None,
         initial_points_sampling_method: PerAlgorithmSamplingMethod = None,
         acquisition_sampling_method: PerAlgorithmSamplingMethod = None,
         initial_sampling_method: PerAlgorithmSamplingMethod = None,
+        _advers_source_entry: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize the coordinator from the components documented above."""
 
@@ -275,6 +302,26 @@ class Experiment:
                 "checkpoint_policy must be 'transactional' or 'periodic'."
             )
         self.checkpoint_policy = checkpoint_policy
+        self._advers_serial_source_protocol = evaluation_protocol if isinstance(evaluation_protocol, AdveRSSerialSourceProtocol) else None
+        self._advers_source_protocol = evaluation_protocol if isinstance(evaluation_protocol, AdveRSSourceProtocol) else None
+        self._advers_source_entry = copy.deepcopy(_advers_source_entry)
+        if self._advers_source_protocol is not None or self._advers_serial_source_protocol is not None:
+            evaluation_protocol = "advers_2025"
+        if self._advers_source_entry is not None and evaluation_protocol != "advers_2025":
+            raise ExperimentConfigurationError("A private AdveRS source entry requires advers_2025 child evaluation.")
+        self._robos_protocol = evaluation_protocol if isinstance(evaluation_protocol, RoBOSSourceProtocol) else None
+        if self._robos_protocol is not None:
+            evaluation_protocol = "robos_2023"
+        self._robos_plan_digest = None
+        self._robos_execution = None
+        if evaluation_protocol not in {"standard", "ax_0_1_17", "advers_2025", "robos_2023"}:
+            raise ExperimentConfigurationError("Unknown evaluation_protocol.")
+        if evaluation_protocol != "standard" and checkpoint_policy != "transactional":
+            raise ExperimentConfigurationError("Historical evaluation protocols require transactional checkpoints.")
+        self.evaluation_protocol = evaluation_protocol
+        self._evaluation_protocol_records = 0
+        self._evaluation_readback_records = -1
+        self._advers_bootstrap: dict[str, Any] | None = None
         if constant_context is not None:
             raise ExperimentConfigurationError(
                 "constant_context no longer configures algorithm defaults. Supply context "
@@ -295,6 +342,8 @@ class Experiment:
         self.warnings: dict[str, list[str]] = {}
         self.failures: dict[str, ExperimentFailure] = {}
         self._run_stop_reason: str | None = None
+        self.regret_curves: dict[str, torch.Tensor] = {}
+        self._regret_reports: dict[str, dict[str, Any]] = {}
         self._last_requested_limits: dict[str, Any] = {}
         parameters: dict[str, Any] = dict(
             environment=environment,
@@ -399,6 +448,9 @@ class Experiment:
         self.experiments: Mapping[str, Experiment] = MappingProxyType({})
         self.algorithms: Mapping[str, Algorithm] = MappingProxyType({})
         self._comparison_elapsed_seconds = 0.0
+        self._elapsed_reporting_managed = False
+        self._elapsed_report_started_at: float | None = None
+        self._reported_elapsed_seconds: float | None = None
         if algorithms is not None:
             self._initialize_multiple(
                 environment=environment,
@@ -441,6 +493,20 @@ class Experiment:
             constant_context=constant_context,
         )
         self.algorithm = algorithm
+        if self.evaluation_protocol == "advers_2025":
+            from ._advers_protocol import validate
+            validate(self)
+        if self.evaluation_protocol == "ax_0_1_17":
+            if (not getattr(algorithm, "_supports_ax017_evaluation", False)
+                    or not callable(getattr(algorithm, "_consume_source_evaluation_draws", None))):
+                raise ExperimentConfigurationError(
+                    "ax_0_1_17 evaluation requires a compatible source random-stream policy.")
+            if (getattr(environment, "source_mode", None) != "function"
+                    or getattr(environment, "noise_std", None) != 0
+                    or getattr(environment, "noise_fn", None) is not None
+                    or environment.get_history_data().number_of_observations):
+                raise ExperimentConfigurationError(
+                    "ax_0_1_17 evaluation currently supports only noiseless callable environments.")
         public_support = getattr(self.environment, "context_support", None)
         self.algorithm.bind_environment_metadata(
             {}
@@ -498,7 +564,7 @@ class Experiment:
             self.load_checkpoint()
             with trial_rng(self):
                 self._replay_unconsumed_environment_records()
-        else:
+        elif self.evaluation_protocol != "advers_2025":
             self._initialize_algorithm_from_environment()
 
     @staticmethod
@@ -594,13 +660,16 @@ class Experiment:
 
     @staticmethod
     def _report_child_failure(
-        *, label: str, phase: Literal["initialization", "run"], error: Exception
+        *, label: str, phase: Literal["initialization", "run"], error: Exception,
+        continuing: bool = True,
     ) -> None:
-        """Print one child traceback and announce that sibling runs will continue."""
+        """Report a child failure and whether the coordinator will continue."""
 
         warnings.warn(
             f"Basat skipped {label!r} during {phase}: {type(error).__name__}: {error}. "
-            "Independent algorithms will continue; the full traceback is available in "
+            + ("Independent algorithms will continue; " if continuing else
+               "Execution stops because fail_fast=True; ")
+            + "the full traceback is available in "
             f"experiment.failures[{label!r}].traceback.",
             BasatExperimentWarning,
             stacklevel=3,
@@ -777,6 +846,7 @@ class Experiment:
                         resume=resume,
                         save_every=save_every,
                         checkpoint_policy=self.checkpoint_policy,
+                        evaluation_protocol=self.evaluation_protocol,
                         constant_context=constant_context,
                         initial_points_sampling_method=initial_methods[label],
                         acquisition_sampling_method=acquisition_methods[label],
@@ -785,6 +855,9 @@ class Experiment:
                     # Inactive children must not spend their time budget while
                     # preceding algorithms are running or being initialized.
                     child._comparison_elapsed_seconds = time.monotonic() - child._started_at
+                    if child._reported_elapsed_seconds is None:
+                        child._reported_elapsed_seconds = child._comparison_elapsed_seconds
+                    child._elapsed_reporting_managed = True
             except Exception as error:
                 child_directory = child_directories[label]
                 if (
@@ -831,6 +904,32 @@ class Experiment:
         self._last_checkpoint_phase = None
 
     @property
+    def elapsed_seconds(self) -> float:
+        """Return recorded elapsed time, excluding other scheduled methods.
+
+        Comparisons sum their child runtimes; ordinary repeated experiments
+        sum their started trial runtimes. A scheduled child
+        reports its accrued time plus its current active interval, excluding
+        time waiting for other methods/trials. Standalone experiments retain
+        their existing wall-clock accounting since construction/checkpoint
+        restoration. This reporting property does not change stopping clocks.
+        Initialization and coordinator/checkpoint overhead are included; this
+        is not a measurement of GP fitting time alone.
+        """
+
+        if hasattr(self, "_trial_count"):
+            return sum(child.elapsed_seconds for child in self.trial_experiments)
+        if self.is_multi_algorithm:
+            return sum(child.elapsed_seconds for child in self.experiments.values())
+        if self._elapsed_reporting_managed:
+            assert self._reported_elapsed_seconds is not None
+            return self._reported_elapsed_seconds + (
+                0.0 if self._elapsed_report_started_at is None
+                else time.monotonic() - self._elapsed_report_started_at
+            )
+        return time.monotonic() - self._started_at
+
+    @property
     def completed_rounds_by_algorithm(self) -> Mapping[str, int]:
         """Return round counts, or each algorithm's common prefix across trials."""
 
@@ -869,6 +968,95 @@ class Experiment:
             return MappingProxyType({type(self.algorithm).__name__: self.output_directory})
         return MappingProxyType(dict(self._checkpoint_directories))
 
+    def _resolve_regret_metrics(
+        self, regret: PerAlgorithmRegret,
+    ) -> dict[str, RSRegret]:
+        """Resolve one explicit post-hoc regret definition per algorithm.
+
+        A bare string such as ``"RS"`` is intentionally unsupported: a
+        benchmark-independent experiment cannot infer the true aspiration,
+        perturbation budget, or optimal fragility without leaking objective
+        information into the learner.
+        """
+
+        labels = tuple(self.algorithms)
+        if regret is None:
+            return {}
+        if isinstance(regret, (RSRegret, RoBOSSourceRegret)):
+            return dict.fromkeys(labels, regret)
+        if not isinstance(regret, Mapping):
+            raise ExperimentConfigurationError(
+                "regret must be an RSRegret, an exact label-to-RSRegret mapping, or None."
+            )
+        missing = [label for label in labels if label not in regret]
+        extra = [label for label in regret if label not in labels]
+        if missing or extra:
+            raise ExperimentConfigurationError(
+                "A regret mapping must contain exactly the experiment labels; "
+                f"missing={missing}, extra={extra}."
+            )
+        resolved = dict(regret)
+        invalid = [label for label, metric in resolved.items() if not isinstance(metric, (RSRegret, RoBOSSourceRegret))]
+        if invalid:
+            raise ExperimentConfigurationError(
+                f"Every regret mapping value must be an RSRegret; invalid labels: {invalid}."
+            )
+        return resolved
+
+    def _attach_regret(
+        self, result: AlgorithmResult, *, label: str, metric: RSRegret,
+    ) -> AlgorithmResult:
+        """Score committed online records without changing the ask/tell path."""
+
+        if isinstance(metric, RoBOSSourceRegret):
+            from ._robos_protocol import attach_regret
+            return attach_regret(self, result, label=label, metric=metric)
+        records = self.environment.history.records
+        latent: list[torch.Tensor] = []
+        sources: list[str] = []
+        for index, record in enumerate(records, start=1):
+            if "latent_observation" in record.audit:
+                value = record.audit["latent_observation"]
+                source = "latent_observation"
+            elif "stored_observation" in record.audit:
+                value = record.audit["stored_observation"]
+                source = "stored_observation"
+            else:
+                raise ExperimentProtocolError(
+                    "RS regret requires the true objective value for every committed online "
+                    f"record; record {index} exposes neither latent_observation nor "
+                    "stored_observation in experiment-only audit data."
+                )
+            scalar = torch.as_tensor(value, dtype=torch.float64, device="cpu").squeeze()
+            if scalar.ndim != 0 or not bool(torch.isfinite(scalar)):
+                raise ExperimentProtocolError(
+                    f"RS regret audit value at record {index} is not one finite scalar."
+                )
+            latent.append(scalar)
+            sources.append(source)
+        if latent:
+            rewards = torch.stack(latent)
+            instantaneous = metric.instantaneous(rewards)
+            curve = metric.evaluate(rewards)
+            assert isinstance(instantaneous, torch.Tensor)
+            assert isinstance(curve, torch.Tensor)
+        else:
+            instantaneous = torch.empty(0, dtype=torch.float64)
+            curve = torch.empty(0, dtype=torch.float64)
+        report = {
+            "name": "RS",
+            "definition": "max(tau - (kappa * epsilon_t)^p - f(evaluated_action_t), 0)",
+            "configuration": asdict(metric),
+            "outcome": "true objective at the evaluated action",
+            "audit_sources": sorted(set(sources)),
+            "initial_history_included": False,
+            "instantaneous": instantaneous.tolist(),
+            "values": curve.tolist(),
+        }
+        self.regret_curves[label] = curve.detach().clone()
+        self._regret_reports[label] = copy.deepcopy(report)
+        return replace(result, metadata={**dict(result.metadata), "regret": report})
+
     def _result_document(self) -> dict[str, Any]:
         """Build a portable audit document without serializing live models."""
 
@@ -882,6 +1070,18 @@ class Experiment:
             if child is not None:
                 try:
                     result = algorithm.result()
+                    child_reports = getattr(child, "_regret_reports", {})
+                    report = child_reports.get(label)
+                    if report is None and len(child_reports) == 1:
+                        report = next(iter(child_reports.values()))
+                    if report is not None:
+                        result = replace(
+                            result,
+                            metadata={
+                                **dict(result.metadata),
+                                "regret": copy.deepcopy(report),
+                            },
+                        )
                 except Exception:
                     # A failed learner can still have useful durable environment
                     # history. Do not let a broken result mask its original error.
@@ -917,9 +1117,12 @@ class Experiment:
                     else len(child.environment.history.initial_data.actions)
                 ),
                 "completed_rounds": 0 if child is None else child.completed_rounds,
+                "elapsed_seconds": None if child is None else child.elapsed_seconds,
                 "environment_evaluations": (
                     0 if child is None else len(child.environment.history.records)
                 ),
+                **({"query_counts": child.query_counts}
+                   if child is not None and child.evaluation_protocol in {"advers_2025", "robos_2023"} else {}),
                 "stopping_reason": (
                     None
                     if child is None
@@ -942,9 +1145,11 @@ class Experiment:
             "package": "basat",
             "package_version": self.PACKAGE_VERSION,
             "mode": "multi_algorithm" if self.is_multi_algorithm else "single_algorithm",
+            "elapsed_seconds": self.elapsed_seconds,
             "limits": self._jsonable(self._last_requested_limits),
             "persistence": {
                 "checkpoint_policy": self.checkpoint_policy,
+                "evaluation_protocol": self.evaluation_protocol,
                 "save_every": self.save_every,
                 "periodic_unsaved_round_bound": (
                     self.save_every if self.checkpoint_policy == "periodic" else 0
@@ -1093,6 +1298,31 @@ class Experiment:
         self.algorithm.initialize_from_environment(data)
         self.algorithm_consumed_environment_records = len(self.environment.history.records)
 
+    @property
+    def query_counts(self) -> dict[str, int]:
+        """Count generated initialization and online objective calls separately."""
+        if self.is_multi_algorithm:
+            raise ExperimentConfigurationError("Inspect query_counts on each child experiment.")
+        if self.evaluation_protocol == "advers_2025":
+            from ._advers_protocol import query_counts
+            return query_counts(self)
+        online = len(self.environment.history.records)
+        if self.evaluation_protocol == "robos_2023":
+            initial = self.environment.history.initial_data
+            initial_count = 0 if initial is None else len(initial.observations)
+            return {"initialization_queries": 0, "shared_initial_observations": initial_count,
+                    "online_queries": online, "total_objective_queries": online,
+                    "total_training_observations": initial_count + online}
+        return {"initialization_queries": 0, "online_queries": online,
+                "total_objective_queries": online}
+
+    def _budget_evaluations(self) -> int:
+        if self.evaluation_protocol == "advers_2025":
+            return self.query_counts["total_objective_queries"]
+        if self.evaluation_protocol == "robos_2023":
+            return self.query_counts["total_training_observations"]
+        return self.algorithm.evaluations
+
     @staticmethod
     def _validate_round_info(round_info: Any, required: frozenset[str]) -> dict[str, Any]:
         """Return a copied round-information mapping after required-key checks."""
@@ -1166,8 +1396,18 @@ class Experiment:
                 "completed_rounds": self.completed_rounds,
                 "save_every": self.save_every,
                 "checkpoint_policy": self.checkpoint_policy,
+                "evaluation_protocol": self.evaluation_protocol,
+                "evaluation_protocol_records": self._evaluation_protocol_records,
+                "evaluation_readback_records": self._evaluation_readback_records,
+                **({"advers_bootstrap": self._advers_bootstrap}
+                   if self.evaluation_protocol == "advers_2025" else {}),
+                **({"robos_plan_digest": self._robos_plan_digest}
+                   if self.evaluation_protocol == "robos_2023" else {}),
                 "phase": phase,
                 "elapsed_seconds": time.monotonic() - self._started_at,
+                "reported_elapsed_seconds": (
+                    self.elapsed_seconds if self._elapsed_reporting_managed else None
+                ),
                 "stopping_decision": self._jsonable(self.stopping_decision),
             },
         }
@@ -1212,6 +1452,33 @@ class Experiment:
             os.replace(temporary, target)
             Experiment._fsync_directory(target.parent)
             return digest
+        finally:
+            if temporary_name is not None:
+                temporary = Path(temporary_name)
+                if temporary.exists():
+                    temporary.unlink()
+
+    @staticmethod
+    def _atomic_checkpoint_copy(source: Path, target: Path) -> None:
+        """Copy already serialized checkpoint bytes, retaining independent files.
+
+        The authoritative slot remains unchanged. Convenience and archive
+        copies use the same flush/replace/directory-sync durability sequence
+        without repickling every tensor. They deliberately are not hardlinks:
+        editing a convenience file cannot corrupt the recovery authority.
+        """
+        temporary_name: str | None = None
+        try:
+            with source.open("rb") as incoming, tempfile.NamedTemporaryFile(
+                mode="w+b", prefix=f".{target.name}.", suffix=".tmp",
+                dir=target.parent, delete=False,
+            ) as stream:
+                temporary_name = stream.name
+                shutil.copyfileobj(incoming, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, target)
+            Experiment._fsync_directory(target.parent)
         finally:
             if temporary_name is not None:
                 temporary = Path(temporary_name)
@@ -1295,7 +1562,7 @@ class Experiment:
         # crash between these independent replacements always leaves one valid
         # manifest-generation pair.
         latest = self.output_directory / "checkpoint-latest.pt"
-        self._atomic_torch_save(payload, latest)
+        self._atomic_checkpoint_copy(authoritative, latest)
         manifest = {
             "schema_version": self.CHECKPOINT_SCHEMA_VERSION,
             "checkpoint": authoritative.name,
@@ -1311,7 +1578,7 @@ class Experiment:
         self._atomic_json_save(manifest, manifest_path)
         if archive:
             archive_path = self.output_directory / f"checkpoint-{self.completed_rounds:08d}.pt"
-            self._atomic_torch_save(payload, archive_path)
+            self._atomic_checkpoint_copy(authoritative, archive_path)
         self._last_checkpoint_phase = phase
         return latest
 
@@ -1395,6 +1662,15 @@ class Experiment:
         state = payload["experiment_state"]
         if not isinstance(state, Mapping):
             raise ExperimentCheckpointError("Checkpoint experiment_state must be a mapping.")
+        if state.get("evaluation_protocol", "standard") != self.evaluation_protocol:
+            raise ExperimentCheckpointError("Checkpoint evaluation protocol does not match configuration.")
+        draw_cursor = state.get("evaluation_protocol_records", 0)
+        if (isinstance(draw_cursor, bool) or not isinstance(draw_cursor, int) or draw_cursor < 0):
+            raise ExperimentCheckpointError("Invalid source evaluation-draw cursor.")
+        readback_cursor = state.get("evaluation_readback_records", -1)
+        if (isinstance(readback_cursor, bool) or not isinstance(readback_cursor, int)
+                or readback_cursor < -1):
+            raise ExperimentCheckpointError("Invalid source cached-readback cursor.")
         environment_state = payload["environment_state"]
         if not isinstance(environment_state, Mapping):
             raise ExperimentCheckpointError("Checkpoint environment_state must be a mapping.")
@@ -1427,6 +1703,15 @@ class Experiment:
             raise ExperimentCheckpointError(
                 "Checkpoint elapsed_seconds must be finite and non-negative."
             )
+        reported_elapsed = state.get("reported_elapsed_seconds")
+        if reported_elapsed is not None and (
+            isinstance(reported_elapsed, bool)
+            or not isinstance(reported_elapsed, (int, float))
+            or not math.isfinite(float(reported_elapsed)) or reported_elapsed < 0
+        ):
+            raise ExperimentCheckpointError(
+                "Checkpoint reported_elapsed_seconds must be finite and non-negative or None."
+            )
         phase = state.get("phase")
         if phase is not None and (not isinstance(phase, str) or not phase.strip()):
             raise ExperimentCheckpointError("Checkpoint phase must be a non-empty string.")
@@ -1457,14 +1742,34 @@ class Experiment:
             )
 
         self._trial_rng_state = payload.get("trial_rng_state")
+        if self.evaluation_protocol == "robos_2023":
+            self._robos_plan_digest = state.get("robos_plan_digest")
+            if not isinstance(self._robos_plan_digest, str):
+                raise ExperimentCheckpointError("Missing RoBOS source-plan identity.")
+        if self.evaluation_protocol == "advers_2025":
+            from ._advers_protocol import restore
+            restore(self, state.get("advers_bootstrap"), environment_state,
+                    payload["algorithm_state"])
         self.environment.load_state_dict(environment_state, strict=True)
         self.algorithm.load_state_dict(payload["algorithm_state"], strict=True)
         if self.stopping_rule is not None:
             self.stopping_rule.load_state_dict(checkpoint_stopping_state, strict=True)
 
         self.algorithm_consumed_environment_records = cursor
+        self._evaluation_protocol_records = draw_cursor
+        self._evaluation_readback_records = readback_cursor
+        if readback_cursor > len(self.environment.history.records):
+            raise ExperimentCheckpointError("Source cached-readback cursor is outside history.")
+        if (self.evaluation_protocol == "ax_0_1_17" and
+                not cursor <= draw_cursor <= len(self.environment.history.records)):
+            raise ExperimentCheckpointError("Source evaluation-draw cursor disagrees with observations.")
         self.completed_rounds = completed_rounds
         self._started_at = time.monotonic() - float(elapsed_seconds)
+        self._reported_elapsed_seconds = (
+            None if reported_elapsed is None else float(reported_elapsed)
+        )
+        self._elapsed_reporting_managed = reported_elapsed is not None
+        self._elapsed_report_started_at = None
         self._last_checkpoint_phase = phase
         self.stopping_decision = restored_decision
 
@@ -1546,12 +1851,44 @@ class Experiment:
                 # after validating its persisted environment representation.
                 # Keep Algorithm.tell's exact pending-action check unchanged.
                 action = pending.actions.detach().clone()
+            self._apply_evaluation_protocol(end)
             self.algorithm.tell(action=action, feedback=feedback, round_info=round_info)
             self._check_stopping(records[cursor:end], feedback)
             cursor = end
             self.algorithm_consumed_environment_records = cursor
         if self.output_directory is not None and self._last_checkpoint_phase == "pre_tell":
             self.save_checkpoint(phase="post_replay", archive=False)
+
+    def _apply_source_readback(self) -> None:
+        """Reproduce discarded zero-noise cached-data draws, not objective calls."""
+        if self.evaluation_protocol != "ax_0_1_17":
+            return
+        hook = getattr(self.algorithm, "_consume_source_readback_draws", None)
+        if not callable(hook):
+            return  # External-callback source policies do not fetch the Ax model's data.
+        count = len(self.environment.history.records)
+        if self._evaluation_readback_records != count:
+            hook(count)
+            self._evaluation_readback_records = count
+            self.save_checkpoint(phase="pre_ask", archive=False)
+
+    def _apply_evaluation_protocol(self, end: int) -> None:
+        """Apply wrapper side effects once, before any observation is learned."""
+        if self.evaluation_protocol != "ax_0_1_17":
+            return
+        if not self._evaluation_protocol_records <= end <= len(self.environment.history.records):
+            raise ExperimentCheckpointError("Source evaluation-draw cursor is outside history.")
+        count = end - self._evaluation_protocol_records
+        if count:
+            # Export cursor and source RNG together before tell-time fitting.
+            # A pre-draw durable record already exists; either crash boundary
+            # therefore replays exactly the missing part, never the objective.
+            hook = getattr(self.algorithm, "_consume_source_evaluation_draws", None)
+            if not callable(hook):
+                raise ExperimentProtocolError("The source evaluation hook is no longer available.")
+            hook(count)
+            self._evaluation_protocol_records = end
+            self.save_checkpoint(phase="pre_tell", archive=False)
 
     def _stopping_context(self, records: Sequence[Any], feedback: Mapping[str, Any]) -> Any:
         """Build a learner-visible stopping snapshot for the latest exchange."""
@@ -1560,7 +1897,7 @@ class Experiment:
 
         return StoppingContext(
             completed_rounds=self.completed_rounds,
-            evaluations=int(getattr(self.algorithm, "evaluations", 0)),
+            evaluations=self._budget_evaluations(),
             elapsed_seconds=time.monotonic() - self._started_at,
             latest_records=tuple(records),
             latest_feedback=dict(feedback),
@@ -1647,9 +1984,13 @@ class Experiment:
             self.save_checkpoint(phase="stopped", archive=False)
             return self.algorithm.result()
         evaluation_ceiling = self._rule_evaluation_ceiling(self.stopping_rule)
+        if self.evaluation_protocol == "advers_2025":
+            from ._advers_protocol import initialize
+            if not initialize(self, ceiling=evaluation_ceiling):
+                return self.algorithm.result()
         if (
             evaluation_ceiling is not None
-            and self.algorithm.evaluations + self.algorithm.request_size > evaluation_ceiling
+            and self._budget_evaluations() + self.algorithm.request_size > evaluation_ceiling
         ):
             self.stopping_decision = StoppingDecision(
                 stop=True,
@@ -1688,12 +2029,49 @@ class Experiment:
             )
             self.save_checkpoint(phase="stopped", archive=False)
             return self.algorithm.result()
-        action = self.algorithm.ask(round_info=round_info)
+        self._apply_source_readback()
+        if self.evaluation_protocol == "robos_2023":
+            from ._robos_protocol import prepare_proposal
+            prepare_proposal(self)
+        if self.evaluation_protocol in {"advers_2025", "robos_2023"} and self.algorithm.last_ask is not None:
+            action = self.algorithm.last_ask.actions[0].detach().clone()
+        else:
+            action = self.algorithm.ask(round_info=round_info)
+        if self.evaluation_protocol in {"advers_2025", "robos_2023"}:
+            self.save_checkpoint(phase="pending_proposal", archive=False)
         record_start = len(self.environment.history.records)
+        step_options: dict[str, Any] = {}
+        source_stream = None
+        from .environments.Adversarial import AdversarialEnvironment, LCBAttack
+        if isinstance(self.environment, AdversarialEnvironment) and isinstance(
+            self.environment.attack, LCBAttack
+        ):
+            step_options["confidence_bounds"] = self.algorithm.confidence_bounds
+        if self.evaluation_protocol == "advers_2025":
+            from .workflow import RandomStream
+            from ._advers_protocol import step_options as advers_step_options
+            source_stream = RandomStream(self.algorithm.seed, engine="mt19937")
+            source_stream.set_state(self.algorithm.get_source_random_state())
+            step_options["source_random_stream"] = source_stream
+            step_options.update(advers_step_options(self))
+        if getattr(self.environment, "evaluation_dtype", "storage") == "proposal":
+            # Precision is captured at ask-time, not read from mutable model
+            # diagnostics after prediction/result inspection or checkpointing.
+            last_ask = self.algorithm.last_ask
+            step_options["proposal_metadata"] = (
+                {} if last_ask is None else dict(last_ask.algorithm_metadata)
+            )
+        if self.evaluation_protocol == "robos_2023":
+            from ._robos_protocol import evaluate_proposal
+            raw_feedback = evaluate_proposal(self, action)
+        else:
+            raw_feedback = self.environment.step(action, **step_options)
         feedback = self._validate_feedback(
-            self.algorithm.prepare_feedback(self.environment.step(action), action=action),
+            self.algorithm.prepare_feedback(raw_feedback, action=action),
             self.algorithm.required_feedback,
         )
+        if source_stream is not None:
+            self.algorithm.set_source_random_state(source_stream.get_state())
         new_records = self.environment.history.records[record_start:]
         if not new_records:
             raise ExperimentProtocolError("step() returned feedback without appending history.")
@@ -1704,6 +2082,7 @@ class Experiment:
         self.completed_rounds = int(self.environment.round)
         if self.checkpoint_policy == "transactional":
             self.save_checkpoint(phase="pre_tell", archive=False)
+        self._apply_evaluation_protocol(len(self.environment.history.records))
         self.algorithm.tell(action=action, feedback=feedback, round_info=round_info)
         self.algorithm_consumed_environment_records = len(self.environment.history.records)
         self._check_stopping(new_records, feedback)
@@ -1720,14 +2099,21 @@ class Experiment:
         self,
         *,
         trials: int = 1,
+        trial_seeds: Sequence[int] | Mapping[str, Sequence[int]] | None = None,
+        max_trials: int | None = None,
+        max_source_runs: int | None = None,
+        grouped_trials: GroupedTrialConfig | None = None,
+        max_groups: int | None = None,
         max_rounds: int | Mapping[str, int | None] | None = None,
         max_evaluations: int | Mapping[str, int | None] | None = None,
         budget_policy: Literal["strict", "finish_iteration"] = "strict",
+        regret: PerAlgorithmRegret = None,
         plot: bool | None = None,
         show: bool = True,
         title: str = "Basat algorithm comparison",
         progress: bool = False,
-    ) -> AlgorithmResult | ExperimentComparisonResult | ExperimentTrialsResult:
+        fail_fast: bool = False,
+    ) -> AlgorithmResult | ExperimentComparisonResult | ExperimentTrialsResult | GroupedExperimentResult:
         """Run one algorithm or every configured algorithm independently.
 
         trials is a positive integer (default 1). With trials > 1, each algorithm
@@ -1743,6 +2129,33 @@ class Experiment:
         trial, not additional evaluations. trials=1 keeps the existing return
         type; trials>1 returns ExperimentTrialsResult. Its results[label] contains
         one outcome per trial (None for a failed algorithm trial).
+
+        trial_seeds optionally supplies the exact seed per trial, either one
+        sequence or an exact method-label mapping. It replaces the default
+        base-seed offsets for algorithms and environments, and is immutable on
+        resume. An explicit length-one schedule returns ExperimentTrialsResult.
+
+        max_trials is an optional cumulative execution ceiling for ordinary
+        trials > 1, between 1 and the planned trials count. For example,
+        trials=20, max_trials=1 executes/resumes only the first trial while
+        preserving the 20-trial manifest. Omit max_trials later to resume the
+        full unchanged plan in the same directories. Already loaded results
+        remain available when the execution ceiling is reduced.
+
+        AdveRSSerialSourceProtocol explicitly opts into the released serial
+        random-attack prefix followed by LCB method blocks, sharing one owned
+        MT19937 stream. max_source_runs is its cumulative prefix-plus-LCB run
+        ceiling, from zero through 12*trials; omit it to finish the same plan.
+        It cannot be combined with max_trials, explicit trial_seeds or grouped
+        trials. Ordinary trial results contain only LCB observations; prefix
+        evaluations and their checkpoints are reported separately.
+
+        grouped_trials explicitly selects sequential shared-design groups for
+        supported released good-action methods. Its max_evaluations includes
+        the three initial observations. max_groups is an optional cumulative
+        group ceiling (use 1 for a pilot, then omit it to finish the same plan).
+        Grouped runs return GroupedExperimentResult; use success_statistics and
+        plot for success/censoring summaries. Ordinary trials remain independent.
 
         max_evaluations is a total objective-evaluation ceiling per algorithm,
         including observations restored from checkpoints. max_rounds is a total
@@ -1761,11 +2174,30 @@ class Experiment:
         interrupted source iteration finishes it; a completed boundary at or
         beyond the target performs no more objective evaluations.
 
+        regret optionally selects post-hoc robust-satisficing regret. Supply a
+        fully specified :class:`basat.RSRegret`, or in multi-algorithm mode an
+        exact label-to-metric mapping. Its cumulative setting defaults to true.
+        Basat evaluates it from the experiment-only latent/stored objective at
+        each actually evaluated action, never from noisy learner feedback.
+        Warm-start rows are excluded because only committed online records are
+        scored. The resulting curve is available in ``regret_curves`` and in
+        result metadata. ``None`` preserves the existing behavior.
+
         plot=True creates a single figure containing all configured algorithms,
         including a labeled legend entry for failed algorithms. show=False
         creates it without displaying it. progress=True prints each algorithm's
         start and completion. Warnings, failures and machine-readable results
         are retained on the experiment and saved under output_directory.
+        fail_fast=True stops remaining methods/trials and raises the first
+        failure after saving diagnostics. False preserves independent-method
+        continuation. Grouped trials always stop on failure.
+
+        With ``evaluation_protocol=AdveRSSourceProtocol(...)``, ``trials`` is
+        the planned repetitions per method. Execution is method/chunk/repetition
+        ordered; ``max_trials`` is a cumulative per-method pilot ceiling and
+        never changes the planned chunk tags or seeds. ``fail_fast=True`` is
+        required. Completed children restore read-only, while a pending child
+        resumes its ordinary transactional checkpoint before stream handoff.
         """
 
         if not isinstance(budget_policy, str) or budget_policy not in {"strict", "finish_iteration"}:
@@ -1774,7 +2206,70 @@ class Experiment:
             )
         if isinstance(trials, bool) or not isinstance(trials, int) or trials < 1:
             raise ExperimentConfigurationError("trials must be a positive integer.")
-        if trials == 1 and (
+        if max_trials is not None and (
+            trials <= 1 or grouped_trials is not None or isinstance(max_trials, bool)
+            or not isinstance(max_trials, int) or not 1 <= max_trials <= trials
+        ):
+            raise ExperimentConfigurationError(
+                "max_trials requires ordinary trials>1 and must be an integer from 1 to trials."
+            )
+        if not isinstance(fail_fast, bool):
+            raise ExperimentConfigurationError("fail_fast must be bool.")
+        regret_metrics = self._resolve_regret_metrics(regret)
+        if self._advers_serial_source_protocol is not None:
+            from ._advers_serial_protocol import run_source_trials
+            if grouped_trials is not None or trial_seeds is not None or max_groups is not None or max_trials is not None or budget_policy != "strict":
+                raise ExperimentConfigurationError("AdveRS serial source execution owns its stream and flat source-run ceiling.")
+            return run_source_trials(self, trials=trials, max_source_runs=max_source_runs,
+                max_rounds=max_rounds, max_evaluations=max_evaluations, metrics=regret_metrics,
+                plot=plot, show=show, title=title, progress=progress, fail_fast=fail_fast)
+        if max_source_runs is not None:
+            raise ExperimentConfigurationError("max_source_runs requires AdveRSSerialSourceProtocol.")
+        if self._advers_source_protocol is not None:
+            from ._advers_source_protocol import run_source_trials
+            if grouped_trials is not None or trial_seeds is not None or max_groups is not None or budget_policy != "strict":
+                raise ExperimentConfigurationError("AdveRS source chunks own their shared task streams and strict budget.")
+            return run_source_trials(self, trials=trials, max_trials=max_trials,
+                max_rounds=max_rounds, max_evaluations=max_evaluations, metrics=regret_metrics,
+                plot=plot, show=show, title=title, progress=progress, fail_fast=fail_fast)
+        if self._robos_protocol is not None:
+            from ._robos_protocol import run_source_trials
+            if grouped_trials is not None or trial_seeds is not None or max_groups is not None or budget_policy != "strict":
+                raise ExperimentConfigurationError("RoBOS source trials own their continuing random stream and strict budget.")
+            return run_source_trials(self, trials=trials, max_trials=max_trials,
+                max_rounds=max_rounds, max_evaluations=max_evaluations, metrics=regret_metrics,
+                plot=plot, show=show, title=title, progress=progress)
+        if grouped_trials is not None:
+            if trial_seeds is not None:
+                raise ExperimentConfigurationError("trial_seeds is for ordinary trials only.")
+            if regret_metrics:
+                raise ExperimentConfigurationError(
+                    "Grouped shared-stream experiments do not yet expose latent audit rows "
+                    "through the ordinary regret result API. Score their explicit run records "
+                    "with RSRegret.statistics instead."
+                )
+            if trials != 1 or max_rounds is not None or budget_policy != "strict":
+                raise ExperimentConfigurationError(
+                    "grouped_trials requires trials=1, max_rounds=None, and strict evaluation budgets."
+                )
+            if isinstance(max_evaluations, bool) or not isinstance(max_evaluations, int):
+                raise ExperimentConfigurationError(
+                    "Grouped max_evaluations must be an integer including initialization."
+                )
+            return run_grouped_trials(
+                self, grouped_trials, max_evaluations=max_evaluations,
+                max_groups=max_groups, progress=progress,
+            )
+        if max_groups is not None:
+            raise ExperimentConfigurationError("max_groups requires grouped_trials.")
+        if hasattr(self, "grouped_result") or (
+            self.output_directory is not None
+            and (self.output_directory / "grouped_trials.json").exists()
+        ):
+            raise ExperimentConfigurationError(
+                "This is a grouped experiment; supply its saved grouped_trials configuration."
+            )
+        if trials == 1 and trial_seeds is None and (
             hasattr(self, "_trial_count")
             or (
                 self.output_directory is not None
@@ -1788,6 +2283,10 @@ class Experiment:
             "max_rounds": max_rounds, "max_evaluations": max_evaluations,
             "budget_policy": budget_policy,
         }
+        if regret_metrics:
+            self._last_requested_limits["regret"] = {
+                label: asdict(metric) for label, metric in regret_metrics.items()
+            }
         self._run_stop_reason = None
         parameters: dict[str, Any] = dict(
             max_rounds=max_rounds,
@@ -1797,9 +2296,28 @@ class Experiment:
             show=show,
             title=title,
             progress=progress,
+            fail_fast=fail_fast,
+            regret=(
+                None
+                if not regret_metrics
+                else next(iter(regret_metrics.values()))
+                if not self.is_multi_algorithm
+                else regret_metrics
+            ),
         )
-        if trials > 1:
-            return run_trials(self, trials, parameters)
+        if fail_fast and self.is_multi_algorithm and self.initialization_failures:
+            label, failure = next(iter(self.initialization_failures.items()))
+            error = ExperimentProtocolError(
+                f"{label!r} failed initialization: {failure.exception_type}: {failure.message}"
+            )
+            self._report_child_failure(
+                label=label, phase="initialization", error=error, continuing=False)
+            if self.output_directory is not None:
+                self.save()
+            raise error
+        if trials > 1 or trial_seeds is not None:
+            return run_trials(self, trials, parameters, max_trials=max_trials,
+                              trial_seeds=trial_seeds)
         try:
             if self.is_multi_algorithm:
                 return self._run_impl(**parameters)
@@ -1828,10 +2346,12 @@ class Experiment:
         max_rounds: int | Mapping[str, int | None] | None = None,
         max_evaluations: int | Mapping[str, int | None] | None = None,
         budget_policy: Literal["strict", "finish_iteration"] = "strict",
+        regret: PerAlgorithmRegret = None,
         plot: bool | None = None,
         show: bool = True,
         title: str = "Basat algorithm comparison",
         progress: bool = False,
+        fail_fast: bool = False,
     ) -> AlgorithmResult | ExperimentComparisonResult:
         """Run until a stopping rule fires or ``max_rounds`` are completed.
 
@@ -1884,6 +2404,7 @@ class Experiment:
             failures = dict(self.initialization_failures)
             for label, child in self.experiments.items():
                 child._started_at = time.monotonic() - child._comparison_elapsed_seconds
+                child._elapsed_report_started_at = time.monotonic()
                 if progress:
                     print(f"[{label}] starting", flush=True)
                 try:
@@ -1895,6 +2416,7 @@ class Experiment:
                             max_rounds=ceilings[label],
                             max_evaluations=evaluation_ceilings[label],
                             budget_policy=budget_policy,
+                            regret=(regret.get(label) if isinstance(regret, Mapping) else regret),
                             plot=False,
                             show=False,
                         )
@@ -1903,16 +2425,29 @@ class Experiment:
                             "A child experiment unexpectedly returned a comparison result."
                         )
                     typed_results[label] = result
+                    if child.regret_curves:
+                        self.regret_curves[label] = next(
+                            iter(child.regret_curves.values())
+                        ).clone()
+                    if child._regret_reports:
+                        self._regret_reports[label] = copy.deepcopy(
+                            next(iter(child._regret_reports.values()))
+                        )
                 except Exception as error:
-                    self._report_child_failure(label=label, phase="run", error=error)
+                    self._report_child_failure(
+                        label=label, phase="run", error=error, continuing=not fail_fast)
                     failures[label] = self._failure_record(
                         label=label,
                         phase="run",
                         error=error,
                         completed_rounds=child.completed_rounds,
                     )
+                    if fail_fast:
+                        raise
                 finally:
+                    child._reported_elapsed_seconds = child.elapsed_seconds
                     child._comparison_elapsed_seconds = time.monotonic() - child._started_at
+                    child._elapsed_report_started_at = None
                     self.failures = dict(failures)
                     if progress:
                         outcome = (
@@ -1982,6 +2517,14 @@ class Experiment:
         ):
             raise ExperimentConfigurationError("max_rounds must be a non-negative integer.")
         target = max_rounds
+        if self.evaluation_protocol == "advers_2025" and (target is None or target > 0):
+            from ._advers_protocol import initialize
+            ceilings = [v for v in (max_evaluations,
+                        self._rule_evaluation_ceiling(self.stopping_rule)) if v is not None]
+            if not initialize(self, ceiling=min(ceilings) if ceilings else None):
+                self._run_stop_reason = "maximum_evaluations"
+                result = self.algorithm.result()
+                return replace(result, metadata={**result.metadata, "query_counts": self.query_counts})
         if self.algorithm.verbose_setting:
             self._report_settings()
         if self.algorithm.verbose:
@@ -1997,7 +2540,7 @@ class Experiment:
         while target is None or self.completed_rounds < target:
             if self.stopping_decision is not None and self.stopping_decision.stop:
                 break
-            evaluations = self.algorithm.evaluations
+            evaluations = self._budget_evaluations()
             reached_budget = max_evaluations is not None and (
                 (
                     budget_policy == "strict"
@@ -2013,7 +2556,7 @@ class Experiment:
                 assert max_evaluations is not None
                 self._run_stop_reason = (
                     "maximum_evaluations"
-                    if self.algorithm.evaluations >= max_evaluations
+                    if evaluations >= max_evaluations
                     else "insufficient_evaluations_for_batch"
                 )
                 self.save_checkpoint(phase="stopped", archive=False)
@@ -2025,6 +2568,16 @@ class Experiment:
             # Flush the non-cadence tail on every successful run-call return.
             self.save_checkpoint(phase="run_end", archive=False)
         result = self.algorithm.result()
+        if self.evaluation_protocol == "advers_2025":
+            result = replace(result, metadata={**result.metadata, "query_counts": self.query_counts})
+        if regret is not None:
+            if not isinstance(regret, RSRegret):
+                raise ExperimentConfigurationError(
+                    "A single-algorithm run requires one RSRegret definition."
+                )
+            result = self._attach_regret(
+                result, label=type(self.algorithm).__name__, metric=regret
+            )
         if self.algorithm.verbose:
             self._report_final(result)
         should_plot = self.algorithm.plot if plot is None else plot

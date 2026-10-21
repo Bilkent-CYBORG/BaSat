@@ -105,7 +105,10 @@ def make_algorithm(
     if isinstance(acquisition, str) and (
         name in {"HeSBO", "ALEBO", "AG_VS"} or (name == "TuRBO" and acquisition != "TS")
     ):
-        values["acquisition"] = AcquisitionConfig(name=acquisition, seed=values["seed"])
+        acquisition_options = {"xi": 1e-4} if name == "AG_VS" else {}
+        values["acquisition"] = AcquisitionConfig(
+            name=acquisition, seed=values["seed"], **acquisition_options
+        )
     return getattr(methods, name)(
         bounds=bounds,
         config=config_class(**values),
