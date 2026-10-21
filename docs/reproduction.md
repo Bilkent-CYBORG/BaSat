@@ -1,6 +1,13 @@
 # Using the guide
 
-Open [basat_user_guide.ipynb](basat_user_guide.ipynb) after installing the project:
+Extract the full project and open [basat_user_guide.ipynb](basat_user_guide.ipynb)
+in Jupyter or VS Code. Run its first setup cell to check the active kernel and
+install Basat with its required dependencies into that environment. It requires
+Python 3.11–3.14 and native arm64 Python on Apple Silicon Macs. The README includes
+[kernel setup instructions](../README.md#choose-a-compatible-kernel). The first
+installation needs internet access. Restart the kernel if the setup cell asks.
+
+Alternatively, install the project and launch Jupyter from Terminal:
 
 ```bash
 python -m pip install .

@@ -4,7 +4,7 @@ Basat is a Python library for **Bayesian optimization** and helps you find good 
 
 Define what you want to optimize, choose an environment and an algorithm, and run an `Experiment`.
 
-[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms) · [Use your own data](#use-your-own-data) · [Installation](#installation)
+[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms) · [Use your own data](#use-your-own-data) · [Notebook setup](#start-from-the-notebook) · [Installation](#installation)
 
 [What you can do](#what-you-can-do) · [Algorithms](#available-algorithms) · [Environments](#environments) · [Budgets and checkpoints](#budgets-stopping-and-checkpoints)
 
@@ -33,6 +33,33 @@ python -m pip install -e ".[dev]"
 ```
 
 Installing Basat also installs its numerical, inference, optimization, notebook, and plotting dependencies, including NumPy, PyTorch, JAX, and NumPyro. The package requirements select compatible versions automatically. Paper reproductions with specific numerical-version requirements use the environments described in [reproduction setup](docs/reproduction.md).
+
+### Start from the notebook
+
+Extract the complete GitHub ZIP and open `docs/basat_user_guide.ipynb` in Jupyter or VS Code with a Python kernel. Run the first code cell before the examples. It checks the Python version and Mac architecture, finds the extracted project, and installs Basat and its dependencies into the active kernel's Python environment. The first installation needs internet access and may take several minutes. Follow any kernel restart instruction before continuing. Opening or downloading the notebook leaves installation under your control through this cell.
+
+If Jupyter starts outside the extracted project, set `PROJECT_DIRECTORY` in the setup cell to the folder containing `pyproject.toml` and `basat/`. Run the setup cell again whenever you restart the kernel. Once setup succeeds, further calls in the same kernel skip installation.
+
+### Choose a compatible kernel
+
+The setup cell needs a Python 3.11–3.14 kernel. On an Apple Silicon Mac, Python must report `arm64`. Use the Python 3.11 macOS universal2 installer from [python.org](https://www.python.org/downloads/macos/) if you need a compatible interpreter. In Terminal, check the Python installation you intend to use with the following command.
+
+```bash
+python3.11 -c "import platform; print(platform.machine())"
+```
+
+If an Apple Silicon Mac reports `x86_64`, use the native interpreter to create an environment from the extracted project root.
+
+```bash
+arch -arm64 /Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11 -m venv .venv-basat
+source .venv-basat/bin/activate
+python -m pip install ipykernel
+python -m ipykernel install --user --name basat --display-name "Basat Python 3.11"
+```
+
+For other supported Python installations, create the environment with `python3.11 -m venv .venv-basat` and then use the same activation and kernel registration commands. Select **Basat Python 3.11** in your notebook and run its setup cell to install Basat automatically. If you need to install Jupyter itself, run `python -m pip install jupyterlab` followed by `python -m jupyter lab docs/basat_user_guide.ipynb` in the activated environment.
+
+The current dependency stack requires a supported platform with available PyTorch and JAX wheels. Intel macOS lacks official wheels for the required PyTorch releases. Apple Silicon Macs can use native arm64 Python, and Intel Mac users can use a supported Linux environment. The setup cell reports incompatible kernels before attempting installation.
 
 ## Quick start
 
@@ -180,7 +207,7 @@ The default transactional checkpoint policy preserves evaluated feedback before 
 
 ## User guide
 
-After installation, open the notebook from the project root using the following command.
+Open `docs/basat_user_guide.ipynb` in your existing notebook editor and run its first setup cell, or use the following command after installing Basat from the project root.
 
 ```bash
 python -m basat notebook docs/basat_user_guide.ipynb
