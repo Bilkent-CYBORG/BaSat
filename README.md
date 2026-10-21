@@ -8,7 +8,7 @@ Define what you want to optimize, choose an environment and an algorithm, and ru
 
 [What you can do](#what-you-can-do) · [Algorithms](#available-algorithms) · [Environments](#environments) · [Budgets and checkpoints](#budgets-stopping-and-checkpoints)
 
-[User guide](#user-guide) · [Project structure](#project-structure) · [Tests](#tests) · [License](#license)
+[User guide](#user-guide) · [Project structure](#project-structure) · [License](#license)
 
 ## What you can do
 
@@ -26,13 +26,11 @@ Basat requires **Python 3.11–3.14**. Install it from the project root using th
 python -m pip install .
 ```
 
-For an editable installation with testing and development tools, use the following command.
+For an editable installation with development tools, use the following command.
 
 ```bash
 python -m pip install -e ".[dev]"
 ```
-
-The project also includes `uv.lock`, and `uv sync` creates the locked project environment.
 
 Some paper-specific backends need additional dependencies. For example, `python -m pip install ".[numpyro]"` installs the NumPyro backend used by the guide's SAASBO experiment. Dedicated numerical environments are described in [reproduction setup](docs/reproduction.md).
 
@@ -198,23 +196,11 @@ The notebook includes embedded figures that you can view independently of the or
 basat/          Library source and component license notices
 docs/           User-guide notebook and reproduction setup
 data/           Small example datasets and provenance
-tests/          Portable library tests and reference fixtures
 scripts/        Clean-project export utility
 pyproject.toml  Package metadata and dependency settings
-uv.lock         Locked dependencies
 ```
 
 Results, checkpoints, caches, temporary environments, and manuscript files are local research artifacts, and the ignore rules keep these files out of the repository.
-
-## Tests
-
-After installing the development dependencies, run the tests using the following command.
-
-```bash
-python -m pytest
-```
-
-Tests requiring optional reference archives, accelerator hardware, or a dedicated numerical environment skip when those resources are unavailable.
 
 ## License
 

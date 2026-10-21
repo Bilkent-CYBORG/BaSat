@@ -1,15 +1,13 @@
-# Publish only source, the guide, lightweight examples, and portable tests.
+# Publish only source, the guide, and lightweight examples.
 /*
 !/basat/
 !/docs/
 !/data/
-!/tests/
 !/scripts/
 !/.gitignore
 !/LICENSE
 !/README.md
 !/pyproject.toml
-!/uv.lock
 
 /docs/*
 !/docs/basat_user_guide.ipynb
@@ -27,14 +25,9 @@
 /scripts/*
 !/scripts/prepare_release.py
 
-# These developer checks use private campaign artifacts or local generators.
-/tests/test_guide_completed_cache.py
-/tests/test_guide_presentation.py
-/tests/test_mhc_confidence_sensitivity.py
-/tests/test_cgp_sensor_notebook.py
-/tests/test_mhc_notebook.py
-/tests/test_mhc_seed_search.py
-/tests/test_mhc_reference.py
+# Local development files remain outside the published project.
+/tests/
+/uv.lock
 
 # Ignore generated files inside the library as well.
 __pycache__/

@@ -49,8 +49,5 @@ python3.11 -m venv .venv-robos
 These are source-compatible numerical environments, not recovered author
 environments. See the guards in the experiment cells for additional checks.
 
-The included tests cover portable library behavior. Independent controls that
-require an optional reference ZIP, historical datasets, CUDA, or a dedicated
-numerical environment skip when those resources are unavailable. Local campaign
-audits, temporary notebook generators, manuscript sources, and raw results remain
-outside this release.
+Local campaign audits, temporary notebook generators, manuscript sources, and
+raw results remain outside this release.

@@ -14,16 +14,11 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEVELOPER_TESTS = {
-    "test_guide_completed_cache.py", "test_guide_presentation.py",
-    "test_mhc_confidence_sensitivity.py", "test_cgp_sensor_notebook.py",
-    "test_mhc_notebook.py", "test_mhc_seed_search.py", "test_mhc_reference.py",
-}
 
 
 def selected_files(root):
     paths = [root / name for name in (
-        ".gitignore", "LICENSE", "README.md", "pyproject.toml", "uv.lock",
+        ".gitignore", "LICENSE", "README.md", "pyproject.toml",
         "docs/basat_user_guide.ipynb", "docs/reproduction.md",
         "data/README.md", "data/manifest.json", "data/native_manifest.json",
         "scripts/prepare_release.py",
@@ -34,9 +29,6 @@ def selected_files(root):
     for family in ("stochastic", "contextual", "distributional", "adversarial"):
         paths.extend(path for path in (root / "data" / family).iterdir()
                      if path.is_file() and path.name != ".DS_Store")
-    paths.extend(path for path in (root / "tests").glob("test_*.py")
-                 if path.name not in DEVELOPER_TESTS)
-    paths.extend((root / "tests/fixtures").glob("*.json"))
     for path in paths:
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"Missing or symlinked release input: {path.relative_to(root)}")
