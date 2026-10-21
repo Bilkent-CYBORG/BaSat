@@ -32,6 +32,8 @@ dependencies = [
   "scikit-learn>=1.5,<2",
   "threadpoolctl>=3.1,<4",
   "pyro-ppl>=1.9,<2",
+  "jax[cpu]>=0.7.0,<0.11",
+  "numpyro>=0.21,<0.22",
   "cvxpy>=1.6,<2",
   "matplotlib>=3.9,<4",
   "umap-learn>=0.5.7,<0.6",
@@ -55,11 +57,14 @@ advers-source = [
   "scipy==1.12.0",
   "scikit-learn==1.7.2",
   "cvxpy>=1.6,<1.7",
+  "jax[cpu]==0.7.0",
+  "numpyro==0.21.0",
 ]
 optimizers = ["cma>=4,<5"]
 tree = ["scikit-learn>=1.5,<2"]
 mcmc = ["pyro-ppl>=1.9,<2"]
-numpyro = ["jax[cpu]>=0.10.2,<0.11", "numpyro>=0.21,<0.22"]
+# Retained as an alias for installations that previously selected this extra.
+numpyro = []
 robust = ["cvxpy>=1.6,<2"]
 notebook = [
   "ipykernel>=7,<8",
@@ -105,10 +110,6 @@ full = [
 [project.urls]
 Documentation = "https://github.com/Bilkent-CYBORG/bayopy"
 Source = "https://github.com/Bilkent-CYBORG/bayopy"
-
-[tool.uv]
-# The historical AdveRS and modern NumPyro stacks need separate environments.
-conflicts = [[{ extra = "advers-source" }, { extra = "numpyro" }]]
 
 [tool.hatch.build.targets.wheel]
 packages = ["basat"]

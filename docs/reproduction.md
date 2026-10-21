@@ -33,9 +33,11 @@ python3.11 -m venv .venv-advers
 .venv-advers/bin/python -m ipykernel install --user --name basat-advers
 ```
 
-Choose that kernel for the AdveRS reproduction cell. The `advers-source` and
-`numpyro` extras have incompatible numerical requirements and must not be
-installed together. The ordinary environment can use `.[numpyro]` for SAASBO.
+Choose that kernel for the AdveRS reproduction cell. A standard Basat installation
+already includes JAX and NumPyro. The `advers-source` profile selects JAX 0.7.0 and
+NumPyro 0.21.0 alongside its pinned NumPy and SciPy versions. Basat handles the
+corresponding JAX precision API automatically, and each numerical profile keeps
+the same inference model. The ordinary environment can run SAASBO directly.
 
 RoBOS source-mode experiments also require a separate Python 3.11 environment
 with NumPy 2.4.6 and SciPy 1.15.3:

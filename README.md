@@ -32,7 +32,7 @@ For an editable installation with development tools, use the following command.
 python -m pip install -e ".[dev]"
 ```
 
-Some paper-specific backends need additional dependencies. For example, `python -m pip install ".[numpyro]"` installs the NumPyro backend used by the guide's SAASBO experiment. Dedicated numerical environments are described in [reproduction setup](docs/reproduction.md).
+Installing Basat also installs its numerical, inference, optimization, notebook, and plotting dependencies, including NumPy, PyTorch, JAX, and NumPyro. The package requirements select compatible versions automatically. Paper reproductions with specific numerical-version requirements use the environments described in [reproduction setup](docs/reproduction.md).
 
 ## Quick start
 
@@ -196,7 +196,6 @@ The notebook includes embedded figures that you can view independently of the or
 basat/          Library source and component license notices
 docs/           User-guide notebook and reproduction setup
 data/           Small example datasets and provenance
-scripts/        Clean-project export utility
 pyproject.toml  Package metadata and dependency settings
 ```
 

@@ -3,7 +3,7 @@
 SAASBO keeps full environment coordinates and induces sparsity through the
 hierarchical half-Cauchy prior on inverse squared length scales.  This module
 uses BoTorch's fully Bayesian GP representation and Pyro NUTS by default.
-An optional native NumPyro backend implements the released MCTS-VS RBF SAAS
+A native NumPyro backend implements the released MCTS-VS RBF SAAS
 protocol. Neither backend substitutes MLE ARD or a sparsity penalty for NUTS.
 """
 
@@ -72,9 +72,9 @@ class SAASBOConfig:
         Request size and checkpointed sampler/acquisition seed.
     inference_backend:
         ``"pyro"`` preserves the existing implementation. ``"numpyro"`` uses
-        Basat's optional NumPyro implementation of the released MCTS-VS RBF
-        SAAS model and requires ``source_protocol="mcts_vs_2022"``. Install
-        ``basat[numpyro]`` for this backend. Both consume observations only.
+        Basat's NumPyro implementation of the released MCTS-VS RBF SAAS
+        model and requires ``source_protocol="mcts_vs_2022"``. Both backends
+        are installed with Basat and consume observations only.
     """
 
     shrinkage_scale: float = 0.1
@@ -237,8 +237,8 @@ class SAASBO(Algorithm):
         Notes
         -----
         Construction does not import an inference backend. Posterior fitting
-        raises an actionable ``basat[mcmc]`` or ``basat[numpyro]`` error if the
-        requested capability is absent. ``jit_compile`` controls only Pyro;
+        raises an actionable installation error if a required dependency
+        is absent. ``jit_compile`` controls only Pyro;
         NumPyro compiles its numerical operations with JAX.
         """
 
@@ -575,7 +575,8 @@ class SAASBO(Algorithm):
             from pyro.infer import MCMC, NUTS
         except ImportError as error:
             raise SAASBOMCMCError(
-                "SAASBO requires Pyro; install the 'basat[mcmc]' capability extra."
+                "SAASBO requires Pyro. Reinstall Basat from its project directory "
+                "using 'python -m pip install .' so pip installs the required dependencies."
             ) from error
         except Exception as error:
             raise SAASBOMCMCError(f"The Pyro backend could not be initialized: {error}") from error

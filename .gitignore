@@ -3,7 +3,6 @@
 !/basat/
 !/docs/
 !/data/
-!/scripts/
 !/.gitignore
 !/LICENSE
 !/README.md
@@ -22,10 +21,8 @@
 !/data/distributional/
 !/data/adversarial/
 
-/scripts/*
-!/scripts/prepare_release.py
-
 # Local development files remain outside the published project.
+/scripts/
 /tests/
 /uv.lock
 

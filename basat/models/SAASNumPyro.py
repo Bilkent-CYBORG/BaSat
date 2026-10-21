@@ -4,7 +4,8 @@ This is a numerical surrogate, not an experiment runner: it receives only arrays
 of observations. The statistical specification follows Eriksson and Jankowiak
 (2021) and the MCTS-VS ``inner_optimizer/saasgp.py`` / ``saasbo_component.py``
 release (commit 29d32b6977d37f5e257d359373497e375befa96b). No external optimizer
-implementation or objective callback is imported. JAX and NumPyro are optional.
+implementation or objective callback is imported. JAX and NumPyro are included
+in the standard Basat dependencies.
 """
 
 from __future__ import annotations
@@ -68,10 +69,19 @@ class SAASNumPyro:
             import numpyro
         except ImportError as error:
             raise ImportError(
-                "NumPyro SAAS inference requires the 'basat[numpyro]' optional extra."
+                "NumPyro SAAS inference requires JAX and NumPyro. Reinstall Basat "
+                "from its project directory using 'python -m pip install .' "
+                "so pip installs the required dependencies."
             ) from error
         self.jax = jax
         self.numpyro = numpyro
+        # JAX moved this equivalent precision context into its public namespace.
+        # Keep the same float64 computations on both supported API layouts.
+        self._enable_x64 = getattr(jax, "enable_x64", None)
+        if self._enable_x64 is None:
+            from jax.experimental import enable_x64
+
+            self._enable_x64 = enable_x64
         self.shrinkage_scale = shrinkage_scale
         self.warmup_steps = warmup_steps
         self.posterior_samples = posterior_samples
@@ -135,7 +145,7 @@ class SAASNumPyro:
             raise ValueError("NumPyro SAAS needs nonempty aligned (n,d) inputs and (n,) outcomes.")
         if not np.isfinite(X).all() or not np.isfinite(Y).all() or np.any((X < 0) | (X > 1)):
             raise ValueError("NumPyro SAAS training values must be finite and inputs unit scaled.")
-        with self.jax.enable_x64():
+        with self._enable_x64():
             self.X, self.Y = jnp.array(X), jnp.array(Y)
             sampler = NUTS(
                 self.model,
@@ -184,7 +194,7 @@ class SAASNumPyro:
 
         if not self.samples:
             raise RuntimeError("Fit NumPyro SAAS before requesting its posterior.")
-        with self.jax.enable_x64():
+        with self._enable_x64():
             candidate_array = jnp.asarray(candidates, dtype=jnp.float64)
             variances = self.samples["kernel_var"]
             inverse_lengths = self.samples["kernel_inv_length_sq"]
@@ -208,7 +218,7 @@ class SAASNumPyro:
         import jax.numpy as jnp
         from jax.scipy.stats import norm
 
-        with self.jax.enable_x64():
+        with self._enable_x64():
             mean, variance = self.posterior(candidates)
             sigma = jnp.maximum(jnp.sqrt(variance), 1e-6)
             improvement = self.Y.min() - mean
@@ -220,6 +230,6 @@ class SAASNumPyro:
         """Select the released top-k EI points, including JAX's tie ordering."""
         from jax import lax
 
-        with self.jax.enable_x64():
+        with self._enable_x64():
             _, indices = lax.top_k(self.expected_improvement(candidates), count)
             return np.asarray(candidates)[np.asarray(indices)].copy()
