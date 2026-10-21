@@ -1,8 +1,14 @@
 # Basat
 
-Basat is a Python library for **Bayesian optimization**: finding good inputs to an expensive objective using a limited number of evaluations. It brings 19 optimization algorithms together behind a consistent interface for objective functions, tabular datasets, experiment management, and plotting.
+Basat is a Python library for **Bayesian optimization** and helps you find good inputs to an expensive objective using a limited number of evaluations. It brings 19 optimization algorithms together behind a consistent interface for objective functions, tabular datasets, experiment management, and plotting.
 
 Define what you want to optimize, choose an environment and an algorithm, and run an `Experiment`.
+
+[Quick start](#quick-start) · [Compare algorithms](#compare-algorithms) · [Use your own data](#use-your-own-data) · [Installation](#installation)
+
+[What you can do](#what-you-can-do) · [Algorithms](#available-algorithms) · [Environments](#environments) · [Budgets and checkpoints](#budgets-stopping-and-checkpoints)
+
+[User guide](#user-guide) · [Project structure](#project-structure) · [Tests](#tests) · [License](#license)
 
 ## What you can do
 
@@ -14,25 +20,25 @@ Define what you want to optimize, choose an environment and an algorithm, and ru
 
 ## Installation
 
-Basat requires **Python 3.11–3.14**. From the project root:
+Basat requires **Python 3.11–3.14**. Install it from the project root using the following command.
 
 ```bash
 python -m pip install .
 ```
 
-For an editable installation with testing and development tools:
+For an editable installation with testing and development tools, use the following command.
 
 ```bash
 python -m pip install -e ".[dev]"
 ```
 
-The project also includes `uv.lock`; `uv sync` creates the locked project environment.
+The project also includes `uv.lock`, and `uv sync` creates the locked project environment.
 
 Some paper-specific backends need additional dependencies. For example, `python -m pip install ".[numpyro]"` installs the NumPyro backend used by the guide's SAASBO experiment. Dedicated numerical environments are described in [reproduction setup](docs/reproduction.md).
 
 ## Quick start
 
-This example maximizes a two-dimensional function:
+The following example maximizes a two-dimensional function.
 
 ```python
 import basat
@@ -61,11 +67,11 @@ print(experiment.summary())
 
 Basat proposes inputs within the bounds, evaluates your function, and updates the algorithm from the observed rewards. The maximum reward in this example is `0`, at `[0.25, 0.25]`.
 
-An objective returns one finite scalar. Basat maximizes by default; return the negative of a loss to optimize it as a reward. Evaluation budgets are configurable: `30` is an example, not a library-wide limit.
+An objective returns one finite scalar, and Basat maximizes by default. To minimize a loss, return its negative as the reward. You can choose an evaluation budget that suits your objective, such as `max_evaluations=30` in this example.
 
 ## Compare algorithms
 
-Pass a dictionary of labeled algorithms to run independent comparisons. Labels can distinguish different algorithms or different configurations of one algorithm:
+Pass a dictionary of labeled algorithms to run independent comparisons. For example, you can use labels to distinguish different algorithms or different configurations of one algorithm, as shown below.
 
 ```python
 import basat
@@ -137,11 +143,11 @@ An environment defines how an action is evaluated and what information the learn
 | `DistributionalEnvironment` | Supply public distribution information and evaluate an action under a sampled context. |
 | `AdversarialEnvironment` | Apply a configured perturbation or attack during evaluation. |
 
-Use an algorithm's native environment when you need its original assumptions. A supported cross-environment adaptation does not establish the method's native theoretical guarantees; the guide documents adaptations and their limitations.
+Each algorithm's theoretical guarantees depend on its stated assumptions. The guide describes supported cross-environment adaptations and explains the assumptions and limitations associated with each one.
 
 ## Use your own data
 
-Basat supports CSV-backed experiments as well as callable objectives. Load a table using the appropriate environment family:
+Basat supports CSV-backed experiments as well as callable objectives. The following example loads a table using the appropriate environment family.
 
 ```python
 import basat
@@ -153,11 +159,11 @@ loaded = basat.load_dataset(
 print(loaded.preview(rows=3))
 ```
 
-The `data/` directory contains small diabetes, wine, wind-power, and iris examples. [Dataset documentation](data/README.md) describes their sources and transformations; the guide shows the required CSV schemas and complete environment construction. You can substitute your own data in the same format.
+The `data/` directory contains small diabetes, wine, wind-power, and iris examples. [Dataset documentation](data/README.md) describes their sources and transformations, and the guide shows the required CSV schemas and complete environment construction. You can substitute your own data in the same format.
 
 ## Budgets, stopping, and checkpoints
 
-`max_evaluations` limits objective evaluations; a round may contain several evaluations when an algorithm proposes a batch. Use stopping rules for additional conditions such as a target reward or lack of improvement:
+`max_evaluations` limits objective evaluations, and a round may contain several evaluations when an algorithm proposes a batch. You can also use stopping rules for conditions such as a target reward or lack of improvement. For example, the following configuration combines an evaluation limit with an improvement-based stopping rule.
 
 ```python
 import basat
@@ -170,13 +176,13 @@ stopping_rule = basat.any_of(
 
 Pass the rule as `stopping_rule` when constructing an `Experiment`.
 
-Set `output_directory` to save results and checkpoints. To continue a run, reconstruct the same objective, environment, configuration, and output directory with `resume=True`, then call `run()` again. Evaluation limits are totals: continuing from 20 evaluations to a limit of 50 permits up to 30 additional evaluations per trial.
+Set `output_directory` to save results and checkpoints. To continue a run, reconstruct the same objective, environment, configuration, and output directory with `resume=True`, then call `run()` again. Evaluation limits are totals, so continuing from 20 evaluations to a limit of 50 permits up to 30 additional evaluations per trial.
 
-The default transactional checkpoint policy preserves evaluated feedback before giving it to the learner. An explicit periodic policy can reduce disk overhead for replayable experiments, but a crash may repeat evaluations since the last checkpoint. It is not an exactly-once policy for costly or externally stateful objectives.
+The default transactional checkpoint policy preserves evaluated feedback before giving it to the learner. An explicit periodic policy can reduce disk overhead for replayable experiments, and a crash may repeat evaluations since the last checkpoint. Costly or externally stateful objectives require appropriate idempotency and recovery safeguards when exactly-once execution matters.
 
 ## User guide
 
-Open the notebook from the project root after installation:
+After installation, open the notebook from the project root using the following command.
 
 ```bash
 python -m basat notebook docs/basat_user_guide.ipynb
@@ -184,7 +190,7 @@ python -m basat notebook docs/basat_user_guide.ipynb
 
 The guide covers objective definitions, algorithm settings, environments, CSV data, stopping rules, checkpoint continuation, plotting, and paper-specific comparisons.
 
-Its embedded figures can be viewed without the original result directories. Editing settings alone does not regenerate saved measurements or embedded figures. Full reproduction campaigns may take substantial time, download additional data, and require separate numerical environments. See [reproduction setup](docs/reproduction.md) before running them. Paper comparisons are not a claim of exact historical or cross-platform bitwise reproduction.
+The notebook includes embedded figures that you can view independently of the original result directories. To obtain figures for different settings, rerun the experiments and refresh the notebook presentation. Full reproduction campaigns may take substantial time, download additional data, and require separate numerical environments. See [reproduction setup](docs/reproduction.md) before running them. Paper comparisons document measured behavior under the stated protocols, and exact historical or cross-platform agreement requires separate verification.
 
 ## Project structure
 
@@ -198,11 +204,11 @@ pyproject.toml  Package metadata and dependency settings
 uv.lock         Locked dependencies
 ```
 
-Results, checkpoints, caches, temporary environments, and manuscript files are local research artifacts rather than required library files. The ignore rules keep them out of the repository.
+Results, checkpoints, caches, temporary environments, and manuscript files are local research artifacts, and the ignore rules keep these files out of the repository.
 
 ## Tests
 
-After installing the development dependencies:
+After installing the development dependencies, run the tests using the following command.
 
 ```bash
 python -m pytest
